@@ -9,7 +9,7 @@ pub mod dtype;
 pub mod error;
 pub mod ops;
 
-pub use array::Array;
+pub use array::{Array, ArrayMeta};
 pub use backend::Backend;
 pub use dtype::DType;
-pub use error::{RumpyError, Result};
+pub use error::{Result, RumpyError};
