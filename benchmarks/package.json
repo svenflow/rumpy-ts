@@ -1,0 +1,22 @@
+{
+  "name": "rumpy-ts-benchmarks",
+  "version": "1.0.0",
+  "description": "Comprehensive benchmark suite for rumpy-ts vs other numeric libraries",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "bench": "vite build && vite preview"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "chart.js": "^4.4.8",
+    "ndarray": "^1.0.19",
+    "ml-matrix": "^6.11.2",
+    "mathjs": "^14.2.0"
+  }
+}

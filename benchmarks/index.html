@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>rumpy-ts Benchmark Suite</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --card: #141414;
+      --border: #2a2a2a;
+      --text: #e0e0e0;
+      --text-muted: #888;
+      --accent: #6366f1;
+      --accent-2: #22c55e;
+      --accent-3: #f59e0b;
+      --accent-4: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      margin-bottom: 2rem;
+      font-size: 1.1rem;
+    }
+
+    .controls {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+
+    button:hover {
+      opacity: 0.9;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .config {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    label {
+      color: var(--text-muted);
+    }
+
+    select, input {
+      background: var(--card);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 0.5rem;
+      border-radius: 4px;
+    }
+
+    .status {
+      padding: 1rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 2rem;
+      font-family: monospace;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .charts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+      gap: 2rem;
+    }
+
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+
+    .chart-card h2 {
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+      color: var(--text);
+    }
+
+    .chart-container {
+      position: relative;
+      height: 300px;
+    }
+
+    .results-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 2rem;
+    }
+
+    .results-table th,
+    .results-table td {
+      padding: 0.75rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .results-table th {
+      background: var(--card);
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .results-table tr:hover {
+      background: var(--card);
+    }
+
+    .fastest {
+      color: var(--accent-2);
+      font-weight: 600;
+    }
+
+    .legend {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .legend-color {
+      width: 12px;
+      height: 12px;
+      border-radius: 2px;
+    }
+
+    .loading {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .spinner {
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>rumpy-ts Benchmark Suite</h1>
+    <p class="subtitle">Comprehensive performance comparison of JavaScript/WASM numeric libraries</p>
+
+    <div class="controls">
+      <button id="runBtn" onclick="runBenchmarks()">▶ Run All Benchmarks</button>
+      <button id="runQuickBtn" onclick="runQuickBenchmarks()">⚡ Quick Run</button>
+
+      <div class="config">
+        <label>Array Size:</label>
+        <select id="sizeSelect">
+          <option value="1000">1K elements</option>
+          <option value="10000" selected>10K elements</option>
+          <option value="100000">100K elements</option>
+          <option value="1000000">1M elements</option>
+        </select>
+
+        <label>Iterations:</label>
+        <input type="number" id="iterations" value="100" min="10" max="1000">
+      </div>
+    </div>
+
+    <div class="status" id="status">Ready to benchmark. Click "Run All Benchmarks" to start.</div>
+
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-color" style="background: #6366f1"></div>
+        <span>rumpy-ts (WASM)</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: #22c55e"></div>
+        <span>TensorFlow.js (WASM)</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: #f59e0b"></div>
+        <span>ml-matrix (JS)</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: #ef4444"></div>
+        <span>mathjs (JS)</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-color" style="background: #8b5cf6"></div>
+        <span>ndarray (JS)</span>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="chart-card">
+        <h2>Element-wise Operations</h2>
+        <div class="chart-container">
+          <canvas id="elementwiseChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <h2>Matrix Operations</h2>
+        <div class="chart-container">
+          <canvas id="matrixChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <h2>Reductions</h2>
+        <div class="chart-container">
+          <canvas id="reductionsChart"></canvas>
+        </div>
+      </div>
+
+      <div class="chart-card">
+        <h2>Linear Regression Pipeline</h2>
+        <div class="chart-container">
+          <canvas id="pipelineChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <h2 style="margin-top: 2rem; margin-bottom: 1rem;">Detailed Results</h2>
+    <table class="results-table" id="resultsTable">
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>rumpy-ts</th>
+          <th>TensorFlow.js</th>
+          <th>ml-matrix</th>
+          <th>mathjs</th>
+          <th>ndarray</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Run benchmarks to see results</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script type="module" src="/benchmark.js"></script>
+</body>
+</html>
