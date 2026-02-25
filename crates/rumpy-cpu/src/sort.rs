@@ -135,11 +135,7 @@ mod tests {
 
     #[test]
     fn test_nonzero_2d() {
-        let a = CpuArray::from_f64_vec(
-            vec![0.0, 1.0, 2.0, 0.0, 3.0, 0.0],
-            vec![2, 3],
-        )
-        .unwrap();
+        let a = CpuArray::from_f64_vec(vec![0.0, 1.0, 2.0, 0.0, 3.0, 0.0], vec![2, 3]).unwrap();
         let indices = CpuBackend::nonzero(&a);
         assert_eq!(indices.len(), 2);
         // Non-zero at (0,1), (0,2), (1,1)

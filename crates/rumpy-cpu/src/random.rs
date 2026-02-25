@@ -207,11 +207,8 @@ mod tests {
         assert_eq!(chosen.size(), 3);
 
         // All values should be from the original array
-        let original: std::collections::HashSet<i64> = arr
-            .as_f64_slice()
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
+        let original: std::collections::HashSet<i64> =
+            arr.as_f64_slice().iter().map(|&x| x as i64).collect();
         for &x in chosen.as_f64_slice().iter() {
             assert!(original.contains(&(x as i64)));
         }

@@ -118,10 +118,8 @@ impl ManipulationOps for CpuBackend {
         }
 
         // Expand dims then concatenate
-        let expanded: Result<Vec<CpuArray>> = arrays
-            .iter()
-            .map(|a| Self::expand_dims(a, axis))
-            .collect();
+        let expanded: Result<Vec<CpuArray>> =
+            arrays.iter().map(|a| Self::expand_dims(a, axis)).collect();
         let expanded = expanded?;
         let refs: Vec<&CpuArray> = expanded.iter().collect();
         Self::concatenate(&refs, axis)
@@ -247,8 +245,7 @@ impl ManipulationOps for CpuBackend {
                 }
 
                 // Repeat along axis
-                let repeated: Vec<CpuArray> =
-                    (0..repeats).map(|_| arr.clone()).collect();
+                let repeated: Vec<CpuArray> = (0..repeats).map(|_| arr.clone()).collect();
                 let refs: Vec<&CpuArray> = repeated.iter().collect();
                 Self::concatenate(&refs, ax)
             }
@@ -290,10 +287,18 @@ impl ManipulationOps for CpuBackend {
                     let mut iter_i = temp_j.into_iter();
                     let mut iter_j = temp_i.into_iter();
 
-                    for (idx, val) in result.slice_axis_mut(Axis(ax), ndarray::Slice::from(i..=i)).iter_mut().enumerate() {
+                    for (idx, val) in result
+                        .slice_axis_mut(Axis(ax), ndarray::Slice::from(i..=i))
+                        .iter_mut()
+                        .enumerate()
+                    {
                         *val = iter_i.next().unwrap();
                     }
-                    for (idx, val) in result.slice_axis_mut(Axis(ax), ndarray::Slice::from(j..=j)).iter_mut().enumerate() {
+                    for (idx, val) in result
+                        .slice_axis_mut(Axis(ax), ndarray::Slice::from(j..=j))
+                        .iter_mut()
+                        .enumerate()
+                    {
                         *val = iter_j.next().unwrap();
                     }
                 }
@@ -323,9 +328,7 @@ impl ManipulationOps for CpuBackend {
                     result[new_i] = val;
                 }
 
-                CpuArray::from_ndarray(
-                    ArrayD::from_shape_vec(IxDyn(arr.shape()), result).unwrap(),
-                )
+                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), result).unwrap())
             }
             Some(_ax) => {
                 // For simplicity, flatten, roll, reshape
