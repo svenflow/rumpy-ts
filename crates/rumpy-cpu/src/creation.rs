@@ -21,7 +21,9 @@ impl CreationOps for CpuBackend {
 
     fn arange(start: f64, stop: f64, step: f64) -> Result<CpuArray> {
         if step == 0.0 {
-            return Err(RumpyError::InvalidArgument("Step cannot be zero".to_string()));
+            return Err(RumpyError::InvalidArgument(
+                "Step cannot be zero".to_string(),
+            ));
         }
 
         if (step > 0.0 && start >= stop) || (step < 0.0 && start <= stop) {
@@ -85,10 +87,7 @@ impl CreationOps for CpuBackend {
             let start_row = if k >= 0 { 0 } else { (-k) as usize };
             let start_col = if k >= 0 { k as usize } else { 0 };
 
-            let diag_len = std::cmp::min(
-                m.saturating_sub(start_row),
-                n.saturating_sub(start_col),
-            );
+            let diag_len = std::cmp::min(m.saturating_sub(start_row), n.saturating_sub(start_col));
 
             let values: Vec<f64> = (0..diag_len)
                 .map(|i| data[IxDyn(&[start_row + i, start_col + i])])

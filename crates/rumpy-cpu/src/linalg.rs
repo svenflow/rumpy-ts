@@ -10,9 +10,7 @@ use rumpy_core::{ops::LinalgOps, Array, Result, RumpyError};
 fn to_faer(arr: &CpuArray) -> Result<Mat<f64>> {
     let shape = arr.shape();
     if shape.len() != 2 {
-        return Err(RumpyError::InvalidArgument(
-            "Matrix must be 2D".to_string(),
-        ));
+        return Err(RumpyError::InvalidArgument("Matrix must be 2D".to_string()));
     }
     let (m, n) = (shape[0], shape[1]);
     let data = arr.as_f64_slice();
@@ -702,9 +700,7 @@ impl LinalgOps for CpuBackend {
                     result[j * m + i] = data[IxDyn(&[i, j])];
                 }
             }
-            return CpuArray::from_ndarray(
-                ArrayD::from_shape_vec(IxDyn(&[n, m]), result).unwrap(),
-            );
+            return CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[n, m]), result).unwrap());
         }
 
         // General transpose: reverse axes

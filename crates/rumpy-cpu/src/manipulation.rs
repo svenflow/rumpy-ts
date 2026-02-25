@@ -39,9 +39,7 @@ impl ManipulationOps for CpuBackend {
                 ArrayD::from_shape_vec(IxDyn(&[1]), arr.as_f64_slice()).unwrap(),
             );
         }
-        CpuArray::from_ndarray(
-            ArrayD::from_shape_vec(IxDyn(&shape), arr.as_f64_slice()).unwrap(),
-        )
+        CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&shape), arr.as_f64_slice()).unwrap())
     }
 
     fn expand_dims(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
