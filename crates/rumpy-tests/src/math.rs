@@ -2,9 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use rumpy_core::{Array, ops::{CreationOps, MathOps}};
-    use rumpy_cpu::{CpuBackend, CpuArray};
     use crate::utils::*;
+    use rumpy_core::{
+        ops::{CreationOps, MathOps},
+        Array,
+    };
+    use rumpy_cpu::{CpuArray, CpuBackend};
     use std::f64::consts::PI;
 
     fn arr(data: Vec<f64>) -> CpuArray {
@@ -103,13 +106,21 @@ mod tests {
 
         assert!(approx_eq(data[0], 1.0, DEFAULT_TOL));
         assert!(approx_eq(data[1], std::f64::consts::E, DEFAULT_TOL));
-        assert!(approx_eq(data[2], std::f64::consts::E * std::f64::consts::E, DEFAULT_TOL));
+        assert!(approx_eq(
+            data[2],
+            std::f64::consts::E * std::f64::consts::E,
+            DEFAULT_TOL
+        ));
         assert!(approx_eq(data[3], 1.0 / std::f64::consts::E, DEFAULT_TOL));
     }
 
     #[test]
     fn test_log() {
-        let a = arr(vec![1.0, std::f64::consts::E, std::f64::consts::E * std::f64::consts::E]);
+        let a = arr(vec![
+            1.0,
+            std::f64::consts::E,
+            std::f64::consts::E * std::f64::consts::E,
+        ]);
         let result = CpuBackend::log(&a);
         let data = result.as_f64_slice();
 
@@ -195,7 +206,10 @@ mod tests {
         let a = arr(vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]);
         let result = CpuBackend::square(&a);
 
-        assert_eq!(result.as_f64_slice(), vec![9.0, 4.0, 1.0, 0.0, 1.0, 4.0, 9.0]);
+        assert_eq!(
+            result.as_f64_slice(),
+            vec![9.0, 4.0, 1.0, 0.0, 1.0, 4.0, 9.0]
+        );
     }
 
     // ============ Rounding ============

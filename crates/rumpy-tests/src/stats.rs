@@ -2,9 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use rumpy_core::{Array, ops::{CreationOps, StatsOps}};
-    use rumpy_cpu::{CpuBackend, CpuArray};
     use crate::utils::*;
+    use rumpy_core::{
+        ops::{CreationOps, StatsOps},
+        Array,
+    };
+    use rumpy_cpu::{CpuArray, CpuBackend};
 
     fn arr(data: Vec<f64>) -> CpuArray {
         CpuArray::from_f64_vec(data.clone(), vec![data.len()]).unwrap()

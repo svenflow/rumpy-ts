@@ -3,10 +3,10 @@
 //! This crate provides JavaScript/TypeScript bindings for RumPy using wasm-bindgen.
 //! It wraps the CPU backend for use in web browsers and Node.js.
 
-use rumpy_cpu::{CpuArray, CpuBackend};
-use rumpy_core::{ops::*, Array};
-use wasm_bindgen::prelude::*;
 use js_sys::Float64Array;
+use rumpy_core::{ops::*, Array};
+use rumpy_cpu::{CpuArray, CpuBackend};
+use wasm_bindgen::prelude::*;
 
 /// Initialize panic hook for better error messages
 #[wasm_bindgen(start)]
@@ -287,8 +287,7 @@ pub fn inv(arr: &NDArray) -> Result<NDArray, JsValue> {
 
 #[wasm_bindgen]
 pub fn det(arr: &NDArray) -> Result<f64, JsValue> {
-    CpuBackend::det(&arr.inner)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+    CpuBackend::det(&arr.inner).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 #[wasm_bindgen]

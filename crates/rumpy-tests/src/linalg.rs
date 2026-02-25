@@ -2,9 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use rumpy_core::{Array, ops::{CreationOps, LinalgOps}};
-    use rumpy_cpu::{CpuBackend, CpuArray};
     use crate::utils::*;
+    use rumpy_core::{
+        ops::{CreationOps, LinalgOps},
+        Array,
+    };
+    use rumpy_cpu::{CpuArray, CpuBackend};
 
     fn mat(data: Vec<f64>, rows: usize, cols: usize) -> CpuArray {
         CpuArray::from_f64_vec(data, vec![rows, cols]).unwrap()
@@ -233,7 +236,11 @@ mod tests {
 
         // Q @ R should equal A
         let reconstructed = CpuBackend::matmul(&q, &r).unwrap();
-        for (x, y) in a.as_f64_slice().iter().zip(reconstructed.as_f64_slice().iter()) {
+        for (x, y) in a
+            .as_f64_slice()
+            .iter()
+            .zip(reconstructed.as_f64_slice().iter())
+        {
             assert!(approx_eq(*x, *y, RELAXED_TOL));
         }
     }
