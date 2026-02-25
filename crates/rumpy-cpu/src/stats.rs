@@ -107,7 +107,6 @@ impl StatsOps for CpuBackend {
             .map(|(_, &s)| s)
             .collect();
 
-        let axis_len = shape[axis];
         let result_size: usize = new_shape.iter().product();
         let mut result = vec![f64::INFINITY; result_size];
 

@@ -140,7 +140,7 @@ mod tests {
 
         // All values should be in [0, 1)
         for &x in arr.as_f64_slice().iter() {
-            assert!(x >= 0.0 && x < 1.0);
+            assert!((0.0..1.0).contains(&x));
         }
     }
 
@@ -161,7 +161,7 @@ mod tests {
 
         // All values should be in [0, 10)
         for &x in arr.as_f64_slice().iter() {
-            assert!(x >= 0.0 && x < 10.0);
+            assert!((0.0..10.0).contains(&x));
             assert_eq!(x, x.floor()); // Should be integers
         }
     }
@@ -173,7 +173,7 @@ mod tests {
 
         // All values should be in [5, 10)
         for &x in arr.as_f64_slice().iter() {
-            assert!(x >= 5.0 && x < 10.0);
+            assert!((5.0..10.0).contains(&x));
         }
     }
 

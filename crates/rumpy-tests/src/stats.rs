@@ -3,10 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::utils::*;
-    use rumpy_core::{
-        ops::{CreationOps, StatsOps},
-        Array,
-    };
+    use rumpy_core::{ops::StatsOps, Array};
     use rumpy_cpu::{CpuArray, CpuBackend};
 
     fn arr(data: Vec<f64>) -> CpuArray {

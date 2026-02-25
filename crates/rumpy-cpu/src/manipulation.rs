@@ -203,7 +203,7 @@ impl ManipulationOps for CpuBackend {
         let mut result = vec![0.0; new_size];
 
         // Fill by iterating over output indices
-        for out_idx in 0..new_size {
+        for (out_idx, result_elem) in result.iter_mut().enumerate().take(new_size) {
             let mut idx = out_idx;
             let mut in_idx = 0;
             let mut in_mult = 1;
@@ -217,7 +217,7 @@ impl ManipulationOps for CpuBackend {
                 in_mult *= shape[d];
             }
 
-            result[out_idx] = data[in_idx];
+            *result_elem = data[in_idx];
         }
 
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap())
@@ -285,17 +285,15 @@ impl ManipulationOps for CpuBackend {
                     let mut iter_i = temp_j.into_iter();
                     let mut iter_j = temp_i.into_iter();
 
-                    for (idx, val) in result
+                    for val in result
                         .slice_axis_mut(Axis(ax), ndarray::Slice::from(i..=i))
                         .iter_mut()
-                        .enumerate()
                     {
                         *val = iter_i.next().unwrap();
                     }
-                    for (idx, val) in result
+                    for val in result
                         .slice_axis_mut(Axis(ax), ndarray::Slice::from(j..=j))
                         .iter_mut()
-                        .enumerate()
                     {
                         *val = iter_j.next().unwrap();
                     }
@@ -346,7 +344,7 @@ impl ManipulationOps for CpuBackend {
             ));
         }
 
-        let k = ((k % 4) + 4) % 4;
+        let k = k.rem_euclid(4);
         let mut result = arr.clone();
 
         for _ in 0..k {

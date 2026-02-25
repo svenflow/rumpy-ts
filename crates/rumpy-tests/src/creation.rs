@@ -63,11 +63,11 @@ mod tests {
 
     #[test]
     fn test_full_negative() {
-        let arr = CpuBackend::full(vec![2, 2], -3.14);
+        let arr = CpuBackend::full(vec![2, 2], -3.15);
         assert!(arr
             .as_f64_slice()
             .iter()
-            .all(|&x| approx_eq(x, -3.14, DEFAULT_TOL)));
+            .all(|&x| approx_eq(x, -3.15, DEFAULT_TOL)));
     }
 
     // ============ arange ============
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn test_arange_float_step() {
         let arr = CpuBackend::arange(0.0, 1.0, 0.25).unwrap();
-        let expected = vec![0.0, 0.25, 0.5, 0.75];
+        let expected = [0.0, 0.25, 0.5, 0.75];
         let data = arr.as_f64_slice();
         for (a, b) in data.iter().zip(expected.iter()) {
             assert!(approx_eq(*a, *b, DEFAULT_TOL));
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn test_linspace_basic() {
         let arr = CpuBackend::linspace(0.0, 1.0, 5);
-        let expected = vec![0.0, 0.25, 0.5, 0.75, 1.0];
+        let expected = [0.0, 0.25, 0.5, 0.75, 1.0];
         let data = arr.as_f64_slice();
         for (a, b) in data.iter().zip(expected.iter()) {
             assert!(approx_eq(*a, *b, DEFAULT_TOL));

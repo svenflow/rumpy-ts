@@ -25,10 +25,6 @@ impl NDArray {
     fn new(inner: CpuArray) -> Self {
         Self { inner }
     }
-
-    fn inner(&self) -> &CpuArray {
-        &self.inner
-    }
 }
 
 #[wasm_bindgen]

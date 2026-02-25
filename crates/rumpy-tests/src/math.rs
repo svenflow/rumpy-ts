@@ -3,10 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::utils::*;
-    use rumpy_core::{
-        ops::{CreationOps, MathOps},
-        Array,
-    };
+    use rumpy_core::{ops::MathOps, Array};
     use rumpy_cpu::{CpuArray, CpuBackend};
     use std::f64::consts::PI;
 

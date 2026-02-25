@@ -1,7 +1,6 @@
 //! Linear algebra operations for CPU backend using faer
 
 use crate::{CpuArray, CpuBackend};
-use faer::prelude::*;
 use faer::Mat;
 use ndarray::{ArrayD, IxDyn};
 use rumpy_core::{ops::LinalgOps, Array, Result, RumpyError};
@@ -192,7 +191,7 @@ impl LinalgOps for CpuBackend {
         // This is a simplified implementation
         let mat = to_faer(arr)?;
         let mt = mat.transpose();
-        let mta = &mt * &mat;
+        let mta = mt * &mat;
 
         // Solve (A^T A) X = A^T to get X = A+
         let mta_inv = {
@@ -200,7 +199,7 @@ impl LinalgOps for CpuBackend {
             Self::inv(&arr_tmp)?
         };
         let mta_inv_mat = to_faer(&mta_inv)?;
-        let result = &mta_inv_mat * &mt;
+        let result = &mta_inv_mat * mt;
         Ok(from_faer(&result))
     }
 
@@ -443,13 +442,10 @@ impl LinalgOps for CpuBackend {
 
             // Orthogonalize against previous columns
             for i in 0..j {
-                let mut dot = 0.0;
-                for row in 0..m {
-                    dot += q.read(row, i) * mat.read(row, j);
-                }
+                let dot: f64 = (0..m).map(|row| q.read(row, i) * mat.read(row, j)).sum();
                 r.write(i, j, dot);
-                for row in 0..m {
-                    v[row] -= dot * q.read(row, i);
+                for (row, v_elem) in v.iter_mut().enumerate().take(m) {
+                    *v_elem -= dot * q.read(row, i);
                 }
             }
 
@@ -458,8 +454,8 @@ impl LinalgOps for CpuBackend {
             r.write(j, j, norm);
 
             if norm > 1e-14 {
-                for row in 0..m {
-                    q.write(row, j, v[row] / norm);
+                for (row, &v_elem) in v.iter().enumerate().take(m) {
+                    q.write(row, j, v_elem / norm);
                 }
             }
         }
@@ -584,7 +580,7 @@ impl LinalgOps for CpuBackend {
 
         // For now, compute via eigendecomposition of A^T A
         let mt = mat.transpose();
-        let ata = &mt * &mat;
+        let ata = mt * &mat;
 
         // Simple eigenvalue computation for symmetric matrix
         let ata_arr = from_faer(&ata);
@@ -642,9 +638,9 @@ impl LinalgOps for CpuBackend {
             for _ in 0..100 {
                 // Multiply
                 let mut new_v = vec![0.0; n];
-                for i in 0..n {
-                    for j in 0..n {
-                        new_v[i] += work.read(i, j) * v[j];
+                for (i, nv) in new_v.iter_mut().enumerate().take(n) {
+                    for (j, &vj) in v.iter().enumerate().take(n) {
+                        *nv += work.read(i, j) * vj;
                     }
                 }
 
@@ -657,14 +653,14 @@ impl LinalgOps for CpuBackend {
                 eigenvalue = new_v.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f64>()
                     / v.iter().map(|x| x * x).sum::<f64>();
 
-                for i in 0..n {
-                    v[i] = new_v[i] / norm;
+                for (v_elem, &nv) in v.iter_mut().zip(new_v.iter()).take(n) {
+                    *v_elem = nv / norm;
                 }
             }
 
             eigenvalues.push(eigenvalue);
-            for i in 0..n {
-                eigenvectors.write(i, k, v[i]);
+            for (i, &v_elem) in v.iter().enumerate().take(n) {
+                eigenvectors.write(i, k, v_elem);
             }
 
             // Deflate: A = A - λ v v^T

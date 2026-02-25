@@ -3,9 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported data types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum DType {
     Float32,
+    #[default]
     Float64,
     Int32,
     Int64,
@@ -46,11 +47,5 @@ impl DType {
 impl std::fmt::Display for DType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
-    }
-}
-
-impl Default for DType {
-    fn default() -> Self {
-        DType::Float64
     }
 }

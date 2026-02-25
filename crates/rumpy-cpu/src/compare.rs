@@ -18,7 +18,7 @@ macro_rules! impl_compare_op {
                 .zip(b.as_f64_slice().iter())
                 .map(|(&x, &y)| if x $op y { 1.0 } else { 0.0 })
                 .collect();
-            Ok(CpuArray::from_f64_vec(result, a.shape().to_vec())?)
+            CpuArray::from_f64_vec(result, a.shape().to_vec())
         }
     };
 }

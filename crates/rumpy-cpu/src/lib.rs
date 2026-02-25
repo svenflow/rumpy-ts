@@ -14,7 +14,7 @@ mod stats;
 
 pub use array::CpuArray;
 
-use rumpy_core::{ops::*, Backend};
+use rumpy_core::Backend;
 
 /// CPU backend using ndarray + faer
 pub struct CpuBackend;
