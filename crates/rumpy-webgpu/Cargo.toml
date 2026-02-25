@@ -1,0 +1,14 @@
+[package]
+name = "rumpy-webgpu"
+description = "WebGPU backend for RumPy (future)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rumpy-core = { path = "../rumpy-core" }
+thiserror.workspace = true
+
+# WebGPU dependencies (to be added)
+# wgpu = "0.19"

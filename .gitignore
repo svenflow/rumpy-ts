@@ -1,0 +1,27 @@
+# Rust
+/target/
+Cargo.lock
+
+# WASM build output
+/pkg/
+/crates/rumpy-wasm/pkg/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test output
+*.log
+native_results.txt
+wasm_results.txt

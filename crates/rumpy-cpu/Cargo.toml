@@ -1,0 +1,18 @@
+[package]
+name = "rumpy-cpu"
+description = "CPU backend for RumPy using ndarray and faer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rumpy-core = { path = "../rumpy-core" }
+ndarray.workspace = true
+faer.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+approx.workspace = true

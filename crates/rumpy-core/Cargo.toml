@@ -1,0 +1,11 @@
+[package]
+name = "rumpy-core"
+description = "Core traits and types for RumPy backends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

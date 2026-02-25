@@ -1,0 +1,14 @@
+[package]
+name = "rumpy-tests"
+description = "Shared test suite for RumPy backends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rumpy-core = { path = "../rumpy-core" }
+rumpy-cpu = { path = "../rumpy-cpu" }
+
+[dev-dependencies]
+approx.workspace = true
