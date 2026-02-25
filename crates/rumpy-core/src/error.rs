@@ -28,7 +28,7 @@ pub enum RumpyError {
     #[error("Matrix is singular")]
     SingularMatrix,
 
-    #[error("Dimension mismatch for {op}: {0:?} vs {1:?}")]
+    #[error("Dimension mismatch for {op}: {shapes:?}")]
     DimensionMismatch {
         op: &'static str,
         shapes: (Vec<usize>, Vec<usize>),
