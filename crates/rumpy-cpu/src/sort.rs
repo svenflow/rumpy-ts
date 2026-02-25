@@ -60,16 +60,16 @@ impl SortOps for CpuBackend {
             if val != 0.0 {
                 // Convert flat index to multi-dimensional indices
                 let mut idx = flat_idx;
+                let mut coords = vec![0usize; ndim];
                 for d in (0..ndim).rev() {
-                    indices[d].push(idx % shape[d]);
+                    coords[d] = idx % shape[d];
                     idx /= shape[d];
                 }
+                // Push coordinates in the correct order
+                for (d, &coord) in coords.iter().enumerate() {
+                    indices[d].push(coord);
+                }
             }
-        }
-
-        // Reverse each index array (we built them backwards)
-        for idx_arr in &mut indices {
-            idx_arr.reverse();
         }
 
         // Convert to CpuArrays

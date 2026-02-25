@@ -586,30 +586,42 @@ impl LinalgOps for CpuBackend {
         let ata_arr = from_faer(&ata);
         let (eigenvalues, v) = Self::eig(&ata_arr)?;
 
-        // Singular values are sqrt of eigenvalues
+        // Singular values are sqrt of eigenvalues (take only first k)
         let s_data: Vec<f64> = eigenvalues
             .as_f64_slice()
             .iter()
+            .take(k)
             .map(|&x| x.max(0.0).sqrt())
             .collect();
         let s = CpuArray::from_f64_vec(s_data, vec![k])?;
 
-        // U = A V S^-1
+        // V is n x n, we need only first k columns for V_k (n x k)
         let v_mat = to_faer(&v)?;
-        let av = &mat * &v_mat;
 
+        // U = A V_k S^-1 (m x k)
         let mut u = Mat::zeros(m, k);
         for j in 0..k {
             let sigma = s.get_flat(j);
             if sigma.abs() > 1e-14 {
+                // Compute (A * v_j) / sigma
                 for i in 0..m {
-                    u.write(i, j, av.read(i, j) / sigma);
+                    let mut sum = 0.0;
+                    for l in 0..n {
+                        sum += mat.read(i, l) * v_mat.read(l, j);
+                    }
+                    u.write(i, j, sum / sigma);
                 }
             }
         }
 
-        // V^T
-        let vt_arr = Self::transpose(&v);
+        // V^T is k x n (first k rows of V transposed)
+        let mut vt_data = vec![0.0; k * n];
+        for i in 0..k {
+            for j in 0..n {
+                vt_data[i * n + j] = v_mat.read(j, i);
+            }
+        }
+        let vt_arr = CpuArray::from_f64_vec(vt_data, vec![k, n])?;
 
         Ok((from_faer(&u), s, vt_arr))
     }
