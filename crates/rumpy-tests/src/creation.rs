@@ -4,9 +4,9 @@
 
 #[cfg(test)]
 mod tests {
-    use rumpy_core::{Array, ops::CreationOps};
-    use rumpy_cpu::CpuBackend;
     use crate::utils::*;
+    use rumpy_core::{ops::CreationOps, Array};
+    use rumpy_cpu::CpuBackend;
 
     // ============ zeros ============
 
@@ -64,7 +64,10 @@ mod tests {
     #[test]
     fn test_full_negative() {
         let arr = CpuBackend::full(vec![2, 2], -3.14);
-        assert!(arr.as_f64_slice().iter().all(|&x| approx_eq(x, -3.14, DEFAULT_TOL)));
+        assert!(arr
+            .as_f64_slice()
+            .iter()
+            .all(|&x| approx_eq(x, -3.14, DEFAULT_TOL)));
     }
 
     // ============ arange ============
@@ -191,7 +194,8 @@ mod tests {
         let mat = rumpy_cpu::CpuArray::from_f64_vec(
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
             vec![3, 3],
-        ).unwrap();
+        )
+        .unwrap();
         let diag = CpuBackend::diag(&mat, 0).unwrap();
         assert_eq!(diag.as_f64_slice(), vec![1.0, 5.0, 9.0]);
     }
@@ -201,7 +205,8 @@ mod tests {
         let mat = rumpy_cpu::CpuArray::from_f64_vec(
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
             vec![3, 3],
-        ).unwrap();
+        )
+        .unwrap();
         let diag = CpuBackend::diag(&mat, 1).unwrap();
         assert_eq!(diag.as_f64_slice(), vec![2.0, 6.0]);
     }
@@ -211,7 +216,8 @@ mod tests {
         let mat = rumpy_cpu::CpuArray::from_f64_vec(
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
             vec![3, 3],
-        ).unwrap();
+        )
+        .unwrap();
         let diag = CpuBackend::diag(&mat, -1).unwrap();
         assert_eq!(diag.as_f64_slice(), vec![4.0, 8.0]);
     }

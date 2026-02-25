@@ -109,11 +109,7 @@ mod tests {
 
     #[test]
     fn test_inv_3x3() {
-        let a = mat(vec![
-            1.0, 2.0, 3.0,
-            0.0, 1.0, 4.0,
-            5.0, 6.0, 0.0,
-        ], 3, 3);
+        let a = mat(vec![1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0], 3, 3);
         let a_inv = CpuBackend::inv(&a).unwrap();
 
         // A @ A^-1 should be identity
@@ -142,11 +138,7 @@ mod tests {
 
     #[test]
     fn test_det_3x3() {
-        let a = mat(vec![
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-            7.0, 8.0, 9.0,
-        ], 3, 3);
+        let a = mat(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3);
         let det = CpuBackend::det(&a).unwrap();
         // This matrix is singular, det = 0
         assert!(approx_eq(det, 0.0, RELAXED_TOL));

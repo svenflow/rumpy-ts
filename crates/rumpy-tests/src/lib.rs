@@ -4,9 +4,9 @@
 //! Tests are designed to match NumPy behavior exactly.
 
 pub mod creation;
+pub mod linalg;
 pub mod math;
 pub mod stats;
-pub mod linalg;
 
 /// Test utilities
 pub mod utils {
@@ -30,7 +30,10 @@ pub mod utils {
         }
         let a_data = a.as_f64_slice();
         let b_data = b.as_f64_slice();
-        a_data.iter().zip(b_data.iter()).all(|(&x, &y)| approx_eq(x, y, tol))
+        a_data
+            .iter()
+            .zip(b_data.iter())
+            .all(|(&x, &y)| approx_eq(x, y, tol))
     }
 
     /// Default tolerance for floating point comparisons
