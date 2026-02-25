@@ -4,7 +4,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use ndarray::{ArrayD, IxDyn};
-use rumpy_cpu::broadcast::broadcast_binary_op;
+use rumpy_cpu::broadcast_binary_op; // Use public re-export
 
 /// Generate a random array of given shape
 fn random_array(shape: &[usize]) -> ArrayD<f64> {
@@ -67,9 +67,9 @@ fn bench_broadcasting_add(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("manual_expand", &id),
-            &(&a_expanded, &b_expanded),
+            &(a_expanded, b_expanded),
             |bench, (a, b)| {
-                bench.iter(|| black_box(&*a + &*b));
+                bench.iter(|| black_box(a + b));
             },
         );
     }
@@ -132,9 +132,9 @@ fn bench_same_shape(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("direct_add", size),
-            &(&a, &b),
+            &(a.clone(), b.clone()),
             |bench, (a, b)| {
-                bench.iter(|| black_box(&*a + &*b));
+                bench.iter(|| black_box(a + b));
             },
         );
     }
