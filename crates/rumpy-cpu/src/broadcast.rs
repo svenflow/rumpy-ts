@@ -225,8 +225,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_binary_op_same_shape() {
-        let a =
-            ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let a = ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let b = ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
             .unwrap();
 

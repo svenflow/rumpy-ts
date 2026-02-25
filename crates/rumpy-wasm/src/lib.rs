@@ -370,13 +370,13 @@ pub fn random_normal(loc: f64, scale: f64, shape: Vec<usize>) -> NDArray {
 
 // ============ Memory access for zero-copy ============
 
-/// Get WASM linear memory
+/// Get WASM linear memory for zero-copy access
 ///
 /// Returns the WebAssembly.Memory object that backs all arrays.
 /// Use with `dataPtr()` and `len()` to create zero-copy TypedArray views:
 ///
 /// ```javascript
-/// const wasmMemory = rumpy.memory();
+/// const wasmMemory = rumpy.wasmMemory();
 /// const ptr = array.dataPtr();
 /// const len = array.len();
 /// const view = new Float64Array(wasmMemory.buffer, ptr, len);
@@ -385,8 +385,8 @@ pub fn random_normal(loc: f64, scale: f64, shape: Vec<usize>) -> NDArray {
 ///
 /// Note: Views are invalidated if WASM memory grows. Monitor memory size
 /// or recreate views after operations that might allocate.
-#[wasm_bindgen]
-pub fn memory() -> JsValue {
+#[wasm_bindgen(js_name = wasmMemory)]
+pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
