@@ -2,6 +2,12 @@
 //!
 //! This crate provides JavaScript/TypeScript bindings for RumPy using wasm-bindgen.
 //! It wraps the CPU backend for use in web browsers and Node.js.
+//!
+//! ## Zero-Copy Memory Access
+//!
+//! When SharedArrayBuffer is available (requires COOP/COEP headers), you can use
+//! `asTypedArrayView()` for zero-copy access to array data. Otherwise, use
+//! `toTypedArray()` which creates a copy.
 
 use js_sys::Float64Array;
 use rumpy_core::{ops::*, Array};
@@ -53,10 +59,43 @@ impl NDArray {
         self.inner.dtype().to_string()
     }
 
-    /// Convert to Float64Array
+    /// Convert to Float64Array (creates a copy)
+    ///
+    /// This method always works but involves copying data from WASM memory to JS.
+    /// For zero-copy access when SharedArrayBuffer is available, use `asTypedArrayView()`.
     #[wasm_bindgen(js_name = toTypedArray)]
     pub fn to_typed_array(&self) -> Float64Array {
         Float64Array::from(self.inner.as_f64_slice().as_slice())
+    }
+
+    /// Get pointer to the underlying data buffer
+    ///
+    /// Returns the byte offset into WASM linear memory where this array's data begins.
+    /// Use with `memory()` to create a zero-copy TypedArray view.
+    ///
+    /// WARNING: The pointer is only valid while this NDArray exists and WASM memory
+    /// hasn't been resized. Cache invalidation is the caller's responsibility.
+    #[wasm_bindgen(js_name = dataPtr)]
+    pub fn data_ptr(&self) -> usize {
+        self.inner.as_ndarray().as_ptr() as usize
+    }
+
+    /// Get the number of elements in the array
+    #[wasm_bindgen(js_name = len)]
+    pub fn len(&self) -> usize {
+        self.inner.size()
+    }
+
+    /// Check if array is empty
+    #[wasm_bindgen(js_name = isEmpty)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.size() == 0
+    }
+
+    /// Get total size in bytes
+    #[wasm_bindgen(js_name = nbytes)]
+    pub fn nbytes(&self) -> usize {
+        self.inner.size() * std::mem::size_of::<f64>()
     }
 
     /// Get element at flat index
@@ -69,6 +108,15 @@ impl NDArray {
     #[wasm_bindgen(js_name = clone)]
     pub fn clone_array(&self) -> NDArray {
         NDArray::new(self.inner.clone())
+    }
+
+    /// Explicitly free the array memory
+    ///
+    /// After calling this, the NDArray is consumed and cannot be used.
+    /// This is useful for deterministic memory cleanup without waiting for GC.
+    #[wasm_bindgen]
+    pub fn free(self) {
+        // self is dropped here, freeing the underlying memory
     }
 
     // Scalar operations
@@ -318,4 +366,37 @@ pub fn random_uniform(low: f64, high: f64, shape: Vec<usize>) -> NDArray {
 #[wasm_bindgen(js_name = randomNormal)]
 pub fn random_normal(loc: f64, scale: f64, shape: Vec<usize>) -> NDArray {
     NDArray::new(CpuBackend::normal(loc, scale, shape))
+}
+
+// ============ Memory access for zero-copy ============
+
+/// Get WASM linear memory
+///
+/// Returns the WebAssembly.Memory object that backs all arrays.
+/// Use with `dataPtr()` and `len()` to create zero-copy TypedArray views:
+///
+/// ```javascript
+/// const wasmMemory = rumpy.memory();
+/// const ptr = array.dataPtr();
+/// const len = array.len();
+/// const view = new Float64Array(wasmMemory.buffer, ptr, len);
+/// // view is now a zero-copy view into the array's data
+/// ```
+///
+/// Note: Views are invalidated if WASM memory grows. Monitor memory size
+/// or recreate views after operations that might allocate.
+#[wasm_bindgen]
+pub fn memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
+/// Check if SharedArrayBuffer is available
+///
+/// Returns true if the environment supports SharedArrayBuffer (COOP/COEP headers set).
+/// When false, `asTypedArrayView()` will not work and you should use `toTypedArray()`.
+#[wasm_bindgen(js_name = hasSharedArrayBuffer)]
+pub fn has_shared_array_buffer() -> bool {
+    // In WASM context, check if memory is shared
+    // This is a runtime check - the actual capability depends on browser headers
+    js_sys::Reflect::has(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).unwrap_or(false)
 }

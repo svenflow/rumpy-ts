@@ -1,7 +1,8 @@
 //! Element-wise math operations for CPU backend
 
+use crate::broadcast::broadcast_binary_op;
 use crate::{CpuArray, CpuBackend};
-use rumpy_core::{ops::MathOps, Array, Result, RumpyError};
+use rumpy_core::{ops::MathOps, Result};
 
 macro_rules! impl_unary_op {
     ($name:ident, $op:expr) => {
@@ -11,16 +12,11 @@ macro_rules! impl_unary_op {
     };
 }
 
-macro_rules! impl_binary_op {
+macro_rules! impl_binary_op_broadcast {
     ($name:ident, $op:tt) => {
         fn $name(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-            if a.shape() != b.shape() {
-                return Err(RumpyError::IncompatibleShapes(
-                    a.shape().to_vec(),
-                    b.shape().to_vec(),
-                ));
-            }
-            Ok(CpuArray::from_ndarray(a.as_ndarray() $op b.as_ndarray()))
+            let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x $op y)?;
+            Ok(CpuArray::from_ndarray(result))
         }
     };
 }
@@ -83,54 +79,24 @@ impl MathOps for CpuBackend {
         }))
     }
 
-    // Binary operations
-    impl_binary_op!(add, +);
-    impl_binary_op!(sub, -);
-    impl_binary_op!(mul, *);
-    impl_binary_op!(div, /);
+    // Binary operations with broadcasting support
+    impl_binary_op_broadcast!(add, +);
+    impl_binary_op_broadcast!(sub, -);
+    impl_binary_op_broadcast!(mul, *);
+    impl_binary_op_broadcast!(div, /);
 
     fn pow(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        if a.shape() != b.shape() {
-            return Err(RumpyError::IncompatibleShapes(
-                a.shape().to_vec(),
-                b.shape().to_vec(),
-            ));
-        }
-        let a_data = a.as_ndarray();
-        let b_data = b.as_ndarray();
-        let result = ndarray::Zip::from(a_data)
-            .and(b_data)
-            .map_collect(|&x, &y| x.powf(y));
+        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x.powf(y))?;
         Ok(CpuArray::from_ndarray(result))
     }
 
     fn maximum(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        if a.shape() != b.shape() {
-            return Err(RumpyError::IncompatibleShapes(
-                a.shape().to_vec(),
-                b.shape().to_vec(),
-            ));
-        }
-        let a_data = a.as_ndarray();
-        let b_data = b.as_ndarray();
-        let result = ndarray::Zip::from(a_data)
-            .and(b_data)
-            .map_collect(|&x, &y| x.max(y));
+        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x.max(y))?;
         Ok(CpuArray::from_ndarray(result))
     }
 
     fn minimum(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        if a.shape() != b.shape() {
-            return Err(RumpyError::IncompatibleShapes(
-                a.shape().to_vec(),
-                b.shape().to_vec(),
-            ));
-        }
-        let a_data = a.as_ndarray();
-        let b_data = b.as_ndarray();
-        let result = ndarray::Zip::from(a_data)
-            .and(b_data)
-            .map_collect(|&x, &y| x.min(y));
+        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x.min(y))?;
         Ok(CpuArray::from_ndarray(result))
     }
 
@@ -152,6 +118,7 @@ impl MathOps for CpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumpy_core::Array;
     use std::f64::consts::PI;
 
     fn approx_eq(a: f64, b: f64) -> bool {
@@ -285,9 +252,37 @@ mod tests {
 
     #[test]
     fn test_shape_mismatch() {
-        let a = arr(vec![1.0, 2.0, 3.0]);
-        let b = arr(vec![1.0, 2.0]);
+        // Incompatible shapes that can't be broadcast
+        let a = arr(vec![1.0, 2.0, 3.0]); // shape [3]
+        let b = arr(vec![1.0, 2.0]); // shape [2]
         let result = CpuBackend::add(&a, &b);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_broadcast_add() {
+        // (2, 3) + (3,) should broadcast
+        let a = CpuArray::from_f64_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let b = CpuArray::from_f64_vec(vec![10.0, 20.0, 30.0], vec![3]).unwrap();
+        let result = CpuBackend::add(&a, &b).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        assert_eq!(
+            result.as_f64_slice(),
+            vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]
+        );
+    }
+
+    #[test]
+    fn test_broadcast_mul_col_row() {
+        // (2, 1) * (1, 3) should broadcast to (2, 3)
+        let col = CpuArray::from_f64_vec(vec![2.0, 3.0], vec![2, 1]).unwrap();
+        let row = CpuArray::from_f64_vec(vec![1.0, 10.0, 100.0], vec![1, 3]).unwrap();
+        let result = CpuBackend::mul(&col, &row).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        // [[2*1, 2*10, 2*100], [3*1, 3*10, 3*100]]
+        assert_eq!(
+            result.as_f64_slice(),
+            vec![2.0, 20.0, 200.0, 3.0, 30.0, 300.0]
+        );
     }
 }

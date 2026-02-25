@@ -3,6 +3,7 @@
 //! Uses ndarray for array operations and faer for linear algebra.
 
 mod array;
+mod broadcast;
 mod compare;
 mod creation;
 mod linalg;
@@ -11,6 +12,8 @@ mod math;
 mod random;
 mod sort;
 mod stats;
+
+pub use broadcast::{broadcast_binary_op, broadcast_compare_op, broadcast_shapes, broadcast_to};
 
 pub use array::CpuArray;
 

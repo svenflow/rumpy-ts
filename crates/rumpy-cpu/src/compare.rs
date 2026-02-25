@@ -1,24 +1,14 @@
 //! Comparison operations for CPU backend
 
+use crate::broadcast::broadcast_compare_op;
 use crate::{CpuArray, CpuBackend};
-use rumpy_core::{ops::CompareOps, Array, Result, RumpyError};
+use rumpy_core::{ops::CompareOps, Array, Result};
 
-macro_rules! impl_compare_op {
+macro_rules! impl_compare_op_broadcast {
     ($name:ident, $op:tt) => {
         fn $name(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-            if a.shape() != b.shape() {
-                return Err(RumpyError::IncompatibleShapes(
-                    a.shape().to_vec(),
-                    b.shape().to_vec(),
-                ));
-            }
-            let result: Vec<f64> = a
-                .as_f64_slice()
-                .iter()
-                .zip(b.as_f64_slice().iter())
-                .map(|(&x, &y)| if x $op y { 1.0 } else { 0.0 })
-                .collect();
-            CpuArray::from_f64_vec(result, a.shape().to_vec())
+            let result = broadcast_compare_op(a.as_ndarray(), b.as_ndarray(), |x, y| x $op y)?;
+            Ok(CpuArray::from_ndarray(result))
         }
     };
 }
@@ -39,12 +29,13 @@ macro_rules! impl_compare_scalar_op {
 impl CompareOps for CpuBackend {
     type Array = CpuArray;
 
-    impl_compare_op!(eq, ==);
-    impl_compare_op!(ne, !=);
-    impl_compare_op!(lt, <);
-    impl_compare_op!(le, <=);
-    impl_compare_op!(gt, >);
-    impl_compare_op!(ge, >=);
+    // Comparison operations with broadcasting support
+    impl_compare_op_broadcast!(eq, ==);
+    impl_compare_op_broadcast!(ne, !=);
+    impl_compare_op_broadcast!(lt, <);
+    impl_compare_op_broadcast!(le, <=);
+    impl_compare_op_broadcast!(gt, >);
+    impl_compare_op_broadcast!(ge, >=);
 
     impl_compare_scalar_op!(eq_scalar, ==);
     impl_compare_scalar_op!(ne_scalar, !=);
@@ -84,6 +75,7 @@ impl CompareOps for CpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rumpy_core::Array;
 
     fn arr(data: Vec<f64>) -> CpuArray {
         CpuArray::from_f64_vec(data.clone(), vec![data.len()]).unwrap()
@@ -174,9 +166,22 @@ mod tests {
 
     #[test]
     fn test_shape_mismatch() {
-        let a = arr(vec![1.0, 2.0, 3.0]);
-        let b = arr(vec![1.0, 2.0]);
+        // Incompatible shapes that can't be broadcast
+        let a = arr(vec![1.0, 2.0, 3.0]); // shape [3]
+        let b = arr(vec![1.0, 2.0]); // shape [2]
         let result = CpuBackend::eq(&a, &b);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_broadcast_compare() {
+        // (2, 3) vs (3,) should broadcast
+        let a = CpuArray::from_f64_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]).unwrap();
+        let b = CpuArray::from_f64_vec(vec![2.0, 2.0, 2.0], vec![3]).unwrap();
+        let result = CpuBackend::gt(&a, &b).unwrap();
+        assert_eq!(result.shape(), &[2, 3]);
+        // Row 0: [1>2, 2>2, 3>2] = [0, 0, 1]
+        // Row 1: [4>2, 5>2, 6>2] = [1, 1, 1]
+        assert_eq!(result.as_f64_slice(), vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
     }
 }
