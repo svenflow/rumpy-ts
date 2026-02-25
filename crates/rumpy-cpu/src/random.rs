@@ -5,6 +5,7 @@ use ndarray::{ArrayD, IxDyn};
 use rand::prelude::*;
 use rand_distr::{Normal, Uniform};
 use rumpy_core::ops::RandomOps;
+use rumpy_core::Array;
 use std::cell::RefCell;
 
 thread_local! {

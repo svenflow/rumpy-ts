@@ -2,7 +2,7 @@
 
 use crate::{CpuArray, CpuBackend};
 use ndarray::{ArrayD, Axis, IxDyn};
-use rumpy_core::{ops::ManipulationOps, Array, Result, RumpyError};
+use rumpy_core::{ops::LinalgOps, ops::ManipulationOps, Array, Result, RumpyError};
 
 impl ManipulationOps for CpuBackend {
     type Array = CpuArray;
@@ -189,11 +189,11 @@ impl ManipulationOps for CpuBackend {
         let data = arr.as_f64_slice();
 
         // Pad reps to match dimensions
-        let mut full_reps = vec![1; shape.len().max(reps.len())];
+        let full_len = shape.len().max(reps.len());
+        let mut full_reps = vec![1; full_len];
+        let offset = full_len - reps.len();
         for (i, &r) in reps.iter().enumerate() {
-            if i < full_reps.len() {
-                full_reps[full_reps.len() - reps.len() + i] = r;
-            }
+            full_reps[offset + i] = r;
         }
 
         // Calculate new shape
@@ -261,7 +261,8 @@ impl ManipulationOps for CpuBackend {
         match axis {
             None => {
                 // Flip all elements (reverse flattened)
-                let reversed: Vec<f64> = data.iter().rev().cloned().collect();
+                let flat: Vec<f64> = data.iter().cloned().collect();
+                let reversed: Vec<f64> = flat.into_iter().rev().collect();
                 CpuArray::from_ndarray(
                     ArrayD::from_shape_vec(IxDyn(arr.shape()), reversed).unwrap(),
                 )
