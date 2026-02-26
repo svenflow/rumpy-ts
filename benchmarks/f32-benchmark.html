@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>F32 vs F64 SIMD Matmul Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    h1 { color: #6366f1; }
+    pre {
+      background: #141414;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 600px;
+      font-size: 14px;
+    }
+    button {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .fastest { color: #22c55e; font-weight: bold; }
+    table { border-collapse: collapse; margin-top: 1rem; }
+    th, td { padding: 0.5rem 1rem; border: 1px solid #333; text-align: right; }
+    th { background: #222; }
+  </style>
+</head>
+<body>
+  <h1>F32 vs F64 SIMD Matmul Benchmark</h1>
+  <p>Comparing rumpy-ts f32 SIMD vs f64 SIMD vs TensorFlow.js XNNPACK</p>
+
+  <button id="runBtn" onclick="runBenchmarks()">▶ Run Benchmarks</button>
+
+  <pre id="log">Initializing...</pre>
+
+  <div id="results"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    let rumpy = null;
+    let tfjsReady = false;
+
+    // Initialize TensorFlow.js WASM with multi-threading for fair comparison
+    async function initTFJS() {
+      log('Initializing TensorFlow.js WASM...');
+      try {
+        // Use same number of threads as rumpy for fair comparison
+        const numThreads = navigator.hardwareConcurrency || 4;
+        tf.wasm.setThreadsCount(numThreads);
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log(`✅ TensorFlow.js ready (backend: ${tf.getBackend()}, threads: ${numThreads} - MULTI-THREADED)`);
+        tfjsReady = true;
+      } catch (e) {
+        log(`❌ TensorFlow.js failed: ${e.message}`);
+      }
+    }
+
+    // Initialize rumpy-ts
+    async function initRumpy() {
+      log('Initializing rumpy-ts WASM...');
+      try {
+        const module = await import('./pkg/rumpy_wasm.js');
+        await module.default();
+        rumpy = module;
+        log('✅ rumpy-ts ready');
+        log(`   matmulF32 available: ${typeof rumpy.matmulF32 === 'function'}`);
+        log(`   matmulF32Packed available: ${typeof rumpy.matmulF32Packed === 'function'}`);
+        log(`   matmulF32FMA available: ${typeof rumpy.matmulF32FMA === 'function'}`);
+        log(`   matmulF32Parallel available: ${typeof rumpy.matmulF32Parallel === 'function'}`);
+        log(`   initThreadPool available: ${typeof rumpy.initThreadPool === 'function'}`);
+
+        // Initialize thread pool for parallel matmul
+        if (rumpy.initThreadPool) {
+          const numThreads = navigator.hardwareConcurrency || 4;
+          log(`   Initializing ${numThreads} threads...`);
+          await rumpy.initThreadPool(numThreads);
+          log(`   ✅ Thread pool ready (${rumpy.getNumThreads()} threads)`);
+        }
+      } catch (e) {
+        log(`❌ rumpy-ts failed: ${e.message}`);
+        console.error(e);
+      }
+    }
+
+    // Benchmark function
+    function benchmark(name, fn, iterations = 100) {
+      // Warmup
+      for (let i = 0; i < 10; i++) fn();
+
+      const times = [];
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        fn();
+        times.push(performance.now() - start);
+      }
+
+      times.sort((a, b) => a - b);
+      // Trim top and bottom 10%
+      const trimStart = Math.floor(times.length * 0.1);
+      const trimEnd = Math.floor(times.length * 0.9);
+      const trimmed = times.slice(trimStart, trimEnd);
+      const mean = trimmed.reduce((a, b) => a + b, 0) / trimmed.length;
+      const min = times[0];
+      const max = times[times.length - 1];
+
+      return { mean, min, max };
+    }
+
+    async function runBenchmarks() {
+      document.getElementById('runBtn').disabled = true;
+      logEl.textContent = 'Running benchmarks...\n';
+
+      const results = {};
+      const sizes = [32, 64, 100, 128, 256, 384, 512, 768, 1024];  // Now supports all sizes!
+      const iterations = 30;
+
+      log(`Config: iterations=${iterations}, sizes=[${sizes.join(', ')}]`);
+
+      // Helper to compute max absolute difference
+      function maxAbsDiff(a, b) {
+        let max = 0;
+        for (let i = 0; i < a.length; i++) {
+          const diff = Math.abs(a[i] - b[i]);
+          if (diff > max) max = diff;
+        }
+        return max;
+      }
+
+      for (const n of sizes) {
+        log(`\n=== Matrix Size: ${n}x${n} ===`);
+        results[n] = {};
+
+        // Create random data
+        const data1_f64 = new Float64Array(n * n).map(() => Math.random());
+        const data2_f64 = new Float64Array(n * n).map(() => Math.random());
+        const data1_f32 = new Float32Array(data1_f64);
+        const data2_f32 = new Float32Array(data2_f64);
+
+        // Get tfjs reference result for correctness check
+        let tfjsRef = null;
+        if (tfjsReady) {
+          const t1 = tf.tensor2d(Array.from(data1_f32), [n, n]);
+          const t2 = tf.tensor2d(Array.from(data2_f32), [n, n]);
+          const r = tf.matMul(t1, t2);
+          tfjsRef = r.dataSync();
+          r.dispose();
+          t1.dispose();
+          t2.dispose();
+        }
+
+        // rumpy-ts f64 via matmulF64
+        if (rumpy && rumpy.matmulF64) {
+          const result = benchmark('rumpy f64', () => {
+            rumpy.matmulF64(data1_f64, data2_f64, n, n, n);
+          }, iterations);
+          results[n]['rumpy-f64'] = result.mean;
+          log(`rumpy-ts f64: ${result.mean.toFixed(4)}ms (min: ${result.min.toFixed(4)}, max: ${result.max.toFixed(4)})`);
+        }
+
+        // rumpy-ts f32 via matmulF32 (no packing)
+        if (rumpy && rumpy.matmulF32) {
+          const result = benchmark('rumpy f32', () => {
+            rumpy.matmulF32(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-f32'] = result.mean;
+          // Correctness check
+          const rumpyOut = rumpy.matmulF32(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts f32: ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts f32 via matmulF32Packed (with B matrix packing)
+        if (rumpy && rumpy.matmulF32Packed) {
+          const result = benchmark('rumpy f32 packed', () => {
+            rumpy.matmulF32Packed(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-f32-packed'] = result.mean;
+          const rumpyOut = rumpy.matmulF32Packed(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts f32 packed: ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts f32 via matmulF32FMA (with FMA instructions)
+        if (rumpy && rumpy.matmulF32FMA) {
+          const result = benchmark('rumpy f32 FMA', () => {
+            rumpy.matmulF32FMA(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-f32-fma'] = result.mean;
+          const rumpyOut = rumpy.matmulF32FMA(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts f32 FMA: ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts f32 via matmulF32Parallel (multi-threaded SIMD)
+        if (rumpy && rumpy.matmulF32Parallel && rumpy.getNumThreads() > 1) {
+          const result = benchmark('rumpy f32 parallel', () => {
+            rumpy.matmulF32Parallel(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-f32-parallel'] = result.mean;
+          const rumpyOut = rumpy.matmulF32Parallel(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts f32 parallel (${rumpy.getNumThreads()} threads): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts XNNPACK-style with pre-packed B (pack once, multiply many times)
+        if (rumpy && rumpy.packB && rumpy.matmulXnnpack) {
+          // Pre-pack B once (simulating cached weights)
+          const packedB = rumpy.packB(data2_f32, n, n);
+          const result = benchmark('rumpy xnnpack-style', () => {
+            // Pass both original B and packed B (for handling N%8 != 0)
+            rumpy.matmulXnnpack(data1_f32, data2_f32, packedB, n, n, n);
+          }, iterations);
+          results[n]['rumpy-xnnpack'] = result.mean;
+          const rumpyOut = rumpy.matmulXnnpack(data1_f32, data2_f32, packedB, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts XNNPACK-style (pre-packed B): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts cache-blocked 6x8 kernel (best for large matrices 256+)
+        if (rumpy && rumpy.matmulF32Blocked) {
+          const result = benchmark('rumpy blocked', () => {
+            rumpy.matmulF32Blocked(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-blocked'] = result.mean;
+          const rumpyOut = rumpy.matmulF32Blocked(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts blocked (cache-optimized): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts cache-blocked XNNPACK-style (packed B + cache blocking)
+        if (rumpy && rumpy.packB && rumpy.matmulXnnpackBlocked) {
+          const packedB = rumpy.packB(data2_f32, n, n);
+          const result = benchmark('rumpy xnnpack blocked', () => {
+            rumpy.matmulXnnpackBlocked(data1_f32, data2_f32, packedB, n, n, n);
+          }, iterations);
+          results[n]['rumpy-xnnpack-blocked'] = result.mean;
+          const rumpyOut = rumpy.matmulXnnpackBlocked(data1_f32, data2_f32, packedB, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy-ts XNNPACK blocked (cache + pack): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // TensorFlow.js WASM (uses f32 internally)
+        if (tfjsReady) {
+          const t1 = tf.tensor2d(Array.from(data1_f32), [n, n]);
+          const t2 = tf.tensor2d(Array.from(data2_f32), [n, n]);
+          const result = benchmark('tfjs', () => {
+            const r = tf.matMul(t1, t2);
+            r.dataSync();
+            r.dispose();
+          }, iterations);
+          results[n]['tfjs-wasm'] = result.mean;
+          log(`tensorflow.js: ${result.mean.toFixed(4)}ms (min: ${result.min.toFixed(4)}, max: ${result.max.toFixed(4)})`);
+          t1.dispose();
+          t2.dispose();
+        }
+
+        // Calculate speedups
+        if (results[n]['rumpy-f64'] && results[n]['rumpy-f32']) {
+          const speedup = results[n]['rumpy-f64'] / results[n]['rumpy-f32'];
+          log(`  → f32 is ${speedup.toFixed(2)}x faster than f64`);
+        }
+        if (results[n]['rumpy-f32'] && results[n]['rumpy-f32-packed']) {
+          const packSpeedup = results[n]['rumpy-f32'] / results[n]['rumpy-f32-packed'];
+          log(`  → packed is ${packSpeedup.toFixed(2)}x ${packSpeedup > 1 ? 'faster' : 'slower'} than unpacked`);
+        }
+        if (results[n]['rumpy-f32-fma'] && results[n]['tfjs-wasm']) {
+          const ratio = results[n]['rumpy-f32-fma'] / results[n]['tfjs-wasm'];
+          log(`  → tfjs is ${ratio.toFixed(2)}x ${ratio > 1 ? 'faster' : 'slower'} than rumpy f32 FMA`);
+        }
+        if (results[n]['rumpy-f32-parallel'] && results[n]['tfjs-wasm']) {
+          const ratio = results[n]['rumpy-f32-parallel'] / results[n]['tfjs-wasm'];
+          if (ratio < 1) {
+            log(`  -> rumpy parallel is ${(1/ratio).toFixed(2)}x FASTER than tfjs!`);
+          } else {
+            log(`  -> tfjs is ${ratio.toFixed(2)}x faster than rumpy parallel`);
+          }
+        }
+        if (results[n]['rumpy-blocked'] && results[n]['tfjs-wasm']) {
+          const ratio = results[n]['rumpy-blocked'] / results[n]['tfjs-wasm'];
+          if (ratio < 1) {
+            log(`  -> rumpy blocked is ${(1/ratio).toFixed(2)}x FASTER than tfjs!`);
+          } else if (ratio > 1) {
+            log(`  -> tfjs is ${ratio.toFixed(2)}x faster than rumpy blocked`);
+          } else {
+            log(`  -> rumpy blocked matches tfjs!`);
+          }
+        }
+        if (results[n]['rumpy-xnnpack-blocked'] && results[n]['tfjs-wasm']) {
+          const ratio = results[n]['rumpy-xnnpack-blocked'] / results[n]['tfjs-wasm'];
+          if (ratio < 1) {
+            log(`  -> rumpy XNNPACK blocked is ${(1/ratio).toFixed(2)}x FASTER than tfjs!`);
+          } else if (ratio > 1) {
+            log(`  -> tfjs is ${ratio.toFixed(2)}x faster than rumpy XNNPACK blocked`);
+          } else {
+            log(`  -> rumpy XNNPACK blocked matches tfjs!`);
+          }
+        }
+      }
+
+      // Display results table
+      log('\n=== Summary Table (ms) ===');
+      displayResults(results, sizes);
+
+      log('\n✅ Benchmarks complete!');
+      log('\nJSON_RESULT:' + JSON.stringify(results));
+
+      window.benchmarkResults = results;
+      window.benchmarkComplete = true;
+
+      document.getElementById('runBtn').disabled = false;
+    }
+
+    function displayResults(results, sizes) {
+      let html = '<table><tr><th>Size</th><th>rumpy FMA</th><th>rumpy Parallel</th><th>tfjs WASM</th><th>Parallel vs FMA</th><th>vs tfjs</th></tr>';
+
+      for (const n of sizes) {
+        const r = results[n];
+        const fma = r['rumpy-f32-fma'];
+        const parallel = r['rumpy-f32-parallel'];
+        const tfjs = r['tfjs-wasm'];
+
+        const parallelSpeedup = fma && parallel ? (fma / parallel).toFixed(2) + 'x' : '—';
+        const best = parallel || fma;
+        const vsTfjs = best && tfjs ? (best / tfjs).toFixed(2) + 'x' : '—';
+
+        // Highlight fastest
+        const times = [
+          { name: 'fma', val: fma },
+          { name: 'parallel', val: parallel },
+          { name: 'tfjs', val: tfjs }
+        ].filter(x => x.val);
+        const fastest = times.sort((a, b) => a.val - b.val)[0]?.name;
+
+        html += `<tr>
+          <td>${n}x${n}</td>
+          <td class="${fastest === 'fma' ? 'fastest' : ''}">${fma ? fma.toFixed(3) : '—'}</td>
+          <td class="${fastest === 'parallel' ? 'fastest' : ''}">${parallel ? parallel.toFixed(3) : '—'}</td>
+          <td class="${fastest === 'tfjs' ? 'fastest' : ''}">${tfjs ? tfjs.toFixed(3) : '—'}</td>
+          <td>${parallelSpeedup}</td>
+          <td>${vsTfjs}</td>
+        </tr>`;
+      }
+
+      html += '</table>';
+      document.getElementById('results').innerHTML = html;
+    }
+
+    window.runBenchmarks = runBenchmarks;
+
+    // Initialize on load
+    async function init() {
+      await initTFJS();
+      await initRumpy();
+      log('\nReady! Click "Run Benchmarks" to start.');
+    }
+
+    init();
+  </script>
+</body>
+</html>
