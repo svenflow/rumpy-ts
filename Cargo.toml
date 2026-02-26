@@ -6,6 +6,8 @@ members = [
     "crates/rumpy-wasm",     # WASM bindings
     "crates/rumpy-webgpu",   # WebGPU backend (future)
     "crates/rumpy-tests",    # Shared test suite
+    "crates/pthreadpool-rs", # Thread pool for parallel computation
+    "crates/wasm-threadpool", # High-perf WASM thread pool (no rayon)
 ]
 
 [workspace.package]
@@ -27,13 +29,19 @@ rand = { version = "0.9", features = ["small_rng"] }
 rand_distr = "0.5"
 
 # WASM
+libm = "0.2"
 wasm-bindgen = "0.2"
+wasm-bindgen-rayon = "1.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = "0.3"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
 wasm-bindgen-test = "0.3"
+
+# Parallelism
+rayon = "1.10"
 
 # Testing
 approx = "0.5"

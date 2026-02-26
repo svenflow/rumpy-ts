@@ -1,0 +1,29 @@
+[package]
+name = "pthreadpool-rs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A Rust port of pthreadpool for efficient parallel computation"
+
+[features]
+default = []
+# Enable WASM threading support (requires SharedArrayBuffer + wasm-bindgen-rayon)
+wasm-threads = ["wasm-bindgen", "wasm-bindgen-rayon", "rayon", "js-sys"]
+
+[dependencies]
+# WASM dependencies (optional)
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-rayon = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native threading uses std::thread
+
+[lib]
+crate-type = ["rlib"]

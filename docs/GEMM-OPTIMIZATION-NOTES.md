@@ -1,21 +1,46 @@
 # GEMM Optimization Notes
 
-## Current Status (2026-02-25 - Updated)
+## 🏆 CURRENT STATUS: WE BEAT XNNPACK! (2026-02-26)
 
-### What's Working
+### Single-Threaded Performance - WE WIN ACROSS THE BOARD
 
-**All kernels produce correct outputs** (verified against TensorFlow.js XNNPACK):
-- `matmulF32` - Basic f32 SIMD with mul+add (6x8 micro-kernel)
-- `matmulF32Packed` - With B matrix packing (4x8 micro-kernel)
-- `matmulF32FMA` - Using relaxed_madd FMA instructions
-- `matmulF32Parallel` - Multi-threaded via Rayon (14 threads)
-- `matmulXnnpack` - XNNPACK-style with pre-packed B (fastest single-threaded)
-- `matmulF32Blocked` - Cache-blocked 6x8 kernel (experimental)
-- `matmulXnnpackBlocked` - Cache-blocked XNNPACK-style (experimental)
+Our new **optimized 6x8 micro-kernel** beats TensorFlow.js XNNPACK at ALL matrix sizes:
 
-### Performance vs XNNPACK (single-threaded, 2026-02-25 benchmarks)
+| Size | tfjs XNNPACK | rumpy optimized | Speedup | Notes |
+|------|--------------|-----------------|---------|-------|
+| 128x128 | 0.16ms | 0.10ms | **42% FASTER** | Small matrix optimization |
+| 256x256 | 0.86ms | 0.45ms | **48% FASTER** | Best improvement |
+| 512x512 | 4.09ms | 3.37ms | **18% FASTER** | |
+| 768x768 | 13.9ms | 11.3ms | **19% FASTER** | |
+| 1024x1024 | 32.8ms | 26.4ms | **20% FASTER** | |
+| 2048x2048 | 262ms | 214ms | **19% FASTER** | Large matrix |
+| 4096x4096 | 2167ms | 1832ms | **15% FASTER** | Very large matrix |
 
-With tfjs `setThreadsCount(1)` for fair comparison:
+### Key Optimizations That Made the Difference
+
+1. **MR=6, NR=8 micro-kernel** - 6 rows × 8 cols per tile, uses 12 v128 accumulator registers (fits perfectly in WASM's 16 XMM registers)
+
+2. **`v128_load32_splat` instead of `f32x4_splat`** - Dedicated instruction for broadcasting scalar to vector, faster than load+shuffle
+
+3. **`f32x4_relaxed_madd` (FMA)** - Fused multiply-add in tight inner loop (note: FMA is faster when used WITH the other optimizations, but was slower in isolation before)
+
+4. **L1/L2 cache blocking** - KC=256 (fits K-panel in L1), MC=72 (6 rows × 12 tiles), NC=128 (fits N-panel in L2)
+
+5. **B matrix packing** - Pack B once, reuse for all M-panels. Sequential memory access in inner loop.
+
+### Functions
+
+- `matmulF32Optimized` - Single-threaded optimized kernel (FASTEST single-threaded)
+- `matmulF32OptimizedParallel` - Multi-threaded version
+- Previous kernels still available for comparison
+
+---
+
+## Historical Data (2026-02-25)
+
+### Previous Performance (BEFORE optimization)
+
+Old results with `matmulXnnpack` (our previous best):
 
 | Size | rumpy XNNPACK | tfjs 1-thread | Ratio | Notes |
 |------|---------------|---------------|-------|-------|
@@ -29,19 +54,71 @@ With tfjs `setThreadsCount(1)` for fair comparison:
 | 768x768 | 13.4ms | 16.0ms | **0.84x FASTER** | |
 | 1024x1024 | 37.0ms | 33.7ms | 1.10x slower | Close |
 
-**Summary: We match or beat XNNPACK at 32, 384, 768!**
+### Multi-threaded Performance (old rayon-based, both 14 threads)
 
-### Multi-threaded Performance (14 threads)
+| Size | rumpy V2 | tfjs 14-thread | Ratio | Notes |
+|------|----------|----------------|-------|-------|
+| 32x32 | 0.007ms | 0.020ms | **2.9x FASTER** | Small matrix overhead |
+| 64x64 | 0.024ms | 0.019ms | 1.3x slower | Thread overhead |
+| 100x100 | 0.166ms | 0.031ms | 5.4x slower | |
+| 128x128 | 0.223ms | 0.041ms | 5.4x slower | |
+| 256x256 | 0.318ms | 0.116ms | 2.7x slower | |
+| 384x384 | 0.529ms | 0.326ms | 1.6x slower | |
+| 512x512 | 1.17ms | 0.74ms | 1.6x slower | |
+| 768x768 | 3.41ms | 2.31ms | 1.5x slower | |
+| 1024x1024 | 8.95ms | 5.35ms | 1.7x slower | |
 
-| Size | rumpy parallel | tfjs | Ratio | Notes |
-|------|----------------|------|-------|-------|
-| 256x256 | 0.34ms | 0.53ms | **1.56x FASTER** | |
-| 384x384 | 0.56ms | 1.77ms | **3.18x FASTER** | |
-| 512x512 | 1.23ms | 4.21ms | **3.41x FASTER** | |
-| 768x768 | 3.41ms | 15.96ms | **4.68x FASTER** | |
-| 1024x1024 | 8.95ms | 33.74ms | **3.77x FASTER** | |
+**NOTE**: Multi-threaded still needs testing with the new optimized kernel!
 
-**Our parallel implementation is 1.5-4.7x FASTER than single-threaded tfjs!**
+**We are 1.5-5x SLOWER than tfjs at most sizes with fair threading!**
+
+### V2 vs V1 Parallel (both 14 threads)
+
+| Size | V1 | V2 | V2 Speedup | Notes |
+|------|----|----|------------|-------|
+| 64x64 | 0.122ms | 0.024ms | **4.8x** | Huge win from no-alloc |
+| 100x100 | 0.231ms | 0.166ms | 1.4x | |
+| 128x128 | 0.230ms | 0.223ms | 1.0x | |
+| 256x256 | 0.353ms | 0.318ms | 1.1x | |
+| 512x512 | 1.19ms | 1.17ms | 1.0x | |
+| 1024x1024 | 9.03ms | 8.95ms | 1.0x | |
+
+V2's zero-allocation approach helps most at small sizes where allocation overhead dominates
+
+## WASM Binary Analysis (2026-02-25)
+
+Disassembled both rumpy_wasm_bg.wasm (470KB) and tfjs-backend-wasm-simd.wasm (415KB) using wasm2wat.
+
+### Instruction Counts Comparison
+
+| Instruction | Rumpy | TFJS | Analysis |
+|-------------|-------|------|----------|
+| **f32x4.relaxed_madd (FMA)** | 166 | 0 | We use FMA, they don't |
+| f32x4.mul | 677 | 1,585 | They use separate mul |
+| f32x4.add | 567 | 1,738 | They use separate add |
+| v128.load | 2,119 | 3,631 | They load more data |
+| v128.store | 1,955 | 1,646 | We store more often |
+| **Load/Store ratio** | 1.08 | 2.21 | They reuse data 2x more per store |
+| i8x16.shuffle | 324 | 888 | They do more data reorganization |
+| Branch instructions | 8,062 | 6,000 | We have more conditionals |
+| Loop instructions | 1,676 | 1,815 | Similar loop count |
+
+### Key Findings
+
+1. **FMA vs mul+add**: We use `f32x4.relaxed_madd` (166 instances), TFJS uses ZERO FMA. They use separate `f32x4.mul` + `f32x4.add`. V8's WASM runtime may optimize mul+add better than relaxed_madd.
+
+2. **Load/Store Ratio**: Our ratio is 1.08 (almost 1:1 load:store), theirs is 2.21 (load 2.2x per store). This indicates TFJS reuses loaded data much better - likely through register blocking and better accumulator management.
+
+3. **Branch Count**: We have 8,062 branches vs their 6,000 (35% more). This suggests more conditional paths, possibly from bounds checking, edge case handling, or less aggressive loop unrolling.
+
+4. **Shuffle Operations**: TFJS uses 888 shuffles vs our 324. More shuffles may indicate more sophisticated data reorganization for cache-friendly access patterns.
+
+### Implications
+
+- Our FMA usage may actually be hurting performance (matches micro-benchmark findings)
+- We need better register blocking to improve load/store ratio
+- Reducing branches could help - consider more aggressive inlining and loop unrolling
+- The fundamental difference may be XNNPACK's mature C→WASM vs our Rust→WASM codegen
 
 ## Key Learnings
 
@@ -67,8 +144,34 @@ Implemented cache blocking (KC=256, MC=128, NC=256) but it's SLOWER than non-blo
 
 The blocked kernels (`matmulF32Blocked`, `matmulXnnpackBlocked`) are available but not recommended.
 
-### 4. XNNPACK's Multi-threading is Built-in
-TensorFlow.js WASM backend uses XNNPACK which has built-in multi-threading. When comparing, we need to ensure fair thread counts. With `tf.wasm.setThreadsCount(1)`, we get fair single-threaded comparison.
+### 4. Rayon Threading Overhead in WASM is Brutal
+
+We investigated why our parallel implementation is 1.5-5x slower than TFJS parallel:
+
+**Our V1 problems (now partially fixed in V2):**
+- Each thread allocated its own `Vec<f32>` result
+- Results concatenated with `c.extend(chunk)` at the end
+- 1D row partitioning (all threads read entire B matrix)
+
+**V2 fixes:**
+- Uses `par_chunks_mut` to write directly to pre-allocated output
+- No per-thread allocation, no final copy
+- Still uses 1D row partitioning (TODO: 2D tiling)
+
+**Why XNNPACK/pthreadpool is still faster:**
+1. **pthreadpool vs rayon**: pthreadpool uses futex-based synchronization, wait-free work items, and persistent thread pools. Rayon uses work-stealing with atomic latches that have higher overhead in WASM.
+2. **2D tiling**: XNNPACK uses `parallelize_2d_tile_2d()` for M×N tiles. Each thread processes tiles and can steal from others. B columns stay hot in L2 cache.
+3. **Apple Silicon issue**: wasm-bindgen-rayon has known issues on M1/M4 - efficiency cores drag performance (see github.com/GoogleChromeLabs/wasm-bindgen-rayon/issues/16)
+4. **Atomics overhead**: WASM atomics are slower on Apple Silicon vs x86
+
+**Potential fixes not yet tried:**
+- 2D tile partitioning for better cache reuse
+- Reduce thread count (use 4 perf cores instead of 14 total)
+- Consider pthreadpool instead of rayon for WASM builds
+- JS Web Workers approach (each worker loads own WASM instance)
+
+### 5. XNNPACK's Multi-threading is Built-in
+TensorFlow.js WASM backend uses XNNPACK which has built-in multi-threading via pthreadpool. When comparing, we need to ensure fair thread counts.
 
 ### 5. Tile Size Matters
 We use 6x8 tiles (6 rows, 8 cols = 2 v128s per row). XNNPACK also uses 6x8 or similar. The tile size affects:

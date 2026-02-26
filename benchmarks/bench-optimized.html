@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Optimized GEMM Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+    }
+    pre { background: #141414; padding: 1rem; border-radius: 8px; overflow: auto; }
+    .fastest { color: #22c55e; font-weight: bold; }
+    .slower { color: #ef4444; }
+  </style>
+</head>
+<body>
+  <h1>Optimized 6x8 GEMM Benchmark</h1>
+  <pre id="log">Loading...</pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      console.log(msg);
+    }
+
+    let rumpy = null;
+
+    // Initialize
+    async function init() {
+      log('Initializing...');
+
+      // TensorFlow.js WASM single-threaded for fair comparison
+      log('Setting up TensorFlow.js WASM (single-threaded)...');
+      tf.wasm.setThreadsCount(1);
+      await tf.setBackend('wasm');
+      await tf.ready();
+      log(`✅ TensorFlow.js ready (backend: ${tf.getBackend()}, 1 thread)`);
+
+      // rumpy-ts
+      log('Loading rumpy-ts...');
+      const module = await import('./pkg/rumpy_wasm.js');
+      await module.default();
+      rumpy = module;
+      log('✅ rumpy-ts ready');
+      log(`   matmulF32Optimized available: ${typeof rumpy.matmulF32Optimized === 'function'}`);
+      log(`   matmulF32 available: ${typeof rumpy.matmulF32 === 'function'}`);
+
+      log('\nReady to benchmark!');
+    }
+
+    function benchmark(name, fn, iterations = 50) {
+      // Warmup
+      for (let i = 0; i < 5; i++) fn();
+
+      const times = [];
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        fn();
+        times.push(performance.now() - start);
+      }
+      times.sort((a, b) => a - b);
+      const median = times[Math.floor(times.length / 2)];
+      const mean = times.reduce((a, b) => a + b, 0) / times.length;
+      return { median, mean, min: times[0], max: times[times.length - 1] };
+    }
+
+    async function runBenchmark() {
+      const sizes = [256, 512, 1024, 2048, 4096];
+      const results = {};
+
+      for (const n of sizes) {
+        log(`\n=== Size ${n}x${n} ===`);
+        results[n] = {};
+
+        // Create test data
+        const data1 = new Float32Array(n * n);
+        const data2 = new Float32Array(n * n);
+        for (let i = 0; i < n * n; i++) {
+          data1[i] = Math.random();
+          data2[i] = Math.random();
+        }
+
+        // TensorFlow.js XNNPACK (single-threaded)
+        const tfA = tf.tensor2d(data1, [n, n]);
+        const tfB = tf.tensor2d(data2, [n, n]);
+
+        const tfjsResult = benchmark('tfjs', () => {
+          const c = tf.matMul(tfA, tfB);
+          c.dataSync(); // Ensure computation completes
+          c.dispose();
+        }, 30);
+        log(`  tfjs XNNPACK (1 thread):    ${tfjsResult.median.toFixed(2)} ms`);
+        results[n].tfjs = tfjsResult.median;
+
+        tfA.dispose();
+        tfB.dispose();
+
+        // rumpy-ts matmulF32 (existing)
+        if (rumpy.matmulF32) {
+          const f32Result = benchmark('rumpy f32', () => {
+            rumpy.matmulF32(data1, data2, n, n, n);
+          }, 30);
+          log(`  rumpy matmulF32:            ${f32Result.median.toFixed(2)} ms`);
+          results[n].rumpyF32 = f32Result.median;
+        }
+
+        // rumpy-ts matmulF32Optimized (NEW!)
+        if (rumpy.matmulF32Optimized) {
+          const optResult = benchmark('rumpy optimized', () => {
+            rumpy.matmulF32Optimized(data1, data2, n, n, n);
+          }, 30);
+          log(`  rumpy matmulF32Optimized:   ${optResult.median.toFixed(2)} ms`);
+          results[n].rumpyOptimized = optResult.median;
+
+          // Comparison
+          const vs_tfjs = optResult.median / tfjsResult.median;
+          const vs_old = optResult.median / results[n].rumpyF32;
+          log(`    vs tfjs: ${vs_tfjs.toFixed(2)}x ${vs_tfjs > 1 ? '(slower)' : '(FASTER!)'}`);
+          log(`    vs old:  ${vs_old.toFixed(2)}x ${vs_old > 1 ? '(slower)' : '(FASTER!)'}`);
+        }
+
+        // rumpy-ts matmulF32FMA (existing FMA version)
+        if (rumpy.matmulF32FMA) {
+          const fmaResult = benchmark('rumpy fma', () => {
+            rumpy.matmulF32FMA(data1, data2, n, n, n);
+          }, 30);
+          log(`  rumpy matmulF32FMA:         ${fmaResult.median.toFixed(2)} ms`);
+          results[n].rumpyFMA = fmaResult.median;
+        }
+      }
+
+      log('\n=== SUMMARY ===');
+      for (const n of sizes) {
+        const r = results[n];
+        log(`${n}x${n}: tfjs=${r.tfjs?.toFixed(2)}ms, rumpy_old=${r.rumpyF32?.toFixed(2)}ms, rumpy_opt=${r.rumpyOptimized?.toFixed(2)}ms`);
+      }
+
+      return results;
+    }
+
+    // Expose to window for node script
+    window.runBenchmark = runBenchmark;
+
+    // Auto-run if not headless
+    init().then(() => {
+      if (typeof window !== 'undefined' && !window.navigator.webdriver) {
+        runBenchmark();
+      }
+    });
+  </script>
+</body>
+</html>

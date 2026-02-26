@@ -2099,6 +2099,42 @@ pub fn matmul_dispatch_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -
     c
 }
 
+/// High-level f32 matmul that dispatches to SIMD or scalar, writing into a pre-allocated slice
+///
+/// This variant writes directly to the provided output slice, avoiding allocation.
+/// Use this for parallel implementations with par_chunks_mut.
+///
+/// # Arguments
+/// * `a` - Input matrix A of shape [m, k]
+/// * `b` - Input matrix B of shape [k, n]
+/// * `c` - Output slice of at least m*n elements to write result
+/// * `m`, `n`, `k` - Matrix dimensions
+pub fn matmul_dispatch_f32_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if m >= 4 && n >= 8 {
+            // Use packed version for matrices >= 64x64 (packing overhead is worth it)
+            // For smaller matrices, the overhead of packing isn't amortized
+            if m >= 64 && n >= 64 && k >= 64 {
+                unsafe {
+                    matmul_simd_f32_packed(a, b, c, m, n, k);
+                }
+            } else {
+                unsafe {
+                    matmul_simd_f32(a, b, c, m, n, k);
+                }
+            }
+        } else {
+            matmul_scalar_f32(a, b, c, m, n, k);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        matmul_scalar_f32(a, b, c, m, n, k);
+    }
+}
+
 /// High-level f64 matmul that dispatches to SIMD or scalar
 pub fn matmul_dispatch_f64(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
     let mut c = vec![0.0; m * n];
@@ -2220,6 +2256,175 @@ pub fn matmul_parallel_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -
     c
 }
 
+/// Parallel f32 GEMM V2 using rayon's par_chunks_mut
+///
+/// This version writes directly to pre-allocated output memory, avoiding
+/// per-thread allocations and the final copy step. This is significantly
+/// faster for large matrices.
+///
+/// Splits the M dimension across threads, with each thread writing to
+/// its own non-overlapping portion of the output.
+pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    // For small matrices, single-threaded is faster (no thread overhead)
+    if m * n * k < 64 * 64 * 64 {
+        return matmul_dispatch_f32(a, b, m, n, k);
+    }
+
+    // Pre-allocate output
+    let mut c = vec![0.0f32; m * n];
+
+    // Calculate chunk size (in elements, not rows)
+    let num_threads = rayon::current_num_threads();
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+    let chunk_size = rows_per_thread * n;  // elements per chunk
+
+    // Use par_chunks_mut to write directly to output
+    c.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(tid, c_chunk)| {
+            let start_row = tid * rows_per_thread;
+            if start_row >= m {
+                return;
+            }
+
+            // Calculate how many rows this chunk actually covers
+            let local_m = c_chunk.len() / n;
+            if local_m == 0 {
+                return;
+            }
+
+            // Get the corresponding slice of A
+            let a_slice = &a[start_row * k..(start_row + local_m) * k];
+
+            // Write directly to this chunk of C
+            matmul_dispatch_f32_into(a_slice, b, c_chunk, local_m, n, k);
+        });
+
+    c
+}
+
+/// Parallel f32 GEMM using pthreadpool-rs
+///
+/// This version uses pthreadpool-rs instead of rayon for parallelization.
+/// On native platforms, pthreadpool-rs uses its own efficient thread pool with
+/// work stealing. On WASM with the `wasm-threads` feature, it uses wasm-bindgen-rayon
+/// under the hood.
+///
+/// This is a drop-in replacement for matmul_parallel_f32_v2 that provides
+/// the same API but uses a different threading backend.
+pub fn matmul_pthreadpool_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use pthreadpool_rs::ThreadPool;
+
+    // For small matrices, single-threaded is faster (no thread overhead)
+    if m * n * k < 64 * 64 * 64 {
+        return matmul_dispatch_f32(a, b, m, n, k);
+    }
+
+    // Pre-allocate output
+    let mut c = vec![0.0f32; m * n];
+
+    // Use default thread pool (uses available parallelism)
+    let pool = ThreadPool::default();
+    let num_threads = pool.threads_count();
+
+    // Calculate rows per thread
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+
+    // Convert pointers to usize for Send+Sync (usize is always Send+Sync)
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_mut_ptr() as usize;
+
+    // Each parallel task processes one chunk of rows
+    let num_chunks = (m + rows_per_thread - 1) / rows_per_thread;
+
+    pool.parallelize_1d(num_chunks, |chunk_idx| {
+        let start_row = chunk_idx * rows_per_thread;
+        if start_row >= m {
+            return;
+        }
+
+        let end_row = (start_row + rows_per_thread).min(m);
+        let local_m = end_row - start_row;
+
+        // Safety: Each chunk writes to a non-overlapping portion of c
+        // and reads from shared a and b
+        unsafe {
+            let a_ptr = a_addr as *const f32;
+            let b_ptr = b_addr as *const f32;
+            let c_ptr = c_addr as *mut f32;
+
+            let a_slice = std::slice::from_raw_parts(a_ptr.add(start_row * k), local_m * k);
+            let b_slice = std::slice::from_raw_parts(b_ptr, k * n);
+            let c_slice = std::slice::from_raw_parts_mut(c_ptr.add(start_row * n), local_m * n);
+
+            matmul_dispatch_f32_into(a_slice, b_slice, c_slice, local_m, n, k);
+        }
+    });
+
+    c
+}
+
+/// Parallel f32 GEMM using pthreadpool-rs with provided pool
+///
+/// Same as matmul_pthreadpool_f32 but reuses an existing thread pool
+/// to avoid pool creation overhead for repeated calls.
+pub fn matmul_pthreadpool_f32_with_pool(
+    pool: &pthreadpool_rs::ThreadPool,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    // For small matrices, single-threaded is faster (no thread overhead)
+    if m * n * k < 64 * 64 * 64 {
+        return matmul_dispatch_f32(a, b, m, n, k);
+    }
+
+    // Pre-allocate output
+    let mut c = vec![0.0f32; m * n];
+
+    let num_threads = pool.threads_count();
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+
+    // Convert pointers to usize for Send+Sync (usize is always Send+Sync)
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_mut_ptr() as usize;
+
+    // Each parallel task processes one chunk of rows
+    let num_chunks = (m + rows_per_thread - 1) / rows_per_thread;
+
+    pool.parallelize_1d(num_chunks, |chunk_idx| {
+        let start_row = chunk_idx * rows_per_thread;
+        if start_row >= m {
+            return;
+        }
+
+        let end_row = (start_row + rows_per_thread).min(m);
+        let local_m = end_row - start_row;
+
+        // Safety: Each chunk writes to a non-overlapping portion of c
+        // and reads from shared a and b
+        unsafe {
+            let a_ptr = a_addr as *const f32;
+            let b_ptr = b_addr as *const f32;
+            let c_ptr = c_addr as *mut f32;
+
+            let a_slice = std::slice::from_raw_parts(a_ptr.add(start_row * k), local_m * k);
+            let b_slice = std::slice::from_raw_parts(b_ptr, k * n);
+            let c_slice = std::slice::from_raw_parts_mut(c_ptr.add(start_row * n), local_m * n);
+
+            matmul_dispatch_f32_into(a_slice, b_slice, c_slice, local_m, n, k);
+        }
+    });
+
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2245,4 +2450,449 @@ mod tests {
         assert!((c[2] - 139.0).abs() < 1e-5);
         assert!((c[3] - 154.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn test_pthreadpool_matmul_small() {
+        // Small matrix (uses single-threaded path)
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let c = matmul_pthreadpool_f32(&a, &b, 2, 2, 3);
+        assert!((c[0] - 58.0).abs() < 1e-5);
+        assert!((c[1] - 64.0).abs() < 1e-5);
+        assert!((c[2] - 139.0).abs() < 1e-5);
+        assert!((c[3] - 154.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_pthreadpool_matmul_large() {
+        // Large matrix to trigger parallel path (> 64*64*64 elements)
+        let m = 128;
+        let n = 128;
+        let k = 128;
+
+        // Create random-ish matrices
+        let a: Vec<f32> = (0..m*k).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..k*n).map(|i| (i as f32) * 0.001).collect();
+
+        // Compute with pthreadpool
+        let c_pthreadpool = matmul_pthreadpool_f32(&a, &b, m, n, k);
+
+        // Compute with dispatch (single-threaded reference)
+        let c_reference = matmul_dispatch_f32(&a, &b, m, n, k);
+
+        // Verify results match
+        assert_eq!(c_pthreadpool.len(), c_reference.len());
+        for i in 0..c_pthreadpool.len() {
+            let diff = (c_pthreadpool[i] - c_reference[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "Mismatch at index {}: pthreadpool={}, reference={}, diff={}",
+                i, c_pthreadpool[i], c_reference[i], diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_pthreadpool_matmul_with_pool() {
+        use pthreadpool_rs::ThreadPool;
+
+        // Large matrix
+        let m = 128;
+        let n = 128;
+        let k = 128;
+
+        let a: Vec<f32> = (0..m*k).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..k*n).map(|i| (i as f32) * 0.001).collect();
+
+        let pool = ThreadPool::new(4);
+
+        // Compute with provided pool
+        let c_pthreadpool = matmul_pthreadpool_f32_with_pool(&pool, &a, &b, m, n, k);
+
+        // Compute reference
+        let c_reference = matmul_dispatch_f32(&a, &b, m, n, k);
+
+        // Verify results match
+        for i in 0..c_pthreadpool.len() {
+            let diff = (c_pthreadpool[i] - c_reference[i]).abs();
+            assert!(
+                diff < 1e-3,
+                "Mismatch at index {}: pthreadpool={}, reference={}, diff={}",
+                i, c_pthreadpool[i], c_reference[i], diff
+            );
+        }
+    }
+}
+
+// ============================================================================
+// OPTIMIZED 6x8 GEMM - XNNPACK-competitive implementation
+// ============================================================================
+// Key optimizations:
+// 1. MR=6, NR=8 tile size (12 v128 accumulators = fits in 16 XMM registers)
+// 2. FMA via f32x4_relaxed_madd (single instruction instead of mul+add)
+// 3. v128_load32_splat for A values (dedicated instruction)
+// 4. L1/L2 cache blocking (KC, MC, NC)
+// 5. B matrix packing for contiguous access
+
+/// Cache blocking constants (tuned for typical L1=32KB, L2=256KB)
+const OPT_KC: usize = 256;  // K-dimension block (depth of dot product)
+const OPT_MC: usize = 72;   // M-dimension block (multiple of MR=6)
+const OPT_NC: usize = 128;  // N-dimension block (multiple of NR=8)
+const OPT_MR: usize = 6;    // Micro-kernel rows
+const OPT_NR: usize = 8;    // Micro-kernel cols
+
+/// Pack B matrix panel into contiguous format for optimal SIMD access.
+/// Layout: For each 8-column panel, store K rows contiguously.
+/// [k0:col0-7][k1:col0-7]...[k_KC:col0-7]
+#[cfg(target_arch = "wasm32")]
+pub fn pack_b_optimized(
+    b: *const f32,
+    ldb: usize,
+    packed_b: *mut f32,
+    k_size: usize,
+    n_size: usize,
+) {
+    unsafe {
+        let mut dest = packed_b;
+        let mut j = 0;
+
+        while j < n_size {
+            let n_remain = n_size - j;
+            let mut src_col = b.add(j);
+
+            if n_remain >= OPT_NR {
+                // Fast path: pack full 8 columns
+                for _k in 0..k_size {
+                    // Load 8 floats from B[k, j..j+8] (contiguous in row-major B)
+                    let v0 = v128_load(src_col as *const v128);
+                    let v1 = v128_load(src_col.add(4) as *const v128);
+
+                    v128_store(dest as *mut v128, v0);
+                    v128_store(dest.add(4) as *mut v128, v1);
+
+                    dest = dest.add(OPT_NR);
+                    src_col = src_col.add(ldb);
+                }
+            } else {
+                // Edge case: pad with zeros
+                for _k in 0..k_size {
+                    for x in 0..n_remain {
+                        *dest.add(x) = *src_col.add(x);
+                    }
+                    for x in n_remain..OPT_NR {
+                        *dest.add(x) = 0.0;
+                    }
+                    dest = dest.add(OPT_NR);
+                    src_col = src_col.add(ldb);
+                }
+            }
+            j += OPT_NR;
+        }
+    }
+}
+
+/// Optimized 6x8 micro-kernel using FMA and loadsplat
+///
+/// Computes C[6x8] += A[6xK] * B_packed[Kx8]
+///
+/// Uses 12 accumulator registers (fits in 16 XMM), 2 for B, 1 for A splat
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub unsafe fn micro_kernel_6x8_fma(
+    k_size: usize,
+    a_ptr: *const f32,
+    lda: usize,
+    b_packed: *const f32,
+    c_ptr: *mut f32,
+    ldc: usize,
+    beta: f32,  // 0.0 = overwrite, 1.0 = accumulate
+) {
+    // Setup A row pointers
+    let a0 = a_ptr;
+    let a1 = a_ptr.add(lda);
+    let a2 = a_ptr.add(lda * 2);
+    let a3 = a_ptr.add(lda * 3);
+    let a4 = a_ptr.add(lda * 4);
+    let a5 = a_ptr.add(lda * 5);
+
+    // 12 accumulators: 6 rows × 2 vectors (8 cols)
+    let mut c00 = f32x4_splat(0.0);
+    let mut c01 = f32x4_splat(0.0);
+    let mut c10 = f32x4_splat(0.0);
+    let mut c11 = f32x4_splat(0.0);
+    let mut c20 = f32x4_splat(0.0);
+    let mut c21 = f32x4_splat(0.0);
+    let mut c30 = f32x4_splat(0.0);
+    let mut c31 = f32x4_splat(0.0);
+    let mut c40 = f32x4_splat(0.0);
+    let mut c41 = f32x4_splat(0.0);
+    let mut c50 = f32x4_splat(0.0);
+    let mut c51 = f32x4_splat(0.0);
+
+    let mut b_run = b_packed;
+
+    // K loop - single iteration per K value
+    for kk in 0..k_size {
+        // Load B: 8 columns = 2 vectors (contiguous in packed format)
+        let vb0 = v128_load(b_run as *const v128);
+        let vb1 = v128_load(b_run.add(4) as *const v128);
+        b_run = b_run.add(8);
+
+        // Row 0: loadsplat + FMA
+        let va0 = v128_load32_splat(a0.add(kk) as *const u32);
+        c00 = f32x4_relaxed_madd(va0, vb0, c00);
+        c01 = f32x4_relaxed_madd(va0, vb1, c01);
+
+        // Row 1
+        let va1 = v128_load32_splat(a1.add(kk) as *const u32);
+        c10 = f32x4_relaxed_madd(va1, vb0, c10);
+        c11 = f32x4_relaxed_madd(va1, vb1, c11);
+
+        // Row 2
+        let va2 = v128_load32_splat(a2.add(kk) as *const u32);
+        c20 = f32x4_relaxed_madd(va2, vb0, c20);
+        c21 = f32x4_relaxed_madd(va2, vb1, c21);
+
+        // Row 3
+        let va3 = v128_load32_splat(a3.add(kk) as *const u32);
+        c30 = f32x4_relaxed_madd(va3, vb0, c30);
+        c31 = f32x4_relaxed_madd(va3, vb1, c31);
+
+        // Row 4
+        let va4 = v128_load32_splat(a4.add(kk) as *const u32);
+        c40 = f32x4_relaxed_madd(va4, vb0, c40);
+        c41 = f32x4_relaxed_madd(va4, vb1, c41);
+
+        // Row 5
+        let va5 = v128_load32_splat(a5.add(kk) as *const u32);
+        c50 = f32x4_relaxed_madd(va5, vb0, c50);
+        c51 = f32x4_relaxed_madd(va5, vb1, c51);
+    }
+
+    // Store results
+    let c0 = c_ptr;
+    let c1 = c_ptr.add(ldc);
+    let c2 = c_ptr.add(ldc * 2);
+    let c3 = c_ptr.add(ldc * 3);
+    let c4 = c_ptr.add(ldc * 4);
+    let c5 = c_ptr.add(ldc * 5);
+
+    if beta == 0.0 {
+        // Overwrite
+        v128_store(c0 as *mut v128, c00);
+        v128_store(c0.add(4) as *mut v128, c01);
+        v128_store(c1 as *mut v128, c10);
+        v128_store(c1.add(4) as *mut v128, c11);
+        v128_store(c2 as *mut v128, c20);
+        v128_store(c2.add(4) as *mut v128, c21);
+        v128_store(c3 as *mut v128, c30);
+        v128_store(c3.add(4) as *mut v128, c31);
+        v128_store(c4 as *mut v128, c40);
+        v128_store(c4.add(4) as *mut v128, c41);
+        v128_store(c5 as *mut v128, c50);
+        v128_store(c5.add(4) as *mut v128, c51);
+    } else {
+        // Accumulate (beta = 1.0)
+        v128_store(c0 as *mut v128, f32x4_add(v128_load(c0 as *const v128), c00));
+        v128_store(c0.add(4) as *mut v128, f32x4_add(v128_load(c0.add(4) as *const v128), c01));
+        v128_store(c1 as *mut v128, f32x4_add(v128_load(c1 as *const v128), c10));
+        v128_store(c1.add(4) as *mut v128, f32x4_add(v128_load(c1.add(4) as *const v128), c11));
+        v128_store(c2 as *mut v128, f32x4_add(v128_load(c2 as *const v128), c20));
+        v128_store(c2.add(4) as *mut v128, f32x4_add(v128_load(c2.add(4) as *const v128), c21));
+        v128_store(c3 as *mut v128, f32x4_add(v128_load(c3 as *const v128), c30));
+        v128_store(c3.add(4) as *mut v128, f32x4_add(v128_load(c3.add(4) as *const v128), c31));
+        v128_store(c4 as *mut v128, f32x4_add(v128_load(c4 as *const v128), c40));
+        v128_store(c4.add(4) as *mut v128, f32x4_add(v128_load(c4.add(4) as *const v128), c41));
+        v128_store(c5 as *mut v128, f32x4_add(v128_load(c5 as *const v128), c50));
+        v128_store(c5.add(4) as *mut v128, f32x4_add(v128_load(c5.add(4) as *const v128), c51));
+    }
+}
+
+/// Handle edge cases where M < 6 or N < 8
+#[cfg(target_arch = "wasm32")]
+unsafe fn micro_kernel_edge(
+    m_rem: usize,
+    n_rem: usize,
+    k: usize,
+    a: *const f32,
+    lda: usize,
+    b_packed: *const f32,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+) {
+    // Use a temp buffer for the full 6x8 tile
+    let mut tmp_c = [0.0f32; OPT_MR * OPT_NR];
+    let tmp_ldc = OPT_NR;
+
+    // Load existing C if accumulating
+    if beta != 0.0 {
+        for r in 0..m_rem {
+            for col in 0..n_rem.min(OPT_NR) {
+                tmp_c[r * tmp_ldc + col] = *c.add(r * ldc + col);
+            }
+        }
+    }
+
+    // Run full kernel on temp buffer
+    micro_kernel_6x8_fma(k, a, lda, b_packed, tmp_c.as_mut_ptr(), tmp_ldc, 0.0);
+
+    // Copy valid results back
+    for r in 0..m_rem {
+        for col in 0..n_rem.min(OPT_NR) {
+            if beta == 0.0 {
+                *c.add(r * ldc + col) = tmp_c[r * tmp_ldc + col];
+            } else {
+                *c.add(r * ldc + col) += tmp_c[r * tmp_ldc + col];
+            }
+        }
+    }
+}
+
+/// Cache-blocked GEMM dispatcher using optimized 6x8 micro-kernel
+///
+/// C = A * B where A is [m, k], B is [k, n], C is [m, n]
+#[cfg(target_arch = "wasm32")]
+pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+
+    // Allocate packing buffer for B (KC x NC)
+    let pack_size = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
+    let mut packed_b = vec![0.0f32; pack_size];
+
+    unsafe {
+        // Loop over N in blocks of NC
+        let mut j = 0;
+        while j < n {
+            let j_block = (n - j).min(OPT_NC);
+            let j_panels = (j_block + OPT_NR - 1) / OPT_NR;
+
+            // Loop over K in blocks of KC
+            let mut p = 0;
+            while p < k {
+                let p_block = (k - p).min(OPT_KC);
+
+                // Pack B panel: B[p..p+p_block, j..j+j_block]
+                pack_b_optimized(
+                    b.as_ptr().add(p * n + j),
+                    n,
+                    packed_b.as_mut_ptr(),
+                    p_block,
+                    j_block,
+                );
+
+                // Beta = 0.0 for first K block, 1.0 for subsequent (accumulate)
+                let beta = if p == 0 { 0.0 } else { 1.0 };
+
+                // Loop over M in blocks of MC
+                let mut i = 0;
+                while i < m {
+                    let i_block = (m - i).min(OPT_MC);
+                    let i_main = i_block / OPT_MR * OPT_MR;
+
+                    // Process full MR×NR tiles
+                    let mut ii = 0;
+                    while ii < i_main {
+                        let mut jj = 0;
+                        while jj < j_panels * OPT_NR && jj < j_block {
+                            let panel_idx = jj / OPT_NR;
+                            let b_panel_ptr = packed_b.as_ptr().add(panel_idx * p_block * OPT_NR);
+                            let n_rem = j_block - jj;
+
+                            if n_rem >= OPT_NR {
+                                micro_kernel_6x8_fma(
+                                    p_block,
+                                    a.as_ptr().add((i + ii) * k + p),
+                                    k,
+                                    b_panel_ptr,
+                                    c.as_mut_ptr().add((i + ii) * n + j + jj),
+                                    n,
+                                    beta,
+                                );
+                            } else {
+                                micro_kernel_edge(
+                                    OPT_MR,
+                                    n_rem,
+                                    p_block,
+                                    a.as_ptr().add((i + ii) * k + p),
+                                    k,
+                                    b_panel_ptr,
+                                    c.as_mut_ptr().add((i + ii) * n + j + jj),
+                                    n,
+                                    beta,
+                                );
+                            }
+                            jj += OPT_NR;
+                        }
+                        ii += OPT_MR;
+                    }
+
+                    // Handle remaining rows (i_main..i_block)
+                    if ii < i_block {
+                        let m_rem = i_block - ii;
+                        let mut jj = 0;
+                        while jj < j_panels * OPT_NR && jj < j_block {
+                            let panel_idx = jj / OPT_NR;
+                            let b_panel_ptr = packed_b.as_ptr().add(panel_idx * p_block * OPT_NR);
+                            let n_rem = (j_block - jj).min(OPT_NR);
+
+                            micro_kernel_edge(
+                                m_rem,
+                                n_rem,
+                                p_block,
+                                a.as_ptr().add((i + ii) * k + p),
+                                k,
+                                b_panel_ptr,
+                                c.as_mut_ptr().add((i + ii) * n + j + jj),
+                                n,
+                                beta,
+                            );
+                            jj += OPT_NR;
+                        }
+                    }
+
+                    i += OPT_MC;
+                }
+
+                p += OPT_KC;
+            }
+
+            j += OPT_NC;
+        }
+    }
+
+    c
+}
+
+/// Parallel version of optimized GEMM using rayon
+#[cfg(target_arch = "wasm32")]
+pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    // For small matrices, single-threaded is faster
+    if m * n * k < 64 * 64 * 64 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    let mut c = vec![0.0f32; m * n];
+
+    // Split by rows - each thread gets a chunk of rows
+    let num_threads = rayon::current_num_threads();
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+
+    c.par_chunks_mut(rows_per_thread * n)
+        .enumerate()
+        .for_each(|(chunk_idx, c_chunk)| {
+            let start_row = chunk_idx * rows_per_thread;
+            let local_m = c_chunk.len() / n;
+            if local_m == 0 { return; }
+
+            let a_slice = &a[start_row * k..(start_row + local_m) * k];
+
+            // Use optimized kernel for this chunk
+            let local_c = matmul_optimized_f32(a_slice, b, local_m, n, k);
+            c_chunk.copy_from_slice(&local_c);
+        });
+
+    c
 }

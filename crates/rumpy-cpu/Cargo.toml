@@ -8,11 +8,17 @@ license.workspace = true
 
 [dependencies]
 rumpy-core = { path = "../rumpy-core" }
+pthreadpool-rs = { path = "../pthreadpool-rs" }
 ndarray.workspace = true
 faer.workspace = true
+gemm = "0.18"
+rayon.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_feature = "atomics"))'.dependencies]
+pthreadpool-rs = { path = "../pthreadpool-rs", features = ["wasm-threads"] }
 
 [dev-dependencies]
 approx.workspace = true

@@ -1,6 +1,7 @@
 //! Linear algebra operations for CPU backend using faer
+//! On WASM targets with simd128, uses hand-optimized SIMD GEMM kernels.
 
-use crate::{CpuArray, CpuBackend};
+use crate::{simd_gemm, CpuArray, CpuBackend};
 use faer::Mat;
 use ndarray::{ArrayD, IxDyn};
 use rumpy_core::{ops::LinalgOps, Array, Result, RumpyError};
@@ -41,18 +42,44 @@ impl LinalgOps for CpuBackend {
     type Array = CpuArray;
 
     fn matmul(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        let mat_a = to_faer(a)?;
-        let mat_b = to_faer(b)?;
+        let a_shape = a.shape();
+        let b_shape = b.shape();
 
-        if mat_a.ncols() != mat_b.nrows() {
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(RumpyError::InvalidArgument("Matrix must be 2D".to_string()));
+        }
+
+        let (m, k1) = (a_shape[0], a_shape[1]);
+        let (k2, n) = (b_shape[0], b_shape[1]);
+
+        if k1 != k2 {
             return Err(RumpyError::IncompatibleShapes(
                 a.shape().to_vec(),
                 b.shape().to_vec(),
             ));
         }
 
-        let result = &mat_a * &mat_b;
-        Ok(from_faer(&result))
+        let k = k1;
+
+        // Use SIMD-optimized GEMM on WASM (simd128 is enabled via .cargo/config.toml rustflags)
+        // Fall back to faer for native targets
+        #[cfg(target_arch = "wasm32")]
+        {
+            let a_data = a.as_f64_slice();
+            let b_data = b.as_f64_slice();
+            let c_data = simd_gemm::matmul_dispatch_f64(&a_data, &b_data, m, n, k);
+            Ok(CpuArray::from_ndarray(
+                ArrayD::from_shape_vec(IxDyn(&[m, n]), c_data).unwrap(),
+            ))
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mat_a = to_faer(a)?;
+            let mat_b = to_faer(b)?;
+            let result = &mat_a * &mat_b;
+            Ok(from_faer(&result))
+        }
     }
 
     fn dot(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
