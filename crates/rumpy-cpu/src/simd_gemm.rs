@@ -2219,7 +2219,8 @@ pub fn matmul_parallel_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -
     use rayon::prelude::*;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows silently at 2048³.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2268,7 +2269,8 @@ pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
     use rayon::prelude::*;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows silently at 2048³.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2318,7 +2320,8 @@ pub fn matmul_pthreadpool_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
     use pthreadpool_rs::ThreadPool;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows silently at 2048³.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2380,7 +2383,8 @@ pub fn matmul_pthreadpool_f32_with_pool(
     k: usize,
 ) -> Vec<f32> {
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows silently at 2048³.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -3090,7 +3094,8 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
     use rayon::prelude::*;
 
     // For small matrices, single-threaded is faster
-    if m * n * k < 64 * 64 * 64 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows silently at 2048³.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
@@ -3371,7 +3376,18 @@ unsafe fn matmul_optimized_f32_slab(
 /// so it may hit in L2/L3 from a sibling; N-tiles read disjoint B).
 #[cfg(target_arch = "wasm32")]
 pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-    if m * n * k < 128 * 128 * 128 {
+    // WARNING: WASM usize is 32-bit. `m * n * k` at 2048³ = 8.6e9 overflows
+    // to 0 and silently routed to the single-threaded fallback — looked
+    // EXACTLY like a cache-conflict collapse in benchmarks (1.0× scaling,
+    // workers confirmed running on distinct threads via probe, any other
+    // dimension combination fine). Took ~6 hours of phantom-chasing to
+    // find. ALWAYS use u64 for flop estimates in WASM.
+    //
+    // Threshold: 192³ ≈ 7M flops. Below this, rayon dispatch overhead
+    // (~100-500 μs depending on worker warmth) dominates the ~100 μs
+    // of parallel compute. 128³ was just at the break-even and lost.
+    let flops = (m as u64) * (n as u64) * (k as u64);
+    if flops < (192u64 * 192 * 192) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
@@ -3385,14 +3401,18 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
     // Padding decisions come FIRST so the fast-path short-circuit can
     // branch on them.
     //
-    // A-packing gates on K's byte-stride having ≥ 12 trailing zero bits
-    // (K divisible by 1024). That's where 6-row micro-kernel A-aliasing
-    // becomes parallel-fatal. Below that the aliasing is mild and the
-    // A-pack overhead (~7 ms at 1024²) isn't worth it.
+    // HISTORICAL NOTE: A-packing and C-stride padding were added while
+    // chasing a "pow-of-2 collapse" that turned out to be the 32-bit
+    // `m * n * k` overflow at 2048³ (= 8.6e9 wraps to 0 → silent fallback
+    // to single-threaded). Once fixed with u64, the pow-of-2 sizes scale
+    // fine WITHOUT these mitigations (v1 gets 6.3× at 2048³).
     //
-    // C-stride padding gates on the same threshold for N (cheap — no
-    // input copy, just a larger output buffer + compaction on return).
-    const PAD_ZEROS_THRESHOLD: u32 = 12;
+    // We keep A-packing and C-padding gated but with a HIGH threshold
+    // (only K or N ≥ 4096 AND divisible by 4096 triggers) — there's a
+    // theoretical cache-set-aliasing risk at very large pow2 strides that
+    // we haven't yet hit in practice but is cheap to defend against.
+    // At the typical ML sizes (512-4096) the fast path is always taken.
+    const PAD_ZEROS_THRESHOLD: u32 = 14;  // K or N divisible by 4096
     let pack_a_enabled = (k * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD;
     let n_stride = if (n * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD {
         n + OPT_NR
@@ -3443,19 +3463,23 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
         // pow2 to worry about, so losing N+1 parallelism doesn't matter.
         let pb_region = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
         let scratch_stride_fast = pb_region + 17;
-        // `mut` + as_mut_ptr is REQUIRED here even though we only mutate
-        // through raw pointers: without it, LLVM's provenance model lets
-        // it assume the buffer is never written and reorder/elide accesses.
-        // Measured: as_ptr() gave 8× slowdown at 128² from UB-induced
-        // misoptimisation (writes to scratch became no-ops, micro-kernel
-        // read stale zeros, results were still CORRECT because correctness
-        // doesn't depend on scratch contents — but perf cratered).
-        let mut scratch_arena = vec![0.0f32; scratch_stride_fast * total_tiles];
+        // Uninitialised scratch: pack_b_optimized writes before reading so
+        // zero-fill is wasted. At 128² with 8 slabs, vec![0.0; N] was
+        // zeroing ~1 MiB = ~200 μs = 60% of total wall time.
+        //
+        // `mut` + as_mut_ptr is REQUIRED for correct provenance — without
+        // it LLVM assumed scratch was never mutated and reordered/elided
+        // writes (measured ~8× slowdown at 128² from that UB alone).
+        let mut scratch_arena: Vec<f32> = Vec::with_capacity(scratch_stride_fast * total_tiles);
+        unsafe { scratch_arena.set_len(scratch_stride_fast * total_tiles); }
 
         let a_addr = a.as_ptr() as usize;
         let b_addr = b.as_ptr() as usize;
         let scratch_addr = scratch_arena.as_mut_ptr() as usize;
 
+        // C must be zeroed: the micro-kernel with beta=0 overwrites, but
+        // edge tiles use micro_kernel_edge which does NOT fully overwrite.
+        // Safer to zero; M×N is small compared to scratch.
         let mut c = vec![0.0f32; m * n];
         let c_addr = c.as_mut_ptr() as usize;
 
@@ -3499,19 +3523,8 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
     // POWER-OF-2 STRIDE DEFENCE
     // ========================================================================
     //
-    // (pack_a_enabled, c_padded, n_stride declared above before the
-    // fast-path short-circuit.)
-    //
-    // KNOWN ISSUE — the (M,N,K) all-pow2 "cursed triple":
-    // When ALL THREE dimensions are large power-of-2 (e.g. 2048³), parallel
-    // scaling collapses to 1.0× for reasons we've not been able to isolate
-    // despite exhaustive probing (see PR #2). Stride padding, buffer
-    // spacing, M-extension: none of them help. Workers ARE running on
-    // distinct rayon threads (confirmed via probe). The per-worker work
-    // just takes single-threaded time. Likely an L2/L3 set-conflict
-    // cascade from dlmalloc's address policy for pow2-sized buffers, or a
-    // V8/WASM runtime quirk — unresolved. WORKAROUND: use one non-pow2
-    // dimension (e.g. 2056 instead of 2048 for any one of M/N/K).
+    // Pow-of-2-aware path (K or N triggers padding/packing). pack_a_enabled,
+    // c_padded, n_stride were declared above before the fast-path branch.
 
     let mut c_internal = vec![0.0f32; m * n_stride];
 
@@ -3524,7 +3537,10 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
     let pb_region = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
     let pa_region = if pack_a_enabled { OPT_MR * OPT_KC } else { 0 };
     let scratch_stride = pb_region + pa_region + 17;
-    let mut scratch_arena = vec![0.0f32; scratch_stride * n_parts];
+    // Uninitialised: pack functions write before reading. Zero-filling
+    // ~1 MiB was measurable overhead at small sizes.
+    let mut scratch_arena: Vec<f32> = Vec::with_capacity(scratch_stride * n_parts);
+    unsafe { scratch_arena.set_len(scratch_stride * n_parts); }
 
     let a_addr = a.as_ptr() as usize;
     let b_addr = b.as_ptr() as usize;
@@ -3631,7 +3647,8 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
 pub fn matmul_optimized_f32_parallel_v4(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use core::arch::wasm32::{memory_atomic_notify, memory_atomic_wait32};
 
-    if m * n * k < 128 * 128 * 128 {
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows at 2048³ → 0.
+    if (m as u64) * (n as u64) * (k as u64) < (128u64 * 128 * 128) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 

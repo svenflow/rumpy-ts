@@ -753,6 +753,41 @@ pub fn probe_v3_dispatch(n_tiles: usize, work_ms_per_tile: f64) -> Vec<f64> {
     out
 }
 
+/// DEBUG: report which code path v3 would take for given (m,n,k).
+/// Returns: [below_threshold, pack_a, c_pad, fast_path, slab_rows, total_tiles, tz(k*4), tz(n*4)]
+#[wasm_bindgen(js_name = probeV3Path)]
+pub fn probe_v3_path(m: usize, n: usize, k: usize) -> Vec<usize> {
+    const PAD_ZEROS_THRESHOLD: u32 = 12;
+    const OPT_MR: usize = 6;
+
+    // u64 mul: WASM usize is 32-bit, m*n*k overflows at 2048³ → 0.
+    // (This was the "cursed triple" — overflow → false below_threshold
+    // positive → silent single-threaded fallback.)
+    let flops = (m as u64) * (n as u64) * (k as u64);
+    let size_below_threshold = flops < (192u64 * 192 * 192);
+
+    let n_workers = rayon::current_num_threads().max(1);
+    let pack_a = (k * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD;
+    let c_pad = (n * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD;
+    let slab_rows = {
+        let base = (m + n_workers - 1) / n_workers;
+        ((base + OPT_MR - 1) / OPT_MR * OPT_MR).max(OPT_MR)
+    };
+    let total_tiles = (m + slab_rows - 1) / slab_rows;
+    let fast = !pack_a && !c_pad && !size_below_threshold && total_tiles >= 2;
+
+    vec![
+        size_below_threshold as usize,
+        pack_a as usize,
+        c_pad as usize,
+        fast as usize,
+        slab_rows,
+        total_tiles,
+        (k * 4).trailing_zeros() as usize,
+        (n * 4).trailing_zeros() as usize,
+    ]
+}
+
 /// DEBUG: probe whether rayon workers are actually executing in parallel.
 ///
 /// Spawns N tasks, each recording its rayon thread index and spinning for

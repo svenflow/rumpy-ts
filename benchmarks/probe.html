@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head><body><pre id="log"></pre>
+<script type="module">
+const L = document.getElementById('log');
+const log = m => { L.textContent += m + '\n'; console.log(m); };
+
+const r = await import('./pkg/rumpy_wasm.js');
+await r.default();
+await r.initThreadPool(8);
+log(`threads: ${r.getNumThreads()}\n`);
+
+function med(fn, n=5) {
+  for(let i=0;i<3;i++) fn();
+  const t=[]; for(let i=0;i<n;i++){const s=performance.now();fn();t.push(performance.now()-s);}
+  t.sort((a,b)=>a-b); return t[n>>1];
+}
+
+log('probeV3Path: [below_threshold, pack_a, c_pad, FAST, slab_rows, total_tiles, tz(k*4), tz(n*4)]');
+for (const n of [64, 100, 127, 128, 129, 200, 256, 500, 512, 1000, 1024, 2040, 2048]) {
+  const p = r.probeV3Path(n, n, n);
+  log(`n=${n.toString().padStart(4)}: [${p.join(',')}]`);
+}
+
+// Now time 128 and nearby sizes to isolate.
+log('\nTiming around 128 (all non-pow2 path):');
+for (const n of [120, 126, 127, 128, 129, 130, 132, 200]) {
+  const A = new Float32Array(n*n).map(Math.random);
+  const st = med(() => r.matmulF32Optimized(A, A, n, n, n), 5);
+  const v3 = med(() => r.matmulF32OptimizedParallelV3(A, A, n, n, n), 5);
+  log(`n=${n.toString().padStart(3)}: st=${st.toFixed(3)}ms v3=${v3.toFixed(3)}ms  (${(st/v3).toFixed(2)}×)`);
+}
+
+// And the 2048 cursed triple with bigger perturbation.
+log('\nTiming 2048³ (antipow2 with +1039 cap):');
+{
+  const A = new Float32Array(2048*2048).map(Math.random);
+  const B = new Float32Array(2048*2048).map(Math.random);
+  const st = med(() => r.matmulF32Optimized(A, B, 2048, 2048, 2048), 2);
+  const v3 = med(() => r.matmulF32OptimizedParallelV3(A, B, 2048, 2048, 2048), 2);
+  log(`2048³: st=${st.toFixed(0)}ms v3=${v3.toFixed(0)}ms (${(st/v3).toFixed(2)}×)`);
+}
+
+window.DONE = true;
+</script></body></html>
