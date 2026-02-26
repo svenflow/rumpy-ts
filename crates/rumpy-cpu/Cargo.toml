@@ -6,6 +6,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Propagate the wasm-futex pool to simd_gemm for the lowest-latency
+# parallel dispatch path. Without this feature, v3 (Rayon-backed atomic
+# dispatch) is the fastest parallel entry point.
+wasm-futex = ["pthreadpool-rs/wasm-futex"]
+
 [dependencies]
 rumpy-core = { path = "../rumpy-core" }
 pthreadpool-rs = { path = "../pthreadpool-rs" }

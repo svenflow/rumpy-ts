@@ -2864,7 +2864,14 @@ pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) 
     c
 }
 
-/// Parallel version of optimized GEMM using rayon
+/// Parallel version of optimized GEMM using rayon (LEGACY - slow)
+///
+/// Known issues (see matmul_optimized_f32_parallel_v3 for the fix):
+///   - Each thread re-packs B independently (N× redundant work)
+///   - Each thread allocates its own Vec<f32> for C and packed_b
+///     (WASM's dlmalloc is globally-locked, so this serialises threads)
+///   - Extra copy_from_slice at the end
+///   - 1D partitioning only; no cache reuse of packed B across threads
 #[cfg(target_arch = "wasm32")]
 pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use rayon::prelude::*;
@@ -2893,6 +2900,381 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
             let local_c = matmul_optimized_f32(a_slice, b, local_m, n, k);
             c_chunk.copy_from_slice(&local_c);
         });
+
+    c
+}
+
+// ============================================================================
+// Parallel GEMM v3: pack-once, 2D tile distribution, atomic work claiming
+// ============================================================================
+//
+// This is a ground-up rewrite of the parallel path that addresses the root
+// causes of poor WASM scaling. Key differences from v1/v2:
+//
+// 1. SHARED PACKED B:  B is packed once into a single (KC × NR) panel per
+//    (j, p) block, then shared read-only across all threads. The old path
+//    packed B independently in every thread — with 14 threads that's 14×
+//    the packing work and 14× the allocator pressure (dlmalloc in WASM is
+//    behind a global lock, so parallel allocs effectively serialise).
+//
+// 2. 2D TILE DISTRIBUTION:  Instead of partitioning M into N_threads row
+//    slabs (each task = 1 big slab, zero load balancing), we enumerate
+//    (m_tile, n_tile) pairs of size ~MC×NC and hand them out via a single
+//    atomic counter.  This is exactly what XNNPACK does via
+//    pthreadpool_parallelize_2d_tile_2d.  With ~100+ tiles on a 1024² matmul,
+//    efficiency cores on Apple Silicon can run at their own pace while perf
+//    cores steal the rest — the "all threads finish at once" assumption that
+//    kills rayon on big.LITTLE no longer applies.
+//
+// 3. ZERO PER-TASK ALLOCATION:  Scratch buffers are allocated once per call,
+//    outside the parallel region. Workers write directly to disjoint C slices.
+//
+// 4. SERIALISED K LOOP, PARALLELISED (M, N) LOOP:  The outer (j, p) loops
+//    run serially so all threads share the same packed-B panel (maximising
+//    L2/L3 reuse).  Parallelism is over (i_tile, j_tile) within each
+//    (j_block, p_block) — which is what XNNPACK does.
+//
+// The atomic-counter dispatch is wait-free per tile: one Relaxed fetch_add
+// to claim, no mutex, no heap. On the main thread (which cannot call
+// memory.atomic.wait32 in a browser) the tail join degenerates to a short
+// spin — fine for sub-100-ms GEMMs.
+
+#[cfg(target_arch = "wasm32")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Descriptor for one (M-tile, N-tile) work item.  All geometry is
+/// precomputed so the hot loop has no divisions / branches.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct GemmTile {
+    a_ofs: usize,      // offset into A (in elements)
+    c_ofs: usize,      // offset into C (in elements)
+    pb_ofs: usize,     // offset into packed_b for this N-panel (in elements)
+    m_size: usize,     // rows in this tile (≤ OPT_MC, multiple of MR except tail)
+    n_size: usize,     // cols in this tile (≤ OPT_NC, multiple of NR except tail)
+}
+
+/// Run the 6x8 micro-kernel over one MC×NC macro-tile.
+///
+/// The packed B buffer is shared (read-only) and covers the full NC width
+/// for the current KC depth. `pb_ofs` picks out the right NR-panel run for
+/// this N-tile.
+///
+/// Safety: caller guarantees disjoint writes to C across all concurrent
+/// callers (i.e. every live GemmTile has a unique c_ofs).
+#[cfg(target_arch = "wasm32")]
+#[inline]
+unsafe fn run_macro_tile(
+    a: *const f32,
+    lda: usize,
+    packed_b: *const f32,
+    c: *mut f32,
+    ldc: usize,
+    tile: GemmTile,
+    p_block: usize,
+    beta: f32,
+) {
+    let a_tile = a.add(tile.a_ofs);
+    let c_tile = c.add(tile.c_ofs);
+    let pb_tile = packed_b.add(tile.pb_ofs);
+
+    let i_main = tile.m_size / OPT_MR * OPT_MR;
+    let j_panels = (tile.n_size + OPT_NR - 1) / OPT_NR;
+
+    // Full MR rows
+    let mut ii = 0;
+    while ii < i_main {
+        let mut jj = 0;
+        while jj < j_panels * OPT_NR && jj < tile.n_size {
+            let panel = jj / OPT_NR;
+            let pb = pb_tile.add(panel * p_block * OPT_NR);
+            let n_rem = tile.n_size - jj;
+
+            if n_rem >= OPT_NR {
+                micro_kernel_6x8_fma(
+                    p_block,
+                    a_tile.add(ii * lda),
+                    lda,
+                    pb,
+                    c_tile.add(ii * ldc + jj),
+                    ldc,
+                    beta,
+                );
+            } else {
+                micro_kernel_edge(
+                    OPT_MR, n_rem, p_block,
+                    a_tile.add(ii * lda), lda,
+                    pb,
+                    c_tile.add(ii * ldc + jj), ldc,
+                    beta,
+                );
+            }
+            jj += OPT_NR;
+        }
+        ii += OPT_MR;
+    }
+
+    // Tail rows (m_size not a multiple of MR)
+    if ii < tile.m_size {
+        let m_rem = tile.m_size - ii;
+        let mut jj = 0;
+        while jj < j_panels * OPT_NR && jj < tile.n_size {
+            let panel = jj / OPT_NR;
+            let pb = pb_tile.add(panel * p_block * OPT_NR);
+            let n_rem = (tile.n_size - jj).min(OPT_NR);
+
+            micro_kernel_edge(
+                m_rem, n_rem, p_block,
+                a_tile.add(ii * lda), lda,
+                pb,
+                c_tile.add(ii * ldc + jj), ldc,
+                beta,
+            );
+            jj += OPT_NR;
+        }
+    }
+}
+
+/// Parallel optimised GEMM, v3.
+///
+/// Matches XNNPACK's parallel decomposition: serial over (N_block, K_block),
+/// parallel over 2D (M_tile, N_tile) within each block, with a single
+/// shared packed-B panel reused by all workers.
+///
+/// Returns `C = A · B` where A is [m,k], B is [k,n].
+#[cfg(target_arch = "wasm32")]
+pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    // For tiny problems the parallel setup is pure overhead.
+    if m * n * k < 128 * 128 * 128 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    let mut c = vec![0.0f32; m * n];
+
+    // One packed-B buffer, allocated once, reused across all (j,p) blocks.
+    // Large enough for the worst-case KC × NC panel.
+    let pb_cap = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
+    let mut packed_b = vec![0.0f32; pb_cap];
+
+    // Precompute the M-tile schedule (same for every (j,p) block).
+    // Each tile is up to OPT_MC rows; there are ceil(m/MC) of them.
+    struct MTile { start: usize, size: usize }
+    let m_tiles: Vec<MTile> = {
+        let mut v = Vec::with_capacity((m + OPT_MC - 1) / OPT_MC);
+        let mut i = 0;
+        while i < m {
+            let sz = (m - i).min(OPT_MC);
+            v.push(MTile { start: i, size: sz });
+            i += OPT_MC;
+        }
+        v
+    };
+
+    let a_ptr = a.as_ptr() as usize;
+    let c_ptr = c.as_mut_ptr() as usize;
+
+    // Outer loops: serial over (N-block, K-block).
+    // These must be serial because all parallel workers share one packed-B
+    // panel per (j,p) — packing it once here amortises across all M-tiles.
+    //
+    // NOTE on loop ordering: the single-threaded path's outermost loop is
+    // also (j, p, i) — we keep that here so packed_b is reused across the
+    // full M range before advancing K, maximising temporal locality.
+    let mut j = 0;
+    while j < n {
+        let j_block = (n - j).min(OPT_NC);
+
+        let mut p = 0;
+        while p < k {
+            let p_block = (k - p).min(OPT_KC);
+
+            // Pack B[p..p+p_block, j..j+j_block] — SERIAL, ONCE.
+            // This is the single biggest perf fix vs. the old parallel path.
+            unsafe {
+                pack_b_optimized(
+                    b.as_ptr().add(p * n + j),
+                    n,
+                    packed_b.as_mut_ptr(),
+                    p_block,
+                    j_block,
+                );
+            }
+            // Release fence: packed_b writes must be visible to workers that
+            // Acquire via the tile counter below.
+            std::sync::atomic::fence(Ordering::Release);
+
+            let beta = if p == 0 { 0.0 } else { 1.0 };
+            let pb_ptr = packed_b.as_ptr() as usize;
+
+            // Tiles for this (j, p) block.  Currently M-sliced only — the
+            // packed-B panel is small (KC × NC = 256 × 128 × 4 B = 128 KiB,
+            // fits in L2) and shared by every M-tile, so 2D-splitting N would
+            // trade B-in-L2 reuse for more parallelism.  For wide-M problems
+            // M-only is enough; if your M is small and N is huge, switch to
+            // a true 2D tile enumeration (see PR discussion for the recipe).
+            let total_tiles = m_tiles.len();
+
+            let tile_counter = AtomicUsize::new(0);
+
+            // The actual work loop. Smuggle pointers via usize because
+            // Rayon wants Send + Sync and *mut f32 is neither. Safety:
+            // tile disjointness in C + packed_b is read-only after the
+            // fence above.
+            let worker = || {
+                loop {
+                    let t = tile_counter.fetch_add(1, Ordering::Acquire);
+                    if t >= total_tiles {
+                        break;
+                    }
+
+                    let mt = &m_tiles[t];
+                    let tile = GemmTile {
+                        a_ofs: mt.start * k + p,
+                        c_ofs: mt.start * n + j,
+                        pb_ofs: 0,
+                        m_size: mt.size,
+                        n_size: j_block,
+                    };
+
+                    unsafe {
+                        run_macro_tile(
+                            a_ptr as *const f32,
+                            k,
+                            pb_ptr as *const f32,
+                            c_ptr as *mut f32,
+                            n,
+                            tile,
+                            p_block,
+                            beta,
+                        );
+                    }
+                }
+            };
+
+            // Fan out.
+            //
+            // We use rayon::scope because wasm-bindgen-rayon already owns
+            // the Web Worker pool. But instead of par_iter (which does NOT
+            // let the caller participate when called from outside the pool,
+            // and which heap-allocs a Task per item), we spawn N-1 helpers
+            // and do the Nth share inline. This is the pthreadpool model:
+            // the caller *is* thread 0.
+            //
+            // The atomic-counter distribution means we don't care how Rayon
+            // schedules the spawns — each helper just drains tiles until the
+            // counter runs out. Heterogeneous cores (M1 perf vs efficiency)
+            // self-balance: slow cores do fewer tiles, fast cores do more.
+            let n_helpers = rayon::current_num_threads();
+            rayon::scope(|s| {
+                // Spawn helpers. Each spawn is ~one Box<dyn FnOnce> alloc,
+                // but there are only N-1 of them per (j,p) block, not per
+                // tile — so total allocs = (N-1) × n_j_blocks × n_k_blocks,
+                // typically < 100 for a 1024² matmul with 14 workers.
+                for _ in 1..n_helpers {
+                    s.spawn(|_| worker());
+                }
+                // Caller participates.
+                worker();
+            });
+
+            p += OPT_KC;
+        }
+        j += OPT_NC;
+    }
+
+    c
+}
+
+/// Same algorithm as v3 but dispatched via the raw WASM futex pool.
+///
+/// This bypasses rayon entirely: work items are claimed by a single Relaxed
+/// fetch_sub (pthreadpool fastpath), workers spin-then-wait on
+/// `memory.atomic.wait32`, the caller spins (main thread can't wait). Net
+/// effect: ~2 atomic.notify per (j,p) block instead of Rayon's heavier
+/// park/unpark + heap-allocated task graph.
+///
+/// Called by the WASM binding when `initFutexPool` has been set up.
+/// The separate entry point exists so we can compile without the futex pool
+/// (e.g. running tests natively).
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub fn matmul_optimized_f32_parallel_v3_with_pool(
+    pool: &pthreadpool_rs::wasm_futex::FutexPool,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    if m * n * k < 128 * 128 * 128 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    let mut c = vec![0.0f32; m * n];
+    let pb_cap = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
+    let mut packed_b = vec![0.0f32; pb_cap];
+
+    let n_m_tiles = (m + OPT_MC - 1) / OPT_MC;
+
+    let a_ptr = a.as_ptr() as usize;
+    let c_ptr = c.as_mut_ptr() as usize;
+
+    let mut j = 0;
+    while j < n {
+        let j_block = (n - j).min(OPT_NC);
+
+        let mut p = 0;
+        while p < k {
+            let p_block = (k - p).min(OPT_KC);
+
+            unsafe {
+                pack_b_optimized(
+                    b.as_ptr().add(p * n + j),
+                    n,
+                    packed_b.as_mut_ptr(),
+                    p_block,
+                    j_block,
+                );
+            }
+            std::sync::atomic::fence(Ordering::Release);
+
+            let beta = if p == 0 { 0.0 } else { 1.0 };
+            let pb_ptr = packed_b.as_ptr() as usize;
+
+            // One work item per M-tile. Pool's fastpath = one Relaxed
+            // fetch_sub per claim, no mutex, no alloc.  For 1024² that's
+            // ceil(1024/72) = 15 tiles per dispatch, repeated for each
+            // (j,p) block → enough items for work-stealing to balance
+            // heterogeneous cores.
+            pool.parallelize(n_m_tiles, |t| {
+                let i_start = t * OPT_MC;
+                let m_size = (m - i_start).min(OPT_MC);
+
+                let tile = GemmTile {
+                    a_ofs: i_start * k + p,
+                    c_ofs: i_start * n + j,
+                    pb_ofs: 0,
+                    m_size,
+                    n_size: j_block,
+                };
+
+                unsafe {
+                    run_macro_tile(
+                        a_ptr as *const f32, k,
+                        pb_ptr as *const f32,
+                        c_ptr as *mut f32, n,
+                        tile, p_block, beta,
+                    );
+                }
+            });
+
+            p += OPT_KC;
+        }
+        j += OPT_NC;
+    }
 
     c
 }

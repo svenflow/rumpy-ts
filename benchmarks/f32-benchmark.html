@@ -92,11 +92,26 @@
         log(`   initThreadPool available: ${typeof rumpy.initThreadPool === 'function'}`);
 
         // Initialize thread pool for parallel matmul
+        // NOTE: On Apple Silicon, navigator.hardwareConcurrency counts
+        // efficiency cores. Cap at 4–8 to avoid the E-core tail.
+        // Change this if you want to test full-threadcount behaviour.
+        const hwThreads = navigator.hardwareConcurrency || 4;
+        const numThreads = Math.min(hwThreads, 8);
         if (rumpy.initThreadPool) {
-          const numThreads = navigator.hardwareConcurrency || 4;
-          log(`   Initializing ${numThreads} threads...`);
+          log(`   Initializing Rayon pool: ${numThreads} threads (hw=${hwThreads})...`);
           await rumpy.initThreadPool(numThreads);
-          log(`   ✅ Thread pool ready (${rumpy.getNumThreads()} threads)`);
+          log(`   ✅ Rayon pool ready (${rumpy.getNumThreads()} threads)`);
+        }
+        // Initialise the raw-futex pool if this build has it.
+        // It's a separate pool (its own Web Workers) so we give it the same
+        // thread budget. Both pools fighting over cores simultaneously would
+        // be bad, but the benchmark tests them sequentially so it's fine.
+        if (rumpy.initFutexPool) {
+          log(`   Initializing futex pool: ${numThreads} threads...`);
+          rumpy.initFutexPool(numThreads);
+          // Give workers a moment to spin up (wasm_thread spawns are async-ish).
+          await new Promise(r => setTimeout(r, 100));
+          log(`   ✅ Futex pool ready (${rumpy.getFutexPoolThreads()} threads)`);
         }
       } catch (e) {
         log(`❌ rumpy-ts failed: ${e.message}`);
@@ -216,7 +231,7 @@
           log(`rumpy-ts f32 FMA: ${result.mean.toFixed(4)}ms ${correct}`);
         }
 
-        // rumpy-ts f32 via matmulF32Parallel (multi-threaded SIMD)
+        // rumpy-ts f32 via matmulF32Parallel (multi-threaded SIMD) — LEGACY
         if (rumpy && rumpy.matmulF32Parallel && rumpy.getNumThreads() > 1) {
           const result = benchmark('rumpy f32 parallel', () => {
             rumpy.matmulF32Parallel(data1_f32, data2_f32, n, n, n);
@@ -226,6 +241,48 @@
           const err = tfjsRef ? maxAbsDiff(rumpyOut, tfjsRef) : 0;
           const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
           log(`rumpy-ts f32 parallel (${rumpy.getNumThreads()} threads): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts optimized parallel LEGACY (packs B per-thread, extra copies)
+        if (rumpy && rumpy.matmulF32OptimizedParallel && rumpy.getNumThreads() > 1) {
+          const result = benchmark('rumpy opt parallel v1', () => {
+            rumpy.matmulF32OptimizedParallel(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-opt-par-v1'] = result.mean;
+          const out = rumpy.matmulF32OptimizedParallel(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(out, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          log(`rumpy opt parallel V1 (legacy, B×N pack): ${result.mean.toFixed(4)}ms ${correct}`);
+        }
+
+        // rumpy-ts optimized parallel V3 (pack-once, atomic tile dispatch, caller participates)
+        if (rumpy && rumpy.matmulF32OptimizedParallelV3 && rumpy.getNumThreads() > 1) {
+          const result = benchmark('rumpy opt parallel v3', () => {
+            rumpy.matmulF32OptimizedParallelV3(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-opt-par-v3'] = result.mean;
+          const out = rumpy.matmulF32OptimizedParallelV3(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(out, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          const vsV1 = results[n]['rumpy-opt-par-v1']
+            ? ` (${(results[n]['rumpy-opt-par-v1'] / result.mean).toFixed(2)}× v1)`
+            : '';
+          log(`rumpy opt parallel V3 (pack-once, atomic tiles): ${result.mean.toFixed(4)}ms ${correct}${vsV1}`);
+        }
+
+        // rumpy-ts optimized parallel via raw-futex pool (if built with --features futex-pool)
+        if (rumpy && rumpy.matmulF32OptimizedParallelFutex && rumpy.getFutexPoolThreads && rumpy.getFutexPoolThreads() > 1) {
+          const result = benchmark('rumpy opt parallel futex', () => {
+            rumpy.matmulF32OptimizedParallelFutex(data1_f32, data2_f32, n, n, n);
+          }, iterations);
+          results[n]['rumpy-opt-par-futex'] = result.mean;
+          const out = rumpy.matmulF32OptimizedParallelFutex(data1_f32, data2_f32, n, n, n);
+          const err = tfjsRef ? maxAbsDiff(out, tfjsRef) : 0;
+          const correct = err < 1e-3 ? '✅' : `❌ err=${err.toExponential(2)}`;
+          const vsV3 = results[n]['rumpy-opt-par-v3']
+            ? ` (${(results[n]['rumpy-opt-par-v3'] / result.mean).toFixed(2)}× v3)`
+            : '';
+          log(`rumpy opt parallel FUTEX (raw wasm atomics): ${result.mean.toFixed(4)}ms ${correct}${vsV3}`);
         }
 
         // rumpy-ts XNNPACK-style with pre-packed B (pack once, multiply many times)

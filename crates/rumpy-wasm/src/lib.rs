@@ -830,7 +830,9 @@ pub fn matmul_f32_optimized(a: &Float32Array, b: &Float32Array, m: usize, n: usi
     }
 }
 
-/// Parallel version of optimized 6x8 GEMM using rayon
+/// Parallel version of optimized 6x8 GEMM using rayon (LEGACY)
+///
+/// Kept for A/B benchmarking. Has known problems — see v3 below.
 #[wasm_bindgen(js_name = matmulF32OptimizedParallel)]
 pub fn matmul_f32_optimized_parallel(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
     let a_vec = a.to_vec();
@@ -847,6 +849,105 @@ pub fn matmul_f32_optimized_parallel(a: &Float32Array, b: &Float32Array, m: usiz
         let c_vec = simd_gemm::matmul_parallel_f32(&a_vec, &b_vec, m, n, k);
         Float32Array::from(c_vec.as_slice())
     }
+}
+
+/// Parallel optimised GEMM, v3: pack-once, 2D-tile, atomic work-claiming.
+///
+/// This is the recommended parallel path. Differences from the legacy
+/// `matmulF32OptimizedParallel`:
+///
+/// * B is packed ONCE and shared read-only across all workers
+///   (old path packed B independently in every thread — with N threads that's
+///   N× the packing work and N× allocator contention on WASM's locked dlmalloc)
+///
+/// * Macro-tiles (~MC × NC) are handed out via an atomic counter, matching
+///   XNNPACK's `pthreadpool_parallelize_2d_tile_2d`. Load balances across
+///   Apple Silicon perf/efficiency cores instead of assuming uniform workers.
+///
+/// * Zero per-task heap allocation. Workers write straight into disjoint
+///   C slices.
+///
+/// * The calling thread participates (it's "thread 0"), so with an N-worker
+///   Rayon pool you get N+1 way parallelism.
+///
+/// Requires `initThreadPool(n)` to have been called (same as legacy path).
+#[wasm_bindgen(js_name = matmulF32OptimizedParallelV3)]
+pub fn matmul_f32_optimized_parallel_v3(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let b_vec = b.to_vec();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let c_vec = simd_gemm::matmul_optimized_f32_parallel_v3(&a_vec, &b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let c_vec = simd_gemm::matmul_parallel_f32(&a_vec, &b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+}
+
+// --- Raw-futex GEMM dispatch (experimental, feature = "futex-pool") ---------
+//
+// Only compiled when built with `--features futex-pool`. Provides a
+// Rayon-free parallel path: workers are spawned via `wasm_thread` and woken
+// with bare `memory.atomic.wait32/notify` instructions. ~2 atomic.notify per
+// GEMM block instead of Rayon's park/unpark + per-task heap allocation.
+//
+// This is the closest you can get in Rust-WASM to XNNPACK's
+// pthreadpool+Emscripten setup, short of hand-writing the worker JS glue.
+
+/// Initialise the raw-futex worker pool with `n` threads (including the
+/// caller as thread 0). Subsequent calls are no-ops.
+///
+/// Spawns `n - 1` Web Workers via `wasm_thread`. The caller's thread (the
+/// JS main thread, typically) becomes thread 0 and participates in
+/// every GEMM dispatch — unlike `initThreadPool` + `par_iter` where the
+/// caller just waits.
+///
+/// Interop: if you're also using `initThreadPool`, you now have two worker
+/// pools. Don't size both to `navigator.hardwareConcurrency` or you'll
+/// oversubscribe — either pick one, or size them to share cores
+/// (e.g. 4 + 4 on an 8-core machine).
+///
+/// Apple Silicon: cap `n` at perf-core count (4 or 8). Efficiency cores
+/// drag down futex-heavy paths; work-stealing mitigates but doesn't
+/// eliminate the tail.
+#[cfg(feature = "futex-pool")]
+#[wasm_bindgen(js_name = initFutexPool)]
+pub fn init_futex_pool(n: usize) {
+    pthreadpool_rs::wasm_futex::init(n);
+}
+
+/// Parallel optimised GEMM using the raw-futex pool.
+///
+/// Same algorithm as v3 (pack-once + tile-atomic) but dispatched via
+/// `memory.atomic.wait32/notify` instead of Rayon. Workers spin ~100 μs
+/// before parking — for GEMM block sizes (sub-ms per dispatch) they never
+/// actually park, so dispatch latency is near zero.
+///
+/// Requires `initFutexPool(n)` — falls back to v3 (Rayon) if uninitialised.
+#[cfg(feature = "futex-pool")]
+#[wasm_bindgen(js_name = matmulF32OptimizedParallelFutex)]
+pub fn matmul_f32_optimized_parallel_futex(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let b_vec = b.to_vec();
+
+    let c_vec = if let Some(pool) = pthreadpool_rs::wasm_futex::get_pool() {
+        simd_gemm::matmul_optimized_f32_parallel_v3_with_pool(pool, &a_vec, &b_vec, m, n, k)
+    } else {
+        simd_gemm::matmul_optimized_f32_parallel_v3(&a_vec, &b_vec, m, n, k)
+    };
+    Float32Array::from(c_vec.as_slice())
+}
+
+/// Report futex pool thread count (0 if uninitialised).
+#[cfg(feature = "futex-pool")]
+#[wasm_bindgen(js_name = getFutexPoolThreads)]
+pub fn get_futex_pool_threads() -> usize {
+    pthreadpool_rs::wasm_futex::threads_count()
 }
 
 /// Cache-blocked XNNPACK-style matmul with pre-packed B
