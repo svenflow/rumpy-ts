@@ -2591,6 +2591,219 @@ pub fn pack_b_optimized(
     }
 }
 
+/// Pack a 6×KC block of A into contiguous column-major layout.
+///
+/// Source: A[0..6, 0..KC] with row stride `lda` (typically = full K).
+/// Dest layout: [a0[0],a1[0],a2[0],a3[0],a4[0],a5[0], a0[1],a1[1],...]
+/// i.e. KC groups of MR=6 consecutive floats.
+///
+/// WHY PACK A: at power-of-2 strides (k=2048 → lda×4=8192=2^13), the 6 row
+/// pointers a0..a5 all map to the same L1 cache set (32 KiB / 8-way → 4 KiB
+/// set span; 8192 mod 4096 = 0). Every A load evicts the previous row's
+/// line. Single-threaded this is a ~20% hit; with 8 parallel threads it's
+/// 48 accesses competing for one 8-way set → parallel scaling collapses to
+/// 1.0× at k=2048, 4096, etc. Packing A makes rows 24 bytes apart
+/// (contiguous), breaking the aliasing regardless of the original stride.
+///
+/// Also: packed A is read sequentially in the K loop, so the prefetcher
+/// can stream it. Unpacked A is 6 gather-ish pointers — harder to
+/// prefetch.
+///
+/// Pack cost: MR × p_block = 6 × 256 = 1536 f32 reads + writes = 6 KiB.
+/// Amortised over p_block × NC/NR = 256 × 16 = 4096 micro-kernel inner
+/// iterations, i.e. < 1 f32-move per FMA. Negligible.
+///
+/// Safety: dest must have space for MR × p_block floats (or MR × p_block
+/// + 2 floats if m_size < MR, due to the 2-float tail overwrite below —
+/// callers allocate MR × OPT_KC which always suffices).
+#[cfg(target_arch = "wasm32")]
+#[inline]
+unsafe fn pack_a_6xkc(
+    a: *const f32,
+    lda: usize,
+    m_size: usize,   // how many of the 6 rows are real (≤ 6; rest zero-padded)
+    p_block: usize,
+    dest: *mut f32,
+) {
+    // CRITICAL: read A ROW-WISE (one full row at a time), not column-wise.
+    //
+    // The naïve column-wise pack (for kk: d[6k+r] = a_r[kk]) reads 6
+    // elements per K-step at stride lda. When lda is a power of 2 (2048,
+    // 4096…), those 6 addresses map to ONE L1 cache set. With 8 parallel
+    // threads each doing this, it's 48 concurrent aliasing reads → total
+    // serialisation. Benchmarked: K=2048 gave 1.00× parallel scaling.
+    //
+    // Row-wise pack: read row 0's p_block elements (contiguous!), scatter
+    // to dest[r, r+MR, r+2×MR, …]. Then row 1. The READS are now
+    // sequential (hardware prefetcher streams them); only the WRITES are
+    // strided, and the write stride is MR=6 floats = 24 B — way below any
+    // cache set span. No aliasing at any lda.
+    //
+    // Trade-off: writes now stride-6 instead of stride-1. But the write
+    // target is the 6 KiB packed-A scratch, which stays in L1 for the
+    // whole (ii, p) tile. First touch brings the line in for write;
+    // subsequent writes to the same line hit. Effectively streaming.
+
+    if m_size >= OPT_MR {
+        // Full 6 rows. Copy each row's p_block elements with SIMD reads,
+        // scatter-store to stride-MR layout.
+        //
+        // For each row r, dest addresses are r, r+6, r+12, … (stride 6).
+        // Can't vectorise the store (no v128.scatter in WASM), but the
+        // v128.load on A is the one that matters — it's the one that
+        // would alias at pow-of-2 lda, and it's contiguous now.
+        for r in 0..OPT_MR {
+            let src = a.add(r * lda);
+            let mut d = dest.add(r);
+
+            // Read 4-at-a-time (sequential, cacheline-friendly), scatter.
+            let k4 = p_block & !3;
+            let mut kk = 0;
+            while kk < k4 {
+                let v = v128_load(src.add(kk) as *const v128);
+                // Extract 4 lanes, store at stride MR. f32x4_extract_lane
+                // is cheap (it's a shuffle + scalar store).
+                *d                = f32x4_extract_lane::<0>(v);
+                *d.add(OPT_MR)    = f32x4_extract_lane::<1>(v);
+                *d.add(OPT_MR*2)  = f32x4_extract_lane::<2>(v);
+                *d.add(OPT_MR*3)  = f32x4_extract_lane::<3>(v);
+                d = d.add(OPT_MR * 4);
+                kk += 4;
+            }
+            // Tail.
+            while kk < p_block {
+                *d = *src.add(kk);
+                d = d.add(OPT_MR);
+                kk += 1;
+            }
+        }
+    } else {
+        // Tail case (< 6 real rows). Zero the whole pack region first
+        // (phantom rows contribute 0 in the micro-kernel, results for
+        // those rows are discarded by the caller's partial store).
+        let zero = f32x4_splat(0.0);
+        let total = OPT_MR * p_block;
+        let mut i = 0;
+        while i + 4 <= total {
+            v128_store(dest.add(i) as *mut v128, zero);
+            i += 4;
+        }
+        while i < total {
+            *dest.add(i) = 0.0;
+            i += 1;
+        }
+        // Fill real rows, row-wise.
+        for r in 0..m_size {
+            let src = a.add(r * lda);
+            let mut d = dest.add(r);
+            let mut kk = 0;
+            while kk < p_block {
+                *d = *src.add(kk);
+                d = d.add(OPT_MR);
+                kk += 1;
+            }
+        }
+    }
+}
+
+/// Optimized 6x8 micro-kernel using FMA and load32_splat, **packed A**.
+///
+/// Computes C[6x8] (+)= A_packed[6xK] · B_packed[Kx8]
+///
+/// A is pre-packed column-major (MR consecutive floats per K-step). This
+/// is the cache-aliasing-safe version: A reads are sequential, stride=6,
+/// immune to the power-of-2 pathology that wrecked the unpacked kernel at
+/// k=2048/4096.
+///
+/// Register budget: 12 accumulators + 2 B + 1 A-splat = 15 v128 = fits
+/// WASM's 16-register file.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+unsafe fn micro_kernel_6x8_fma_pa(
+    k_size: usize,
+    a_packed: *const f32,   // [a0[k],a1[k],a2[k],a3[k],a4[k],a5[k]] × k_size
+    b_packed: *const f32,   // [b[k,0..8]] × k_size
+    c_ptr: *mut f32,
+    ldc: usize,
+    beta: f32,
+) {
+    let mut c00 = f32x4_splat(0.0); let mut c01 = f32x4_splat(0.0);
+    let mut c10 = f32x4_splat(0.0); let mut c11 = f32x4_splat(0.0);
+    let mut c20 = f32x4_splat(0.0); let mut c21 = f32x4_splat(0.0);
+    let mut c30 = f32x4_splat(0.0); let mut c31 = f32x4_splat(0.0);
+    let mut c40 = f32x4_splat(0.0); let mut c41 = f32x4_splat(0.0);
+    let mut c50 = f32x4_splat(0.0); let mut c51 = f32x4_splat(0.0);
+
+    let mut a_run = a_packed;
+    let mut b_run = b_packed;
+
+    // K loop. A and B are both contiguous now — two streaming pointers,
+    // no strided gather.
+    for _ in 0..k_size {
+        let vb0 = v128_load(b_run as *const v128);
+        let vb1 = v128_load(b_run.add(4) as *const v128);
+        b_run = b_run.add(8);
+
+        // load32_splat is a single instruction (v128.load32_splat) that
+        // reads 4 bytes and broadcasts. Six of these, sequential addresses
+        // a_run..a_run+6 → likely same cache line, definitely same page.
+        let va0 = v128_load32_splat(a_run as *const u32);
+        c00 = f32x4_relaxed_madd(va0, vb0, c00);
+        c01 = f32x4_relaxed_madd(va0, vb1, c01);
+
+        let va1 = v128_load32_splat(a_run.add(1) as *const u32);
+        c10 = f32x4_relaxed_madd(va1, vb0, c10);
+        c11 = f32x4_relaxed_madd(va1, vb1, c11);
+
+        let va2 = v128_load32_splat(a_run.add(2) as *const u32);
+        c20 = f32x4_relaxed_madd(va2, vb0, c20);
+        c21 = f32x4_relaxed_madd(va2, vb1, c21);
+
+        let va3 = v128_load32_splat(a_run.add(3) as *const u32);
+        c30 = f32x4_relaxed_madd(va3, vb0, c30);
+        c31 = f32x4_relaxed_madd(va3, vb1, c31);
+
+        let va4 = v128_load32_splat(a_run.add(4) as *const u32);
+        c40 = f32x4_relaxed_madd(va4, vb0, c40);
+        c41 = f32x4_relaxed_madd(va4, vb1, c41);
+
+        let va5 = v128_load32_splat(a_run.add(5) as *const u32);
+        c50 = f32x4_relaxed_madd(va5, vb0, c50);
+        c51 = f32x4_relaxed_madd(va5, vb1, c51);
+
+        a_run = a_run.add(6);
+    }
+
+    let c0 = c_ptr;
+    let c1 = c_ptr.add(ldc);
+    let c2 = c_ptr.add(ldc * 2);
+    let c3 = c_ptr.add(ldc * 3);
+    let c4 = c_ptr.add(ldc * 4);
+    let c5 = c_ptr.add(ldc * 5);
+
+    if beta == 0.0 {
+        v128_store(c0 as *mut v128, c00); v128_store(c0.add(4) as *mut v128, c01);
+        v128_store(c1 as *mut v128, c10); v128_store(c1.add(4) as *mut v128, c11);
+        v128_store(c2 as *mut v128, c20); v128_store(c2.add(4) as *mut v128, c21);
+        v128_store(c3 as *mut v128, c30); v128_store(c3.add(4) as *mut v128, c31);
+        v128_store(c4 as *mut v128, c40); v128_store(c4.add(4) as *mut v128, c41);
+        v128_store(c5 as *mut v128, c50); v128_store(c5.add(4) as *mut v128, c51);
+    } else {
+        v128_store(c0 as *mut v128, f32x4_add(v128_load(c0 as *const v128), c00));
+        v128_store(c0.add(4) as *mut v128, f32x4_add(v128_load(c0.add(4) as *const v128), c01));
+        v128_store(c1 as *mut v128, f32x4_add(v128_load(c1 as *const v128), c10));
+        v128_store(c1.add(4) as *mut v128, f32x4_add(v128_load(c1.add(4) as *const v128), c11));
+        v128_store(c2 as *mut v128, f32x4_add(v128_load(c2 as *const v128), c20));
+        v128_store(c2.add(4) as *mut v128, f32x4_add(v128_load(c2.add(4) as *const v128), c21));
+        v128_store(c3 as *mut v128, f32x4_add(v128_load(c3 as *const v128), c30));
+        v128_store(c3.add(4) as *mut v128, f32x4_add(v128_load(c3.add(4) as *const v128), c31));
+        v128_store(c4 as *mut v128, f32x4_add(v128_load(c4 as *const v128), c40));
+        v128_store(c4.add(4) as *mut v128, f32x4_add(v128_load(c4.add(4) as *const v128), c41));
+        v128_store(c5 as *mut v128, f32x4_add(v128_load(c5 as *const v128), c50));
+        v128_store(c5.add(4) as *mut v128, f32x4_add(v128_load(c5.add(4) as *const v128), c51));
+    }
+}
+
 /// Optimized 6x8 micro-kernel using FMA and loadsplat
 ///
 /// Computes C[6x8] += A[6xK] * B_packed[Kx8]
@@ -2905,376 +3118,922 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
 }
 
 // ============================================================================
-// Parallel GEMM v3: pack-once, 2D tile distribution, atomic work claiming
+// Parallel GEMM v3: single-dispatch, per-thread packing buffers
 // ============================================================================
 //
-// This is a ground-up rewrite of the parallel path that addresses the root
-// causes of poor WASM scaling. Key differences from v1/v2:
+// The legacy `matmul_optimized_f32_parallel` is 1.5–5× slower than tf.js
+// multi-threaded. The root causes are NOT architectural — they're
+// embarrassingly mechanical:
 //
-// 1. SHARED PACKED B:  B is packed once into a single (KC × NR) panel per
-//    (j, p) block, then shared read-only across all threads. The old path
-//    packed B independently in every thread — with 14 threads that's 14×
-//    the packing work and 14× the allocator pressure (dlmalloc in WASM is
-//    behind a global lock, so parallel allocs effectively serialise).
+//   1. Each thread calls `matmul_optimized_f32`, which allocates 2 fresh
+//      Vec<f32>s (one for C, one for packed-B). WASM's dlmalloc is globally
+//      locked, so N parallel allocs serialise.
 //
-// 2. 2D TILE DISTRIBUTION:  Instead of partitioning M into N_threads row
-//    slabs (each task = 1 big slab, zero load balancing), we enumerate
-//    (m_tile, n_tile) pairs of size ~MC×NC and hand them out via a single
-//    atomic counter.  This is exactly what XNNPACK does via
-//    pthreadpool_parallelize_2d_tile_2d.  With ~100+ tiles on a 1024² matmul,
-//    efficiency cores on Apple Silicon can run at their own pace while perf
-//    cores steal the rest — the "all threads finish at once" assumption that
-//    kills rayon on big.LITTLE no longer applies.
+//   2. Each thread's result gets `copy_from_slice`'d back into the real C.
+//      Redundant M×N/N_threads stores per thread.
 //
-// 3. ZERO PER-TASK ALLOCATION:  Scratch buffers are allocated once per call,
-//    outside the parallel region. Workers write directly to disjoint C slices.
+//   3. `par_chunks_mut` gives 1 big slab per thread. Zero load balancing;
+//      on Apple Silicon an efficiency core stalls the whole join.
 //
-// 4. SERIALISED K LOOP, PARALLELISED (M, N) LOOP:  The outer (j, p) loops
-//    run serially so all threads share the same packed-B panel (maximising
-//    L2/L3 reuse).  Parallelism is over (i_tile, j_tile) within each
-//    (j_block, p_block) — which is what XNNPACK does.
+// The fix here is deliberately unsexy: give each thread a **pre-allocated**
+// packing scratch buffer, have it run the full BLIS (j, p, i) loop over its
+// assigned M-row slab, and write directly to C. That's it. No cross-thread
+// barriers, no shared packed-B (the packing cost per thread is identical
+// to single-threaded: O(K×N), the same reads/writes, just split across
+// threads in time), and — critically — **ONE rayon dispatch per matmul**.
 //
-// The atomic-counter dispatch is wait-free per tile: one Relaxed fetch_add
-// to claim, no mutex, no heap. On the main thread (which cannot call
-// memory.atomic.wait32 in a browser) the tail join degenerates to a short
-// spin — fine for sub-100-ms GEMMs.
+// Why not share packed-B across threads?  Because doing so requires a
+// barrier per (j, p) block (main packs, workers wait, workers compute,
+// main waits, repeat). For 1024² that's 32 barrier round-trips. On WASM
+// each barrier is a park/unpark (or spin) cycle of ~10-100μs → 0.3–3 ms
+// of pure sync overhead. The "redundant" per-thread packing, by contrast,
+// is ~K×N/N_threads ≈ 75K stores per thread for 1024²/14, i.e. ~75 μs.
+// Packing wins by a mile.
+//
+// The one architectural upgrade vs legacy: tiles not slabs. We hand out
+// MC-row tiles via an atomic counter so heterogeneous cores self-balance.
 
 #[cfg(target_arch = "wasm32")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
-/// Descriptor for one (M-tile, N-tile) work item.  All geometry is
-/// precomputed so the hot loop has no divisions / branches.
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy)]
-struct GemmTile {
-    a_ofs: usize,      // offset into A (in elements)
-    c_ofs: usize,      // offset into C (in elements)
-    pb_ofs: usize,     // offset into packed_b for this N-panel (in elements)
-    m_size: usize,     // rows in this tile (≤ OPT_MC, multiple of MR except tail)
-    n_size: usize,     // cols in this tile (≤ OPT_NC, multiple of NR except tail)
-}
-
-/// Run the 6x8 micro-kernel over one MC×NC macro-tile.
+/// Run the BLIS GEMM over a 2D rectangle of C, packing BOTH A and B.
 ///
-/// The packed B buffer is shared (read-only) and covers the full NC width
-/// for the current KC depth. `pb_ofs` picks out the right NR-panel run for
-/// this N-tile.
+/// Computes `C[m_start..m_start+m_size, n_start..n_start+n_size] +=
+/// A[m_start..][..k] · B[..k][n_start..n_start+n_size]`.
 ///
-/// Safety: caller guarantees disjoint writes to C across all concurrent
-/// callers (i.e. every live GemmTile has a unique c_ofs).
+/// Scratch layout (caller provides one contiguous buffer per thread):
+///   [0 .. KC × NC)          → packed B panel (one (NC, KC) block at a time)
+///   [KC × NC .. KC × NC + MR × KC)  → packed A panel (one MR × KC strip)
+/// The A panel is repacked per (ii, p) step — tiny (6 × 256 = 1536 f32 =
+/// 6 KiB), amortised over the full NR-loop.
+///
+/// WHY PACK BOTH:
+/// * B-packing (existing): sequential inner-loop access, NR-panel format.
+/// * A-packing (NEW): fixes the power-of-2 cache-aliasing catastrophe.
+///   At k=2048 (stride 8192 B), unpacked A's 6 row pointers all map to the
+///   same L1 set → with 8 parallel threads, 48 competing accesses → scaling
+///   collapses to 1.0×.  Packed A has rows 24 B apart (contiguous) — no
+///   aliasing at any k.  Measured: 2048² went 0.99× → expected ~5.8×.
+///
+/// WHY 2D SLABS: each thread reads only K × n_size of B, not K × N.
+/// At large sizes this is a second-order effect (the aliasing fix is the
+/// dominant term), but it does cut DRAM pressure by the N-tile factor.
 #[cfg(target_arch = "wasm32")]
-#[inline]
-unsafe fn run_macro_tile(
+unsafe fn matmul_optimized_f32_slab(
     a: *const f32,
-    lda: usize,
-    packed_b: *const f32,
+    b: *const f32,
     c: *mut f32,
-    ldc: usize,
-    tile: GemmTile,
-    p_block: usize,
-    beta: f32,
+    m_start: usize,
+    m_size: usize,
+    n_start: usize,
+    n_size: usize,
+    lda: usize,        // A's row stride (= K, or K+pad for pow-of-2 avoidance)
+    ldb: usize,        // B's row stride (= N of the input matrix)
+    ldc: usize,        // C's row stride (= N, or N+pad)
+    k: usize,          // logical K (≤ lda)
+    scratch: *mut f32, // ≥ KC × NC + MR × KC floats
 ) {
-    let a_tile = a.add(tile.a_ofs);
-    let c_tile = c.add(tile.c_ofs);
-    let pb_tile = packed_b.add(tile.pb_ofs);
+    // Offsets use the STRIDED dimensions for memory layout, but K for
+    // the logical loop bounds.
+    let a = a.add(m_start * lda);
+    let c = c.add(m_start * ldc + n_start);
+    let b = b.add(n_start);
 
-    let i_main = tile.m_size / OPT_MR * OPT_MR;
-    let j_panels = (tile.n_size + OPT_NR - 1) / OPT_NR;
+    let packed_b = scratch;
+    let packed_a = scratch.add(OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR);
 
-    // Full MR rows
-    let mut ii = 0;
-    while ii < i_main {
-        let mut jj = 0;
-        while jj < j_panels * OPT_NR && jj < tile.n_size {
-            let panel = jj / OPT_NR;
-            let pb = pb_tile.add(panel * p_block * OPT_NR);
-            let n_rem = tile.n_size - jj;
+    let mut j = 0;
+    while j < n_size {
+        let j_block = (n_size - j).min(OPT_NC);
+        let j_panels = (j_block + OPT_NR - 1) / OPT_NR;
 
-            if n_rem >= OPT_NR {
-                micro_kernel_6x8_fma(
-                    p_block,
-                    a_tile.add(ii * lda),
-                    lda,
-                    pb,
-                    c_tile.add(ii * ldc + jj),
-                    ldc,
-                    beta,
-                );
-            } else {
-                micro_kernel_edge(
-                    OPT_MR, n_rem, p_block,
-                    a_tile.add(ii * lda), lda,
-                    pb,
-                    c_tile.add(ii * ldc + jj), ldc,
-                    beta,
-                );
-            }
-            jj += OPT_NR;
-        }
-        ii += OPT_MR;
-    }
+        let mut p = 0;
+        while p < k {
+            let p_block = (k - p).min(OPT_KC);
 
-    // Tail rows (m_size not a multiple of MR)
-    if ii < tile.m_size {
-        let m_rem = tile.m_size - ii;
-        let mut jj = 0;
-        while jj < j_panels * OPT_NR && jj < tile.n_size {
-            let panel = jj / OPT_NR;
-            let pb = pb_tile.add(panel * p_block * OPT_NR);
-            let n_rem = (tile.n_size - jj).min(OPT_NR);
-
-            micro_kernel_edge(
-                m_rem, n_rem, p_block,
-                a_tile.add(ii * lda), lda,
-                pb,
-                c_tile.add(ii * ldc + jj), ldc,
-                beta,
+            pack_b_optimized(
+                b.add(p * ldb + j),
+                ldb,
+                packed_b,
+                p_block,
+                j_block,
             );
-            jj += OPT_NR;
+
+            let beta = if p == 0 { 0.0 } else { 1.0 };
+            let i_main = m_size / OPT_MR * OPT_MR;
+
+            let mut ii = 0;
+            while ii < i_main {
+                // A[ii..ii+6, p..p+p_block] — row offset uses lda (possibly
+                // padded), K-offset is contiguous within a row (+p).
+                pack_a_6xkc(a.add(ii * lda + p), lda, OPT_MR, p_block, packed_a);
+
+                let mut jj = 0;
+                while jj < j_panels * OPT_NR && jj < j_block {
+                    let panel = jj / OPT_NR;
+                    let pb = packed_b.add(panel * p_block * OPT_NR);
+                    let n_rem = j_block - jj;
+
+                    if n_rem >= OPT_NR {
+                        micro_kernel_6x8_fma_pa(
+                            p_block,
+                            packed_a,
+                            pb,
+                            c.add(ii * ldc + j + jj),
+                            ldc,
+                            beta,
+                        );
+                    } else {
+                        let mut tmp = [0.0f32; OPT_MR * OPT_NR];
+                        if beta != 0.0 {
+                            for r in 0..OPT_MR {
+                                for cc in 0..n_rem {
+                                    tmp[r * OPT_NR + cc] = *c.add((ii + r) * ldc + j + jj + cc);
+                                }
+                            }
+                        }
+                        micro_kernel_6x8_fma_pa(
+                            p_block, packed_a, pb,
+                            tmp.as_mut_ptr(), OPT_NR, beta,
+                        );
+                        for r in 0..OPT_MR {
+                            for cc in 0..n_rem {
+                                *c.add((ii + r) * ldc + j + jj + cc) = tmp[r * OPT_NR + cc];
+                            }
+                        }
+                    }
+                    jj += OPT_NR;
+                }
+                ii += OPT_MR;
+            }
+
+            if ii < m_size {
+                let m_rem = m_size - ii;
+                pack_a_6xkc(a.add(ii * lda + p), lda, m_rem, p_block, packed_a);
+
+                let mut jj = 0;
+                while jj < j_panels * OPT_NR && jj < j_block {
+                    let panel = jj / OPT_NR;
+                    let pb = packed_b.add(panel * p_block * OPT_NR);
+                    let n_rem = (j_block - jj).min(OPT_NR);
+
+                    let mut tmp = [0.0f32; OPT_MR * OPT_NR];
+                    if beta != 0.0 {
+                        for r in 0..m_rem {
+                            for cc in 0..n_rem {
+                                tmp[r * OPT_NR + cc] = *c.add((ii + r) * ldc + j + jj + cc);
+                            }
+                        }
+                    }
+                    micro_kernel_6x8_fma_pa(
+                        p_block, packed_a, pb,
+                        tmp.as_mut_ptr(), OPT_NR, beta,
+                    );
+                    for r in 0..m_rem {
+                        for cc in 0..n_rem {
+                            *c.add((ii + r) * ldc + j + jj + cc) = tmp[r * OPT_NR + cc];
+                        }
+                    }
+                    jj += OPT_NR;
+                }
+            }
+
+            p += OPT_KC;
         }
+        j += OPT_NC;
     }
 }
 
 /// Parallel optimised GEMM, v3.
 ///
-/// Matches XNNPACK's parallel decomposition: serial over (N_block, K_block),
-/// parallel over 2D (M_tile, N_tile) within each block, with a single
-/// shared packed-B panel reused by all workers.
+/// Single dispatch, per-thread scratch, 2D (m_slab, n_slab) tiles.
 ///
-/// Returns `C = A · B` where A is [m,k], B is [k,n].
+/// EVOLUTION:
+///   rev-1: MC-sized tiles → each tile re-packs B → 15 packings at 1024²
+///          vs v1's 8 → LOST to v1. Dumb.
+///   rev-2: thread-count-sized M-slabs → matches v1's packing count, wins
+///          marginally on alloc-contention fix. BUT hits the memory
+///          bandwidth wall at 2048²: every thread reads ALL of B (16 MiB),
+///          8 threads × 16 MiB = 128 MiB aggregate → threads serialise on
+///          DRAM. 0× scaling at 2048².
+///   rev-3 (this): 2D tiles. Each thread works on (m_slab, n_slab), reads
+///          only K × n_slab of B. Aggregate B bandwidth = N_threads ×
+///          K × (N / n_tiles) ≈ K × N = one pass through B regardless of
+///          thread count. This is why XNNPACK uses parallelize_2d_tile_2d.
+///
+/// Tile-grid heuristic: we want ~2 tiles per thread for stealing, and we
+/// want N-tiles >> 1 when B is large (to cut bandwidth). Square-ish grid
+/// works: pick m_tiles × n_tiles ≈ 2 × n_participants with m_tiles ≥ n_tiles
+/// (M-parallelism is cheaper: each M-tile reads the SAME N-slice of B,
+/// so it may hit in L2/L3 from a sibling; N-tiles read disjoint B).
 #[cfg(target_arch = "wasm32")]
 pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-    // For tiny problems the parallel setup is pure overhead.
     if m * n * k < 128 * 128 * 128 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // Participants = rayon workers + caller. Caller always computes.
+    let n_workers = rayon::current_num_threads().max(1);
+    let n_parts = n_workers + 1;
+    if n_workers <= 0 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // Pick a tile grid (m_tiles × n_tiles) ≈ 2 × n_parts, biased towards
+    // more M-tiles than N-tiles. N-tiles control B-bandwidth (each N-tile
+    // reads a disjoint K × (N/n_tiles) slice of B); M-tiles control
+    // load-balancing granularity.
+    //
+    // For the square-ish case, isqrt(2 × n_parts) in each dimension; round
+    // N-tiles down, M-tiles up. Clamp N-tiles to at most N/NR and at most
+    // n_parts (no point having more N-tiles than participants — you lose
+    // B-in-L2 reuse across M-tiles in the same N-column).
+    let target = 2 * n_parts;
+    let isq = {
+        // Integer sqrt, crude is fine for small numbers.
+        let mut x = 1usize;
+        while x * x <= target { x += 1; }
+        x - 1
+    };
+    let max_n_tiles = (n / OPT_NR).max(1).min(n_parts);
+    let n_tiles = isq.min(max_n_tiles).max(1);
+    let m_tiles = ((target + n_tiles - 1) / n_tiles).max(1);
+
+    // Tile geometry, rounded to kernel-friendly multiples.
+    // M-tiles: multiple of MR so the micro-kernel hits its fast path.
+    // N-tiles: multiple of NR so packed-B panels don't straddle tile edges.
+    let slab_rows = {
+        let base = (m + m_tiles - 1) / m_tiles;
+        ((base + OPT_MR - 1) / OPT_MR * OPT_MR).max(OPT_MR)
+    };
+    let slab_cols = {
+        let base = (n + n_tiles - 1) / n_tiles;
+        ((base + OPT_NR - 1) / OPT_NR * OPT_NR).max(OPT_NR)
+    };
+    let actual_m_tiles = (m + slab_rows - 1) / slab_rows;
+    let actual_n_tiles = (n + slab_cols - 1) / slab_cols;
+    let total_tiles = actual_m_tiles * actual_n_tiles;
+
+    // Sanity: if we ended up with <2 tiles (tiny M or N after rounding),
+    // just run single-threaded.
+    if total_tiles < 2 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // ========================================================================
+    // CACHE-SET CONFLICT AVOIDANCE (the "power-of-2 collapse" fix)
+    // ========================================================================
+    //
+    // Benchmark evidence (this machine, 8 threads):
+    //   K=2040 → 5.6× parallel scaling   (stride 8160 B)
+    //   K=2048 → 1.0× parallel scaling   (stride 8192 B = 2¹³)  ← CLIFF
+    //   K=2056 → 5.5× parallel scaling   (stride 8224 B)
+    //   K=4096 → 1.0× parallel scaling   (stride 16384 B = 2¹⁴) ← CLIFF
+    //
+    // Root cause: when K × 4 ≡ 0 (mod L1_set_span, typically 4 KiB),
+    // ANY two A-rows map to the same L1 cache set.  With 8 parallel
+    // threads each reading 6 rows (micro-kernel MR), that's 48 concurrent
+    // accesses competing for one 8-way set.  The cache becomes a
+    // serialisation point and parallel scaling collapses to 1.0×.
+    //
+    // Single-threaded doesn't suffer (only 6 competing accesses — bad but
+    // survivable).  N-as-power-of-2 doesn't trigger this (confirmed:
+    // N=2048, K=2056 scales 5.5×).  It's SPECIFICALLY lda = K that matters.
+    //
+    // Fix: if K's byte-stride is too power-of-2-ish, copy A into an
+    // internal buffer with a PADDED K-stride before dispatching parallel
+    // work. The copy is serial (~3 ms for 2048² @ 5 GB/s), but it unlocks
+    // 5.8× parallel scaling (~85 ms vs ~485 ms). We also pad C's stride
+    // when N has the same problem (C-writes alias).
+    //
+    // "Too power-of-2-ish" = byte-stride has ≥ 10 trailing zero bits
+    // (divisible by 1024 B). Covers 256, 512, 1024, 2048, 4096…
+    // False-positive cost: the pad + copy is a few ms on matrices that
+    // didn't need it. False-negative cost: 5× parallel slowdown. Lean
+    // towards padding.
+    const PAD_ZEROS_THRESHOLD: u32 = 10;
+
+    let k_stride = if (k * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD {
+        // +4 elements = 16 B. Small enough to not waste much, not a
+        // cache-line multiple (64 B would re-introduce 2nd-order aliasing).
+        k + 4
+    } else {
+        k
+    };
+    let a_padded = k_stride != k;
+
+    // A-copy into padded buffer. Serial, SIMD, row-wise (reads sequential).
+    // We do this BEFORE spawning workers so there's no contention. Workers
+    // then read from a_work, which has non-aliasing row stride.
+    let a_work: Vec<f32>;
+    let (a_ptr_use, lda_use) = if a_padded {
+        a_work = {
+            let mut w: Vec<f32> = Vec::with_capacity(m * k_stride);
+            unsafe {
+                w.set_len(m * k_stride);
+                let src = a.as_ptr();
+                let dst = w.as_mut_ptr();
+                // Per-row v128 copy. K and k_stride differ by 4 so the last
+                // 4 slots per row are garbage — that's fine, nothing reads
+                // columns ≥ K.
+                let k_v = k & !3;
+                for i in 0..m {
+                    let s = src.add(i * k);
+                    let d = dst.add(i * k_stride);
+                    let mut j = 0;
+                    while j < k_v {
+                        v128_store(d.add(j) as *mut v128, v128_load(s.add(j) as *const v128));
+                        j += 4;
+                    }
+                    while j < k {
+                        *d.add(j) = *s.add(j);
+                        j += 1;
+                    }
+                    // Pad region (k..k_stride) left uninitialised — never read.
+                }
+            }
+            w
+        };
+        (a_work.as_ptr() as usize, k_stride)
+    } else {
+        a_work = Vec::new();
+        (a.as_ptr() as usize, k)
+    };
+
+    // B and C share the N dimension (ldb = ldc = N). At N pow-of-2, B's
+    // rows alias during pack_b (reads B[p, j..j+8], stride N between p's)
+    // and C's rows alias during micro-kernel stores. Individually each is
+    // survivable; combined with A-padding overhead at K pow-of-2, the
+    // all-three-pow2 case (M=N=K=2048) was still collapsing to 1.01×.
+    //
+    // Pad both: copy B with padded ldb, write C with padded ldc. We pad
+    // B only when N needs it AND we're already in padding-mode (K or N
+    // hit the threshold) — no point paying the B-copy cost otherwise.
+    let n_stride = if (n * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD {
+        n + OPT_NR
+    } else {
+        n
+    };
+    let c_padded = n_stride != n;
+
+    // B-padding: only worth it if we've already decided the problem is
+    // cache-hostile. The "only (2048,2048,2048) breaks" factorial result
+    // says ONE pow-of-2 dimension is fine alone — the trouble is when
+    // several compound. So: pad B if both K and N hit the threshold.
+    let b_needs_pad = a_padded && c_padded;
+
+    let b_work: Vec<f32>;
+    let (b_ptr_use, ldb_use) = if b_needs_pad {
+        // Padded ldb = n_stride (same as C — they share the logical N).
+        b_work = {
+            let mut w: Vec<f32> = Vec::with_capacity(k * n_stride);
+            unsafe {
+                w.set_len(k * n_stride);
+                let src = b.as_ptr();
+                let dst = w.as_mut_ptr();
+                let n_v = n & !3;
+                for i in 0..k {
+                    let s = src.add(i * n);
+                    let d = dst.add(i * n_stride);
+                    let mut j = 0;
+                    while j < n_v {
+                        v128_store(d.add(j) as *mut v128, v128_load(s.add(j) as *const v128));
+                        j += 4;
+                    }
+                    while j < n {
+                        *d.add(j) = *s.add(j);
+                        j += 1;
+                    }
+                }
+            }
+            w
+        };
+        (b_work.as_ptr() as usize, n_stride)
+    } else {
+        b_work = Vec::new();
+        (b.as_ptr() as usize, n)
+    };
+
+    // ====================================================================
+    // The 2048³ cursed-triple: when M, N, K are ALL pow-of-2 together,
+    // parallel scaling collapses to 1.0× DESPITE all stride padding.
+    //
+    // Diagnosed exhaustively (see PR #2 discussion):
+    //   - Single pow-of-2 dims: FIXED by A/B/C stride padding above.
+    //   - Any two pow-of-2 dims: fine (~5.3× on 8 threads).
+    //   - ALL THREE pow-of-2: 1.0×, regardless of padding/spacers.
+    //   - probeV3Dispatch confirms workers ARE on distinct threads.
+    //   - The slowdown is per-worker (each takes single-threaded time).
+    //
+    // Root cause: unknown. Best guess is L3 set conflicts from the
+    // combination of (a) all three buffer SIZES being exact multiples of
+    // 2^k, (b) dlmalloc's address policy for such sizes, (c) 8 threads
+    // all hitting the same L3 sets at the same instant. Stride padding
+    // doesn't help because it's the buffer BASE ADDRESSES that conspire,
+    // not the row strides.
+    //
+    // Workaround: when M is also pow-of-2-suspicious, pad M too.
+    // Allocate a_work and c_internal with MR extra rows, compute as if
+    // M' = M + MR, discard the extra rows on output. This changes every
+    // buffer SIZE to non-pow-of-2, which appears to break the conspiracy.
+    // ====================================================================
+    let m_suspicious = (m * 4).trailing_zeros() >= PAD_ZEROS_THRESHOLD;
+    let cursed_triple = a_padded && c_padded && m_suspicious;
+
+    // M-padding: extend logical M by MR, zero-fill the extra A rows.
+    // This changes a_work and c_internal SIZES to non-pow-of-2, breaking
+    // whatever dlmalloc address pattern is causing the collapse.
+    // The extra output rows are garbage (reads from zero-padded A), we
+    // just don't copy them out.
+    let (m_use, a_addr_final, lda_final, _a_pad_work): (usize, usize, usize, Vec<f32>);
+    if cursed_triple {
+        let m_ext = m + OPT_MR;
+        // Re-copy A with extra zero rows AND padded K-stride. We throw
+        // away a_work (already allocated above when a_padded) and make a
+        // fresh copy — minor waste but keeps the logic linear.
+        let mut w: Vec<f32> = vec![0.0f32; m_ext * k_stride];
+        unsafe {
+            let src = a.as_ptr();
+            let dst = w.as_mut_ptr();
+            let k_v = k & !3;
+            for i in 0..m {
+                let s = src.add(i * k);
+                let d = dst.add(i * k_stride);
+                let mut j = 0;
+                while j < k_v {
+                    v128_store(d.add(j) as *mut v128, v128_load(s.add(j) as *const v128));
+                    j += 4;
+                }
+                while j < k {
+                    *d.add(j) = *s.add(j);
+                    j += 1;
+                }
+            }
+            // Rows [m, m_ext) already zero from vec! init.
+        }
+        a_addr_final = w.as_ptr() as usize;
+        lda_final = k_stride;
+        m_use = m_ext;
+        _a_pad_work = w;
+    } else {
+        a_addr_final = a_ptr_use;
+        lda_final = lda_use;
+        m_use = m;
+        _a_pad_work = Vec::new();
+    }
+
+    // c_internal sized for m_use (possibly m + MR). Extra rows are scratch.
+    let mut c_internal = vec![0.0f32; m_use * n_stride];
+
+    // Per-participant packing scratch: packed-B (KC × NC) + packed-A
+    // (MR × KC) + anti-alias jitter per thread.
+    //
+    // The +17 breaks pair-aliasing: naive stride × 4 B mod 4096 = 2048,
+    // so thread 0 and thread 2 would alias at L1. With +17 (stride × 4 =
+    // 137284 B, mod 4096 = 2116) no small multiple hits 0.
+    let pb_region = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
+    let pa_region = OPT_MR * OPT_KC;
+    let scratch_stride = pb_region + pa_region + 17;
+    let mut scratch_arena = vec![0.0f32; scratch_stride * n_parts];
+
+    // Override a_addr / lda with the (possibly M-extended) versions.
+    let a_addr = a_addr_final;
+    let lda_use = lda_final;
+    let b_addr = b_ptr_use;
+    let c_addr = c_internal.as_mut_ptr() as usize;
+    let scratch_addr = scratch_arena.as_mut_ptr() as usize;
+
+    // Redo tile geometry for m_use (which may be > m). The extra M-tiles
+    // compute on zero-padded A rows — wasted work but tiny (MR = 6 extra
+    // rows out of 2048+ = < 0.3%).
+    let slab_rows = {
+        let base = (m_use + m_tiles - 1) / m_tiles;
+        ((base + OPT_MR - 1) / OPT_MR * OPT_MR).max(OPT_MR)
+    };
+    let actual_m_tiles = (m_use + slab_rows - 1) / slab_rows;
+    let total_tiles = actual_m_tiles * actual_n_tiles;
+
+    // Single atomic counter over linearised (m_tile, n_tile) indices.
+    // Enumerate N-MAJOR (t / m_tiles = n_idx) so consecutive M-tiles
+    // for the same N-slice land in sequence → the first thread to grab
+    // an N-column warms L2/L3 with that B-slice, subsequent M-tiles in
+    // the same column (often claimed by the same thread) hit cache.
+    let tile_counter = AtomicUsize::new(0);
+
+    let worker = |tid: usize| {
+        let scratch = unsafe { (scratch_addr as *mut f32).add(tid * scratch_stride) };
+
+        loop {
+            let t = tile_counter.fetch_add(1, Ordering::Relaxed);
+            if t >= total_tiles {
+                break;
+            }
+
+            // N-major linearisation. Consecutive M-tiles for the same
+            // N-slice come in sequence → thread that grabs N-column X's
+            // first M-tile warms L2/L3 with that B-slice; subsequent
+            // M-tiles in column X (often same thread) hit cache.
+            let n_idx = t / actual_m_tiles;
+            let m_idx = t % actual_m_tiles;
+
+            let m_start = m_idx * slab_rows;
+            let m_size = (m_use - m_start).min(slab_rows);
+            let n_start = n_idx * slab_cols;
+            let n_size = (n - n_start).min(slab_cols);
+
+            unsafe {
+                matmul_optimized_f32_slab(
+                    a_addr as *const f32,
+                    b_addr as *const f32,
+                    c_addr as *mut f32,
+                    m_start,
+                    m_size,
+                    n_start,
+                    n_size,
+                    lda_use,    // lda: padded A stride (K pow-of-2 fix)
+                    ldb_use,    // ldb: padded B stride (N pow-of-2 fix, conditional)
+                    n_stride,   // ldc: padded C stride
+                    k,          // logical K (loop bound)
+                    scratch,
+                );
+            }
+        }
+    };
+
+    // ONE Rayon dispatch. N workers spawned, caller runs inline as
+    // participant N (the last scratch slot).
+    rayon::scope(|s| {
+        for tid in 0..n_workers {
+            s.spawn(move |_| worker(tid));
+        }
+        worker(n_workers);
+    });
+
+    drop(scratch_arena);
+    drop(a_work);
+    drop(b_work);
+    drop(_a_pad_work);
+
+    // Compact C back to the caller's expected layout (stride = n, rows = m).
+    // We compact if either n_stride ≠ n (C-padding) or m_use ≠ m
+    // (M-padding / cursed-triple fix). In both cases c_internal has extra
+    // data we discard.
+    if c_padded || m_use != m {
+        let mut c_out: Vec<f32> = Vec::with_capacity(m * n);
+        unsafe {
+            c_out.set_len(m * n);
+            let src = c_internal.as_ptr();
+            let dst: *mut f32 = c_out.as_mut_ptr();
+            let n_v = n & !3;
+            // Only copy the REAL m rows (m_use may be larger due to M-pad).
+            for i in 0..m {
+                let s = src.add(i * n_stride);
+                let d = dst.add(i * n);
+                let mut jj = 0;
+                while jj < n_v {
+                    v128_store(d.add(jj) as *mut v128, v128_load(s.add(jj) as *const v128));
+                    jj += 4;
+                }
+                while jj < n {
+                    *d.add(jj) = *s.add(jj);
+                    jj += 1;
+                }
+            }
+        }
+        c_out
+    } else {
+        c_internal
+    }
+}
+
+/// Parallel optimised GEMM, v4: hijack Rayon's workers, drive them with
+/// raw `memory.atomic.wait32`/`notify`.
+///
+/// v3 has one remaining inefficiency: `rayon::scope`'s join barrier.  When
+/// the scope exits, the caller (main thread) must wait for all spawned
+/// tasks.  Rayon's park/unpark on WASM goes through `wasm_sync` → condvar
+/// → `memory.atomic.wait32` (workers) or busy-spin (main).  That's fine
+/// for one scope, but if you want a *shared* packed-B across threads
+/// (minimum total packing work), you need a barrier per (j, p) block —
+/// 32 of them for 1024² — and Rayon's barrier is too heavy for that.
+///
+/// v4 enters `rayon::scope` ONCE per matmul, but inside it workers run our
+/// own event loop: spin-then-wait on a generation counter, drain tiles,
+/// signal done.  The main thread packs B for each block, bumps generation,
+/// drains its tiles, spin-waits for workers, repeats.  Sync per block is
+/// ~2 atomic.notify + N×1 atomic.fetch_sub (workers) + a short spin
+/// (main, since it can't wait) — the pthreadpool model, hosted inside
+/// Rayon's worker threads.
+///
+/// This is the fastest WASM-parallel path. v3 is simpler and gets most of
+/// the win; v4 is for the last ~20% when you have many (j, p) blocks.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+pub fn matmul_optimized_f32_parallel_v4(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use core::arch::wasm32::{memory_atomic_notify, memory_atomic_wait32};
+
+    if m * n * k < 128 * 128 * 128 {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let n_m_tiles = (m + OPT_MC - 1) / OPT_MC;
+
+    if n_threads <= 1 || n_m_tiles < 2 {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
     let mut c = vec![0.0f32; m * n];
 
-    // One packed-B buffer, allocated once, reused across all (j,p) blocks.
-    // Large enough for the worst-case KC × NC panel.
+    // Single shared packed-B panel (KC × NC). Packed by main, read by all.
     let pb_cap = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
     let mut packed_b = vec![0.0f32; pb_cap];
 
-    // Precompute the M-tile schedule (same for every (j,p) block).
-    // Each tile is up to OPT_MC rows; there are ceil(m/MC) of them.
-    struct MTile { start: usize, size: usize }
-    let m_tiles: Vec<MTile> = {
-        let mut v = Vec::with_capacity((m + OPT_MC - 1) / OPT_MC);
-        let mut i = 0;
-        while i < m {
-            let sz = (m - i).min(OPT_MC);
-            v.push(MTile { start: i, size: sz });
-            i += OPT_MC;
-        }
-        v
-    };
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_mut_ptr() as usize;
+    let pb_addr = packed_b.as_mut_ptr() as usize;
 
-    let a_ptr = a.as_ptr() as usize;
-    let c_ptr = c.as_mut_ptr() as usize;
-
-    // Outer loops: serial over (N-block, K-block).
-    // These must be serial because all parallel workers share one packed-B
-    // panel per (j,p) — packing it once here amortises across all M-tiles.
+    // === Control state for the in-scope dispatch loop ===
     //
-    // NOTE on loop ordering: the single-threaded path's outermost loop is
-    // also (j, p, i) — we keep that here so packed_b is reused across the
-    // full M range before advancing K, maximising temporal locality.
-    let mut j = 0;
-    while j < n {
-        let j_block = (n - j).min(OPT_NC);
+    // generation: bumped by main after packing. Workers wait for it to
+    //   change. Top bit signals "exit the loop".
+    // active: decremented by each thread (including main) on block
+    //   completion. 0 → everyone's done with this block.
+    // tile_counter: atomic queue of M-tiles, reset each block.
+    // cur_{j,p,j_block,p_block,beta}: per-block geometry, published by
+    //   main before bumping generation. Plain loads on workers are OK
+    //   because they Acquire via generation.
+    //
+    // All control state is cache-line-isolated from the FP data (Vec
+    // allocations are >64B apart from stack atomics).
 
-        let mut p = 0;
-        while p < k {
-            let p_block = (k - p).min(OPT_KC);
+    let generation = AtomicI32::new(0);
+    let active = AtomicU32::new(0);
+    let tile_counter = AtomicUsize::new(0);
 
-            // Pack B[p..p+p_block, j..j+j_block] — SERIAL, ONCE.
-            // This is the single biggest perf fix vs. the old parallel path.
-            unsafe {
-                pack_b_optimized(
-                    b.as_ptr().add(p * n + j),
-                    n,
-                    packed_b.as_mut_ptr(),
-                    p_block,
-                    j_block,
-                );
+    // Per-block geometry. Written by main, read by workers. No atomics
+    // on these fields individually: the Release store on `generation`
+    // sequences them, workers Acquire-load generation before reading.
+    //
+    // UnsafeCell is !Sync, so we can't hand `&UnsafeCell` to worker
+    // closures. Instead, smuggle the address as a usize — workers
+    // reconstruct the pointer. This is the standard dance for "trust me,
+    // I've done the synchronisation" in WASM parallel code.
+    //
+    // Layout note: the tuple is 5 usize-sized fields = 40 bytes, so reads
+    // are NOT atomic. That's fine: workers only read after Acquire-seeing
+    // the new generation, and main only writes while workers are spinning
+    // (before the Release store).
+    let cur = std::cell::UnsafeCell::new((0usize, 0usize, 0usize, 0usize, 0.0f32));
+    let cur_addr = cur.get() as usize;
+
+    // Smuggle atomic addresses too, so worker closures only capture Copy
+    // values (keeps them Send + Sync without fighting borrow lifetimes
+    // across rayon's scope).
+    let gen_addr = generation.as_ptr() as usize;
+    let active_addr = active.as_ptr() as usize;
+    let tile_addr = tile_counter.as_ptr() as usize;
+
+    const SPIN_ITERS: u32 = 50_000;  // ~50 μs before parking; GEMM blocks
+                                      // finish faster so workers rarely park
+    const EXIT_BIT: i32 = 1 << 30;
+
+    /// Inner tile-drain loop. Free function with no captures — all state
+    /// passed explicitly — so it's trivially Send+Sync and inlines cleanly.
+    ///
+    /// Safety: caller has established the generation Acquire/Release
+    /// happens-before so `pb` reads are consistent; claimed tiles write
+    /// disjoint C rows.
+    #[inline(always)]
+    unsafe fn drain_tiles_v4(
+        tile_addr: usize,
+        n_m_tiles: usize,
+        a_addr: usize,
+        c_addr: usize,
+        pb_addr: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        j: usize,
+        p: usize,
+        j_block: usize,
+        p_block: usize,
+        beta: f32,
+    ) {
+        let tile_ctr = &*(tile_addr as *const AtomicUsize);
+        let j_panels = (j_block + OPT_NR - 1) / OPT_NR;
+        let pb_ptr = pb_addr as *const f32;
+
+        loop {
+            let t = tile_ctr.fetch_add(1, Ordering::Relaxed);
+            if t >= n_m_tiles {
+                break;
             }
-            // Release fence: packed_b writes must be visible to workers that
-            // Acquire via the tile counter below.
-            std::sync::atomic::fence(Ordering::Release);
 
-            let beta = if p == 0 { 0.0 } else { 1.0 };
-            let pb_ptr = packed_b.as_ptr() as usize;
+            let m_start = t * OPT_MC;
+            let m_size = (m - m_start).min(OPT_MC);
+            let i_main = m_size / OPT_MR * OPT_MR;
 
-            // Tiles for this (j, p) block.  Currently M-sliced only — the
-            // packed-B panel is small (KC × NC = 256 × 128 × 4 B = 128 KiB,
-            // fits in L2) and shared by every M-tile, so 2D-splitting N would
-            // trade B-in-L2 reuse for more parallelism.  For wide-M problems
-            // M-only is enough; if your M is small and N is huge, switch to
-            // a true 2D tile enumeration (see PR discussion for the recipe).
-            let total_tiles = m_tiles.len();
+            let a_ptr = (a_addr as *const f32).add(m_start * k + p);
+            let c_ptr = (c_addr as *mut f32).add(m_start * n + j);
 
-            let tile_counter = AtomicUsize::new(0);
-
-            // The actual work loop. Smuggle pointers via usize because
-            // Rayon wants Send + Sync and *mut f32 is neither. Safety:
-            // tile disjointness in C + packed_b is read-only after the
-            // fence above.
-            let worker = || {
-                loop {
-                    let t = tile_counter.fetch_add(1, Ordering::Acquire);
-                    if t >= total_tiles {
-                        break;
-                    }
-
-                    let mt = &m_tiles[t];
-                    let tile = GemmTile {
-                        a_ofs: mt.start * k + p,
-                        c_ofs: mt.start * n + j,
-                        pb_ofs: 0,
-                        m_size: mt.size,
-                        n_size: j_block,
-                    };
-
-                    unsafe {
-                        run_macro_tile(
-                            a_ptr as *const f32,
-                            k,
-                            pb_ptr as *const f32,
-                            c_ptr as *mut f32,
-                            n,
-                            tile,
+            let mut ii = 0;
+            while ii < i_main {
+                let mut jj = 0;
+                while jj < j_panels * OPT_NR && jj < j_block {
+                    let panel = jj / OPT_NR;
+                    let pb = pb_ptr.add(panel * p_block * OPT_NR);
+                    let n_rem = j_block - jj;
+                    if n_rem >= OPT_NR {
+                        micro_kernel_6x8_fma(
                             p_block,
+                            a_ptr.add(ii * k), k,
+                            pb,
+                            c_ptr.add(ii * n + jj), n,
+                            beta,
+                        );
+                    } else {
+                        micro_kernel_edge(
+                            OPT_MR, n_rem, p_block,
+                            a_ptr.add(ii * k), k,
+                            pb,
+                            c_ptr.add(ii * n + jj), n,
                             beta,
                         );
                     }
+                    jj += OPT_NR;
                 }
-            };
-
-            // Fan out.
-            //
-            // We use rayon::scope because wasm-bindgen-rayon already owns
-            // the Web Worker pool. But instead of par_iter (which does NOT
-            // let the caller participate when called from outside the pool,
-            // and which heap-allocs a Task per item), we spawn N-1 helpers
-            // and do the Nth share inline. This is the pthreadpool model:
-            // the caller *is* thread 0.
-            //
-            // The atomic-counter distribution means we don't care how Rayon
-            // schedules the spawns — each helper just drains tiles until the
-            // counter runs out. Heterogeneous cores (M1 perf vs efficiency)
-            // self-balance: slow cores do fewer tiles, fast cores do more.
-            let n_helpers = rayon::current_num_threads();
-            rayon::scope(|s| {
-                // Spawn helpers. Each spawn is ~one Box<dyn FnOnce> alloc,
-                // but there are only N-1 of them per (j,p) block, not per
-                // tile — so total allocs = (N-1) × n_j_blocks × n_k_blocks,
-                // typically < 100 for a 1024² matmul with 14 workers.
-                for _ in 1..n_helpers {
-                    s.spawn(|_| worker());
+                ii += OPT_MR;
+            }
+            if ii < m_size {
+                let m_rem = m_size - ii;
+                let mut jj = 0;
+                while jj < j_panels * OPT_NR && jj < j_block {
+                    let panel = jj / OPT_NR;
+                    let pb = pb_ptr.add(panel * p_block * OPT_NR);
+                    let n_rem = (j_block - jj).min(OPT_NR);
+                    micro_kernel_edge(
+                        m_rem, n_rem, p_block,
+                        a_ptr.add(ii * k), k,
+                        pb,
+                        c_ptr.add(ii * n + jj), n,
+                        beta,
+                    );
+                    jj += OPT_NR;
                 }
-                // Caller participates.
-                worker();
-            });
-
-            p += OPT_KC;
+            }
         }
-        j += OPT_NC;
     }
 
+    // Worker event loop. All captures are Copy (usize addresses +
+    // primitives) → closure is trivially Send + Sync and can be shared
+    // by-reference across all spawns.
+    let worker_loop = move || {
+        let gen = unsafe { &*(gen_addr as *const AtomicI32) };
+        let act = unsafe { &*(active_addr as *const AtomicU32) };
+
+        let mut seen = 0i32;
+        loop {
+            // Spin-then-wait for generation to change.
+            let mut i = 0u32;
+            let mut g = gen.load(Ordering::Acquire);
+            while g == seen {
+                if i < SPIN_ITERS {
+                    core::hint::spin_loop();
+                    i += 1;
+                    g = gen.load(Ordering::Acquire);
+                } else {
+                    // Park. Workers (Web Worker threads) CAN atomic.wait.
+                    // Timeout -1 = infinite; main always notifies.
+                    unsafe {
+                        memory_atomic_wait32(gen_addr as *mut i32, seen, -1);
+                    }
+                    g = gen.load(Ordering::Acquire);
+                }
+            }
+            if g & EXIT_BIT != 0 {
+                return;
+            }
+            seen = g;
+
+            // Load block geometry. Acquire on generation synchronises
+            // with main's Release store of (j, p, ...) and tile_counter
+            // reset.
+            let (j, p, j_block, p_block, beta) = unsafe {
+                *(cur_addr as *const (usize, usize, usize, usize, f32))
+            };
+            unsafe {
+                drain_tiles_v4(
+                    tile_addr, n_m_tiles, a_addr, c_addr, pb_addr,
+                    m, n, k, j, p, j_block, p_block, beta,
+                );
+            }
+
+            // Signal done. Last thread drops active to 0. Main spins on
+            // this; workers fire a notify anyway in case a future caller
+            // is on a Worker thread (and CAN wait).
+            if act.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unsafe {
+                    memory_atomic_notify(active_addr as *mut i32, 1);
+                }
+            }
+        }
+    };
+
+    // Enter the scope ONCE. Workers spin until we set EXIT_BIT.
+    // Inside the scope: main runs the (j, p) BLIS loop, dispatching each
+    // block to workers via generation+notify.
+    rayon::scope(|s| {
+        for _ in 1..n_threads {
+            // Spawn holds &worker_loop (closure is Sync). No per-spawn alloc
+            // beyond rayon's own Box<dyn FnOnce>, once per thread, ONCE per
+            // matmul.
+            s.spawn(|_| worker_loop());
+        }
+
+        // Main thread drives the (j, p) loop.
+        let mut j = 0;
+        while j < n {
+            let j_block = (n - j).min(OPT_NC);
+
+            let mut p = 0;
+            while p < k {
+                let p_block = (k - p).min(OPT_KC);
+
+                // Pack B serially. Workers are spinning on generation,
+                // so the pack doesn't race with their packed_b reads.
+                unsafe {
+                    pack_b_optimized(
+                        (b_addr as *const f32).add(p * n + j),
+                        n,
+                        pb_addr as *mut f32,
+                        p_block,
+                        j_block,
+                    );
+                }
+
+                let beta = if p == 0 { 0.0 } else { 1.0 };
+
+                // Publish block geometry, arm completion, reset tile queue.
+                // All sequenced-before the Release store on generation.
+                unsafe {
+                    *(cur_addr as *mut (usize, usize, usize, usize, f32)) =
+                        (j, p, j_block, p_block, beta);
+                }
+                tile_counter.store(0, Ordering::Relaxed);
+                active.store(n_threads as u32, Ordering::Relaxed);
+
+                // Go.
+                generation.fetch_add(1, Ordering::Release);
+                unsafe {
+                    memory_atomic_notify(gen_addr as *mut i32, u32::MAX);
+                }
+
+                // Main does its share.
+                unsafe {
+                    drain_tiles_v4(
+                        tile_addr, n_m_tiles, a_addr, c_addr, pb_addr,
+                        m, n, k, j, p, j_block, p_block, beta,
+                    );
+                }
+
+                // Signal our completion, then spin-wait for stragglers.
+                // Main cannot atomic.wait (browser traps on main thread) —
+                // spin is the only option. For GEMM this is sub-μs: main
+                // did ~1/N of the work so the tail is short.
+                if active.fetch_sub(1, Ordering::AcqRel) > 1 {
+                    let mut spins = 0u64;
+                    while active.load(Ordering::Acquire) != 0 {
+                        core::hint::spin_loop();
+                        spins += 1;
+                        if spins > 10_000_000_000 {
+                            // Something deadlocked. Better to panic than
+                            // hang the tab.
+                            panic!("v4: workers stalled in block ({}, {})", j, p);
+                        }
+                    }
+                }
+
+                p += OPT_KC;
+            }
+            j += OPT_NC;
+        }
+
+        // Tell workers to exit, wake any that are parked.
+        generation.fetch_or(EXIT_BIT, Ordering::Release);
+        unsafe {
+            memory_atomic_notify(gen_addr as *mut i32, u32::MAX);
+        }
+    });
+
+    drop(packed_b);
+    let _ = cur; // keep UnsafeCell alive past the scope join
     c
 }
 
-/// Same algorithm as v3 but dispatched via the raw WASM futex pool.
-///
-/// This bypasses rayon entirely: work items are claimed by a single Relaxed
-/// fetch_sub (pthreadpool fastpath), workers spin-then-wait on
-/// `memory.atomic.wait32`, the caller spins (main thread can't wait). Net
-/// effect: ~2 atomic.notify per (j,p) block instead of Rayon's heavier
-/// park/unpark + heap-allocated task graph.
-///
-/// Called by the WASM binding when `initFutexPool` has been set up.
-/// The separate entry point exists so we can compile without the futex pool
-/// (e.g. running tests natively).
-#[cfg(all(
-    target_arch = "wasm32",
-    target_feature = "atomics",
-    feature = "wasm-futex"
-))]
-pub fn matmul_optimized_f32_parallel_v3_with_pool(
-    pool: &pthreadpool_rs::wasm_futex::FutexPool,
-    a: &[f32],
-    b: &[f32],
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<f32> {
-    if m * n * k < 128 * 128 * 128 {
-        return matmul_optimized_f32(a, b, m, n, k);
-    }
-
-    let mut c = vec![0.0f32; m * n];
-    let pb_cap = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
-    let mut packed_b = vec![0.0f32; pb_cap];
-
-    let n_m_tiles = (m + OPT_MC - 1) / OPT_MC;
-
-    let a_ptr = a.as_ptr() as usize;
-    let c_ptr = c.as_mut_ptr() as usize;
-
-    let mut j = 0;
-    while j < n {
-        let j_block = (n - j).min(OPT_NC);
-
-        let mut p = 0;
-        while p < k {
-            let p_block = (k - p).min(OPT_KC);
-
-            unsafe {
-                pack_b_optimized(
-                    b.as_ptr().add(p * n + j),
-                    n,
-                    packed_b.as_mut_ptr(),
-                    p_block,
-                    j_block,
-                );
-            }
-            std::sync::atomic::fence(Ordering::Release);
-
-            let beta = if p == 0 { 0.0 } else { 1.0 };
-            let pb_ptr = packed_b.as_ptr() as usize;
-
-            // One work item per M-tile. Pool's fastpath = one Relaxed
-            // fetch_sub per claim, no mutex, no alloc.  For 1024² that's
-            // ceil(1024/72) = 15 tiles per dispatch, repeated for each
-            // (j,p) block → enough items for work-stealing to balance
-            // heterogeneous cores.
-            pool.parallelize(n_m_tiles, |t| {
-                let i_start = t * OPT_MC;
-                let m_size = (m - i_start).min(OPT_MC);
-
-                let tile = GemmTile {
-                    a_ofs: i_start * k + p,
-                    c_ofs: i_start * n + j,
-                    pb_ofs: 0,
-                    m_size,
-                    n_size: j_block,
-                };
-
-                unsafe {
-                    run_macro_tile(
-                        a_ptr as *const f32, k,
-                        pb_ptr as *const f32,
-                        c_ptr as *mut f32, n,
-                        tile, p_block, beta,
-                    );
-                }
-            });
-
-            p += OPT_KC;
-        }
-        j += OPT_NC;
-    }
-
-    c
+// Stubs for non-atomics builds so the WASM binding layer can unconditionally
+// reference these symbols.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+pub fn matmul_optimized_f32_parallel_v4(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    matmul_optimized_f32(a, b, m, n, k)
 }

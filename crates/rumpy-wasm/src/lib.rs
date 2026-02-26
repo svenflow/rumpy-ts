@@ -703,6 +703,92 @@ pub fn get_num_threads() -> usize {
     rayon::current_num_threads()
 }
 
+/// DEBUG: mimic v3's dispatch pattern (rayon::scope + inline caller +
+/// atomic tile counter) and record which rayon thread claims each tile.
+///
+/// Returns a flat array of [tile_idx, rayon_thread_idx, tid_param] triples
+/// so we can see if all tiles were claimed by one thread (rayon dispatch
+/// bug) or spread across threads (parallelism works, perf bug is elsewhere).
+#[wasm_bindgen(js_name = probeV3Dispatch)]
+pub fn probe_v3_dispatch(n_tiles: usize, work_ms_per_tile: f64) -> Vec<f64> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let n_workers = rayon::current_num_threads();
+    let tile_counter = AtomicUsize::new(0);
+    let log: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::with_capacity(n_tiles));
+
+    let worker = |tid: usize| {
+        loop {
+            let t = tile_counter.fetch_add(1, Ordering::Relaxed);
+            if t >= n_tiles { break; }
+
+            let rtid = rayon::current_thread_index().unwrap_or(9999);
+            log.lock().unwrap().push((t, rtid, tid));
+
+            // Simulate work.
+            let start = js_sys::Date::now();
+            while js_sys::Date::now() - start < work_ms_per_tile {
+                core::hint::spin_loop();
+            }
+        }
+    };
+
+    let t0 = js_sys::Date::now();
+    rayon::scope(|s| {
+        for tid in 0..n_workers {
+            s.spawn(move |_| worker(tid));
+        }
+        worker(n_workers); // caller
+    });
+    let wall = js_sys::Date::now() - t0;
+
+    // Flatten: [wall, n_triples, t0,r0,p0, t1,r1,p1, ...]
+    let mut out = vec![wall, log.lock().unwrap().len() as f64];
+    for (t, r, p) in log.lock().unwrap().iter() {
+        out.push(*t as f64);
+        out.push(*r as f64);
+        out.push(*p as f64);
+    }
+    out
+}
+
+/// DEBUG: probe whether rayon workers are actually executing in parallel.
+///
+/// Spawns N tasks, each recording its rayon thread index and spinning for
+/// ~duration_ms. If workers are live, wall-clock ≈ duration_ms (parallel).
+/// If all tasks run on the main thread, wall-clock ≈ N × duration_ms.
+///
+/// Returns [wall_ms, n_distinct_thread_ids, max_thread_id_seen].
+#[wasm_bindgen(js_name = probeRayonParallelism)]
+pub fn probe_rayon_parallelism(n_tasks: usize, duration_ms: f64) -> Vec<f64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Rayon thread indices seen (bitmask; up to 64 threads).
+    let seen = AtomicUsize::new(0);
+    let max_idx = AtomicUsize::new(0);
+
+    let t0 = js_sys::Date::now();
+    (0..n_tasks).into_par_iter().for_each(|_| {
+        let tid = rayon::current_thread_index().unwrap_or(usize::MAX);
+        if tid < 64 {
+            seen.fetch_or(1 << tid, Ordering::Relaxed);
+            max_idx.fetch_max(tid, Ordering::Relaxed);
+        }
+        // Busy-spin for duration_ms (can't atomic.wait on main thread, and
+        // we want deterministic work regardless of thread).
+        let start = js_sys::Date::now();
+        while js_sys::Date::now() - start < duration_ms {
+            core::hint::spin_loop();
+        }
+    });
+    let wall = js_sys::Date::now() - t0;
+
+    let n_distinct = seen.load(Ordering::Relaxed).count_ones() as f64;
+    vec![wall, n_distinct, max_idx.load(Ordering::Relaxed) as f64]
+}
+
 /// Parallel f32 matrix multiplication using pthreadpool-rs
 ///
 /// Uses pthreadpool-rs instead of rayon for parallelization.
@@ -889,65 +975,46 @@ pub fn matmul_f32_optimized_parallel_v3(a: &Float32Array, b: &Float32Array, m: u
     }
 }
 
-// --- Raw-futex GEMM dispatch (experimental, feature = "futex-pool") ---------
-//
-// Only compiled when built with `--features futex-pool`. Provides a
-// Rayon-free parallel path: workers are spawned via `wasm_thread` and woken
-// with bare `memory.atomic.wait32/notify` instructions. ~2 atomic.notify per
-// GEMM block instead of Rayon's park/unpark + per-task heap allocation.
-//
-// This is the closest you can get in Rust-WASM to XNNPACK's
-// pthreadpool+Emscripten setup, short of hand-writing the worker JS glue.
-
-/// Initialise the raw-futex worker pool with `n` threads (including the
-/// caller as thread 0). Subsequent calls are no-ops.
+/// Parallel optimised GEMM, v4: hijack Rayon's workers with raw
+/// `memory.atomic.wait32`/`notify` dispatch.
 ///
-/// Spawns `n - 1` Web Workers via `wasm_thread`. The caller's thread (the
-/// JS main thread, typically) becomes thread 0 and participates in
-/// every GEMM dispatch — unlike `initThreadPool` + `par_iter` where the
-/// caller just waits.
+/// v3 uses ONE `rayon::scope` per matmul (good), but inside it there's
+/// still no shared packed-B (each thread packs its own) and the join is
+/// Rayon's standard park/unpark.  v4 is the full pthreadpool model:
 ///
-/// Interop: if you're also using `initThreadPool`, you now have two worker
-/// pools. Don't size both to `navigator.hardwareConcurrency` or you'll
-/// oversubscribe — either pick one, or size them to share cores
-/// (e.g. 4 + 4 on an 8-core machine).
+/// * ONE `rayon::scope` — we use wasm-bindgen-rayon's Web Workers but
+///   NOT Rayon's task scheduler.
 ///
-/// Apple Silicon: cap `n` at perf-core count (4 or 8). Efficiency cores
-/// drag down futex-heavy paths; work-stealing mitigates but doesn't
-/// eliminate the tail.
-#[cfg(feature = "futex-pool")]
-#[wasm_bindgen(js_name = initFutexPool)]
-pub fn init_futex_pool(n: usize) {
-    pthreadpool_rs::wasm_futex::init(n);
-}
-
-/// Parallel optimised GEMM using the raw-futex pool.
+/// * Workers enter OUR spin-then-`atomic.wait` loop. Main drives them
+///   block-by-block: pack B (shared), bump generation, `atomic.notify`,
+///   drain tiles alongside workers, spin-wait for completion, repeat.
 ///
-/// Same algorithm as v3 (pack-once + tile-atomic) but dispatched via
-/// `memory.atomic.wait32/notify` instead of Rayon. Workers spin ~100 μs
-/// before parking — for GEMM block sizes (sub-ms per dispatch) they never
-/// actually park, so dispatch latency is near zero.
+/// * Shared packed-B → minimum total packing work (same as single-thread).
 ///
-/// Requires `initFutexPool(n)` — falls back to v3 (Rayon) if uninitialised.
-#[cfg(feature = "futex-pool")]
-#[wasm_bindgen(js_name = matmulF32OptimizedParallelFutex)]
-pub fn matmul_f32_optimized_parallel_futex(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+/// * Per-block sync is ~1 `atomic.notify` + N×1 Relaxed `fetch_sub` +
+///   one short main-thread spin. Compare Rayon: N× `Box<dyn FnOnce>` +
+///   N× park/unpark per scope.
+///
+/// This is "our own thread manager", hosted inside Rayon's already-spawned
+/// workers. No new dependencies, no separate worker pool to manage.
+///
+/// Requires `initThreadPool(n)` (same as v3).
+#[wasm_bindgen(js_name = matmulF32OptimizedParallelV4)]
+pub fn matmul_f32_optimized_parallel_v4(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
     let a_vec = a.to_vec();
     let b_vec = b.to_vec();
 
-    let c_vec = if let Some(pool) = pthreadpool_rs::wasm_futex::get_pool() {
-        simd_gemm::matmul_optimized_f32_parallel_v3_with_pool(pool, &a_vec, &b_vec, m, n, k)
-    } else {
-        simd_gemm::matmul_optimized_f32_parallel_v3(&a_vec, &b_vec, m, n, k)
-    };
-    Float32Array::from(c_vec.as_slice())
-}
+    #[cfg(target_arch = "wasm32")]
+    {
+        let c_vec = simd_gemm::matmul_optimized_f32_parallel_v4(&a_vec, &b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
 
-/// Report futex pool thread count (0 if uninitialised).
-#[cfg(feature = "futex-pool")]
-#[wasm_bindgen(js_name = getFutexPoolThreads)]
-pub fn get_futex_pool_threads() -> usize {
-    pthreadpool_rs::wasm_futex::threads_count()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let c_vec = simd_gemm::matmul_parallel_f32(&a_vec, &b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
 }
 
 /// Cache-blocked XNNPACK-style matmul with pre-packed B
