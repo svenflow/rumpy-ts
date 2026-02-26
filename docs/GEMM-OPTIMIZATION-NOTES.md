@@ -36,6 +36,71 @@ Our new **optimized 6x8 micro-kernel** beats TensorFlow.js XNNPACK at ALL matrix
 
 ---
 
+## Multi-threaded Optimization Journey (2026-02-26)
+
+### Problem: Multi-threaded was 5x SLOWER than tfjs
+
+With the old rayon-based parallelization, we were consistently 1.5-5x slower than tfjs multi-threaded (which uses XNNPACK + pthreadpool).
+
+### Root Causes Identified
+
+1. **wasm-bindgen-rayon initialization**: `initThreadPool()` was hanging because our benchmark server wasn't properly serving the workerHelpers.js module. Fixed by routing `/pkg/` requests to `/pkg/rumpy_wasm.js`.
+
+2. **Allocator contention**: Original code allocated `packed_b` buffer inside `par_iter().for_each()`. With hundreds of tasks, threads serialized waiting for the global heap lock. Fixed by using `for_each_init()` to allocate buffers once per thread.
+
+3. **1D vs 2D tiling**: 1D row partitioning means all threads read the entire B matrix → cache thrashing. 2D tiling reduces shared memory access.
+
+### 🔴 THE BIG DISCOVERY: Cache Associativity Aliasing (Power-of-2 Curse)
+
+**Symptom**: Parallelization worked PERFECTLY up to 1792x1792 (5-7x speedup), but dropped to exactly 1.0x at 2048x2048 and 4096x4096.
+
+**Root Cause**: Cache set aliasing!
+- 2048 × 4 bytes = **8KB row stride** (perfect power-of-2)
+- Modern CPU caches are set-associative (e.g., 8-way)
+- Memory addresses map to cache "sets" using lower address bits
+- When stride is power-of-2, EVERY row maps to the SAME cache set
+- With 10 threads accessing simultaneously → catastrophic cache thrashing
+
+**Evidence**:
+| Size | Parallel Speedup | Notes |
+|------|-----------------|-------|
+| 1792x1792 | **5.29x** | Works great |
+| 2047x2047 | **3.75x** | Off-by-one avoids aliasing |
+| 2048x2048 | **1.00x** | Perfect aliasing - no speedup! |
+| 2049x2049 | **4.21x** | Off-by-one avoids aliasing |
+| 2056x2056 | **4.79x** | +8 padding breaks aliasing |
+| 4096x4096 | **1.00x** | Also power-of-2 - same problem |
+
+**The Fix**: Pad matrices to non-power-of-2 widths:
+- 2048 → 2056 (add 8 columns)
+- 4096 → 4104 (add 8 columns)
+
+This is a well-known problem in HPC (High Performance Computing). BLAS libraries like OpenBLAS handle this with internal padding.
+
+### Current Multi-threaded Results (with fixes, 10 threads)
+
+| Size | tfjs multi | rumpy parallel | vs tfjs | Parallel Speedup |
+|------|-----------|----------------|---------|------------------|
+| 256x256 | 0.14ms | 0.17ms | 1.23x slower | 2.6x |
+| 512x512 | 0.74ms | 0.80ms | 1.07x slower | 4.3x |
+| 1024x1024 | 5.33ms | 4.67ms | **0.88x FASTER** | 5.7x |
+| 2049x2049 | ~42ms | ~50ms | 1.2x slower | 4.2x |
+| 2056x2056 | ~42ms | ~45ms | ~1.07x slower | 4.8x |
+
+**We now beat tfjs at 1024x1024!** Larger sizes need padding to avoid cache aliasing.
+
+### Lessons Learned
+
+1. **Power-of-2 matrix dimensions are DANGEROUS** in multi-threaded code. Always test 2^n-1, 2^n, and 2^n+1.
+
+2. **wasm-bindgen-rayon is picky** about module resolution. The workerHelpers.js import `../../..` must resolve correctly.
+
+3. **Allocate buffers per-thread, not per-task** using `for_each_init()` to avoid allocator serialization.
+
+4. **Pre-allocate WASM memory** to avoid `memory.grow` during parallel execution (causes global pause).
+
+---
+
 ## Historical Data (2026-02-25)
 
 ### Previous Performance (BEFORE optimization)
