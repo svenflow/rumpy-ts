@@ -23,6 +23,7 @@ futex-pool = ["pthreadpool-rs/wasm-futex", "rumpy-cpu/wasm-futex"]
 rumpy-core = { path = "../rumpy-core" }
 rumpy-cpu = { path = "../rumpy-cpu" }
 pthreadpool-rs = { path = "../pthreadpool-rs", features = ["wasm-threads"] }
+ndarray.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-rayon.workspace = true
 rayon.workspace = true

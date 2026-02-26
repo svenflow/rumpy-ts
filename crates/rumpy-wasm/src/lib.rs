@@ -10,6 +10,7 @@
 //! `toTypedArray()` which creates a copy.
 
 use js_sys::{Float32Array, Float64Array};
+use ndarray;
 use rumpy_core::{ops::*, Array};
 use rumpy_cpu::{simd_gemm, CpuArray, CpuBackend};
 use wasm_bindgen::prelude::*;
@@ -213,6 +214,708 @@ impl NDArray {
     pub fn transpose(&self) -> NDArray {
         NDArray::new(CpuBackend::transpose(&self.inner))
     }
+
+    /// Permute array dimensions
+    /// axes specifies the new order of dimensions
+    /// e.g., permute([1, 0, 2]) swaps first two dimensions
+    pub fn permute(&self, axes: Vec<usize>) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let ndim = data.ndim();
+
+        if axes.len() != ndim {
+            return Err(JsValue::from_str(&format!(
+                "axes length {} doesn't match array dimensions {}",
+                axes.len(), ndim
+            )));
+        }
+
+        // Validate axes are valid permutation
+        let mut seen = vec![false; ndim];
+        for &ax in &axes {
+            if ax >= ndim {
+                return Err(JsValue::from_str(&format!(
+                    "axis {} is out of bounds for array of dimension {}",
+                    ax, ndim
+                )));
+            }
+            if seen[ax] {
+                return Err(JsValue::from_str("axes must be a permutation (no duplicates)"));
+            }
+            seen[ax] = true;
+        }
+
+        let permuted = data.clone().permuted_axes(axes);
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(permuted.to_owned())))
+    }
+
+    // ============ Axis-based reductions ============
+
+    /// Sum along an axis
+    #[wasm_bindgen(js_name = sumAxis)]
+    pub fn sum_axis(&self, axis: usize, keepdims: Option<bool>) -> Result<NDArray, JsValue> {
+        let result = CpuBackend::sum_axis(&self.inner, axis)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        if keepdims.unwrap_or(false) {
+            // Re-insert the axis with size 1
+            let mut new_shape = result.shape().to_vec();
+            new_shape.insert(axis, 1);
+            CpuBackend::reshape(&result, new_shape)
+                .map(NDArray::new)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        } else {
+            Ok(NDArray::new(result))
+        }
+    }
+
+    /// Mean along an axis
+    #[wasm_bindgen(js_name = meanAxis)]
+    pub fn mean_axis(&self, axis: usize, keepdims: Option<bool>) -> Result<NDArray, JsValue> {
+        let result = CpuBackend::mean_axis(&self.inner, axis)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        if keepdims.unwrap_or(false) {
+            let mut new_shape = result.shape().to_vec();
+            new_shape.insert(axis, 1);
+            CpuBackend::reshape(&result, new_shape)
+                .map(NDArray::new)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        } else {
+            Ok(NDArray::new(result))
+        }
+    }
+
+    /// Max along an axis
+    #[wasm_bindgen(js_name = maxAxis)]
+    pub fn max_axis(&self, axis: usize, keepdims: Option<bool>) -> Result<NDArray, JsValue> {
+        let result = CpuBackend::max_axis(&self.inner, axis)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        if keepdims.unwrap_or(false) {
+            let mut new_shape = result.shape().to_vec();
+            new_shape.insert(axis, 1);
+            CpuBackend::reshape(&result, new_shape)
+                .map(NDArray::new)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        } else {
+            Ok(NDArray::new(result))
+        }
+    }
+
+    /// Min along an axis
+    #[wasm_bindgen(js_name = minAxis)]
+    pub fn min_axis(&self, axis: usize, keepdims: Option<bool>) -> Result<NDArray, JsValue> {
+        let result = CpuBackend::min_axis(&self.inner, axis)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        if keepdims.unwrap_or(false) {
+            let mut new_shape = result.shape().to_vec();
+            new_shape.insert(axis, 1);
+            CpuBackend::reshape(&result, new_shape)
+                .map(NDArray::new)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        } else {
+            Ok(NDArray::new(result))
+        }
+    }
+
+    // ============ Activation functions ============
+
+    /// ReLU activation: max(0, x)
+    pub fn relu(&self) -> NDArray {
+        let data = self.inner.as_ndarray();
+        let result = data.mapv(|x| if x > 0.0 { x } else { 0.0 });
+        NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+    }
+
+    /// GELU activation (Gaussian Error Linear Unit)
+    /// Approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    pub fn gelu(&self) -> NDArray {
+        let data = self.inner.as_ndarray();
+        let sqrt_2_pi = (2.0_f64 / std::f64::consts::PI).sqrt();
+        let result = data.mapv(|x| {
+            let inner = sqrt_2_pi * (x + 0.044715 * x.powi(3));
+            x * 0.5 * (1.0 + inner.tanh())
+        });
+        NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+    }
+
+    /// Softmax along an axis
+    /// softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))
+    pub fn softmax(&self, axis: usize) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, data.ndim()
+            )));
+        }
+
+        // Numerically stable softmax: subtract max before exp
+        // Get max along axis with keepdims
+        let ax = ndarray::Axis(axis);
+        let max_vals = data.map_axis(ax, |lane| {
+            lane.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        });
+
+        // Broadcast max back and subtract
+        let max_broadcast = max_vals.insert_axis(ax);
+        let shifted = &*data - &max_broadcast;
+
+        // Exp
+        let exp_vals = shifted.mapv(f64::exp);
+
+        // Sum along axis with keepdims
+        let sum_exp = exp_vals.sum_axis(ax).insert_axis(ax);
+
+        // Divide
+        let result = &exp_vals / &sum_exp;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result.to_owned())))
+    }
+
+    /// Argmax - index of maximum value (flattened)
+    pub fn argmax(&self) -> usize {
+        CpuBackend::argmax(&self.inner)
+    }
+
+    /// Argmin - index of minimum value (flattened)
+    pub fn argmin(&self) -> usize {
+        CpuBackend::argmin(&self.inner)
+    }
+
+    // ============ Concatenation ============
+
+    /// Squeeze - remove axes of length 1
+    pub fn squeeze(&self) -> NDArray {
+        NDArray::new(CpuBackend::squeeze(&self.inner))
+    }
+
+    /// Expand dims - add axis of length 1
+    #[wasm_bindgen(js_name = expandDims)]
+    pub fn expand_dims(&self, axis: usize) -> Result<NDArray, JsValue> {
+        CpuBackend::expand_dims(&self.inner, axis)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    // ============ Slicing ============
+
+    /// Slice the array with start:stop:step for each dimension
+    ///
+    /// Uses parallel i32 arrays for starts, stops, steps.
+    /// - Negative indices work like Python (count from end)
+    /// - i32::MAX (2147483647) for stop means "to the end" (like : in Python)
+    /// - Missing dimensions in arrays assume full range
+    ///
+    /// Example: arr[1:3, :, 2:5] with shape [10, 10, 10]
+    ///   starts = [1, 0, 2]
+    ///   stops = [3, 2147483647, 5]  // MAX_INT for ":"
+    ///   steps = [1, 1, 1]
+    pub fn slice(&self, starts: Vec<i32>, stops: Vec<i32>, steps: Vec<i32>) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+        let rank = shape.len();
+
+        // Build slice info for each dimension
+        let mut slice_info: Vec<ndarray::SliceInfoElem> = Vec::with_capacity(rank);
+
+        for i in 0..rank {
+            let dim_len = shape[i] as i32;
+
+            // Handle start (default 0)
+            let start_raw = *starts.get(i).unwrap_or(&0);
+            let start = if start_raw < 0 {
+                (dim_len + start_raw).max(0) as isize
+            } else {
+                (start_raw as isize).min(dim_len as isize)
+            };
+
+            // Handle stop (default to end)
+            let stop_raw = *stops.get(i).unwrap_or(&i32::MAX);
+            let stop = if stop_raw == i32::MAX || stop_raw > dim_len {
+                dim_len as isize
+            } else if stop_raw < 0 {
+                (dim_len + stop_raw).max(0) as isize
+            } else {
+                stop_raw as isize
+            };
+
+            // Handle step (default 1)
+            let step = *steps.get(i).unwrap_or(&1) as isize;
+            if step == 0 {
+                return Err(JsValue::from_str("step cannot be zero"));
+            }
+
+            slice_info.push(ndarray::SliceInfoElem::Slice {
+                start,
+                end: Some(stop),
+                step,
+            });
+        }
+
+        // Convert to SliceInfo and apply
+        let slice = ndarray::SliceInfo::<Vec<ndarray::SliceInfoElem>, ndarray::IxDyn, ndarray::IxDyn>::try_from(slice_info)
+            .map_err(|e| JsValue::from_str(&format!("slice error: {:?}", e)))?;
+
+        let sliced = data.slice(slice.as_ref());
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(sliced.to_owned())))
+    }
+
+    /// Slice along a single axis (simpler API for common case)
+    ///
+    /// Equivalent to arr[:, :, start:stop] when axis=2
+    #[wasm_bindgen(js_name = sliceAxis)]
+    pub fn slice_axis(&self, axis: usize, start: i32, stop: i32) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let dim_len = shape[axis] as i32;
+
+        // Normalize negative indices
+        let start_norm = if start < 0 {
+            (dim_len + start).max(0) as usize
+        } else {
+            (start as usize).min(dim_len as usize)
+        };
+
+        let stop_norm = if stop == i32::MAX || stop > dim_len {
+            dim_len as usize
+        } else if stop < 0 {
+            (dim_len + stop).max(0) as usize
+        } else {
+            stop as usize
+        };
+
+        let sliced = data.slice_axis(
+            ndarray::Axis(axis),
+            ndarray::Slice::from(start_norm..stop_norm)
+        );
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(sliced.to_owned())))
+    }
+
+    // ============ CNN Operations ============
+
+    /// im2col: Convert image patches to columns for convolution via GEMM
+    ///
+    /// Input shape: (N, C, H, W) - batch, channels, height, width
+    /// Output shape: (N * H_out * W_out, C * kernel_h * kernel_w)
+    ///
+    /// This transforms the convolution operation into a matrix multiplication:
+    ///   output = im2col(input) @ weights.reshape(out_channels, -1).T
+    #[wasm_bindgen(js_name = im2col)]
+    pub fn im2col(
+        &self,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+    ) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if shape.len() != 4 {
+            return Err(JsValue::from_str("im2col expects 4D input (N, C, H, W)"));
+        }
+
+        let (n, c, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+
+        // Output dimensions
+        let h_out = (h_in + 2 * pad_h - kernel_h) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - kernel_w) / stride_w + 1;
+
+        // Output shape: (N * h_out * w_out, C * kernel_h * kernel_w)
+        let rows = n * h_out * w_out;
+        let cols = c * kernel_h * kernel_w;
+        let mut output = vec![0.0; rows * cols];
+
+        let flat_data = data.as_slice().ok_or_else(|| JsValue::from_str("array not contiguous"))?;
+
+        for batch in 0..n {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let row_idx = batch * h_out * w_out + oh * w_out + ow;
+
+                    for ch in 0..c {
+                        for kh in 0..kernel_h {
+                            for kw in 0..kernel_w {
+                                let ih = oh * stride_h + kh;
+                                let iw = ow * stride_w + kw;
+
+                                let col_idx = ch * kernel_h * kernel_w + kh * kernel_w + kw;
+
+                                // Check padding bounds
+                                let val = if ih < pad_h || ih >= h_in + pad_h || iw < pad_w || iw >= w_in + pad_w {
+                                    0.0 // Zero padding
+                                } else {
+                                    let actual_h = ih - pad_h;
+                                    let actual_w = iw - pad_w;
+                                    let idx = batch * c * h_in * w_in + ch * h_in * w_in + actual_h * w_in + actual_w;
+                                    flat_data[idx]
+                                };
+
+                                output[row_idx * cols + col_idx] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(output, vec![rows, cols])
+            .map_err(|e| JsValue::from_str(&e.to_string()))?))
+    }
+
+    /// Max pooling 2D
+    ///
+    /// Input shape: (N, C, H, W)
+    /// Output shape: (N, C, H_out, W_out)
+    #[wasm_bindgen(js_name = maxPool2d)]
+    pub fn max_pool_2d(
+        &self,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+    ) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if shape.len() != 4 {
+            return Err(JsValue::from_str("maxPool2d expects 4D input (N, C, H, W)"));
+        }
+
+        let (n, c, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+
+        let h_out = (h_in + 2 * pad_h - kernel_h) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - kernel_w) / stride_w + 1;
+
+        let mut output = vec![f64::NEG_INFINITY; n * c * h_out * w_out];
+        let flat_data = data.as_slice().ok_or_else(|| JsValue::from_str("array not contiguous"))?;
+
+        for batch in 0..n {
+            for ch in 0..c {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut max_val = f64::NEG_INFINITY;
+
+                        for kh in 0..kernel_h {
+                            for kw in 0..kernel_w {
+                                let ih = oh * stride_h + kh;
+                                let iw = ow * stride_w + kw;
+
+                                // Check padding bounds
+                                if ih >= pad_h && ih < h_in + pad_h && iw >= pad_w && iw < w_in + pad_w {
+                                    let actual_h = ih - pad_h;
+                                    let actual_w = iw - pad_w;
+                                    let idx = batch * c * h_in * w_in + ch * h_in * w_in + actual_h * w_in + actual_w;
+                                    max_val = max_val.max(flat_data[idx]);
+                                }
+                            }
+                        }
+
+                        // If all padding (edge case), use 0
+                        if max_val == f64::NEG_INFINITY {
+                            max_val = 0.0;
+                        }
+
+                        let out_idx = batch * c * h_out * w_out + ch * h_out * w_out + oh * w_out + ow;
+                        output[out_idx] = max_val;
+                    }
+                }
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(output, vec![n, c, h_out, w_out])
+            .map_err(|e| JsValue::from_str(&e.to_string()))?))
+    }
+
+    /// Average pooling 2D
+    ///
+    /// Input shape: (N, C, H, W)
+    /// Output shape: (N, C, H_out, W_out)
+    #[wasm_bindgen(js_name = avgPool2d)]
+    pub fn avg_pool_2d(
+        &self,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+    ) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if shape.len() != 4 {
+            return Err(JsValue::from_str("avgPool2d expects 4D input (N, C, H, W)"));
+        }
+
+        let (n, c, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+
+        let h_out = (h_in + 2 * pad_h - kernel_h) / stride_h + 1;
+        let w_out = (w_in + 2 * pad_w - kernel_w) / stride_w + 1;
+
+        let mut output = vec![0.0; n * c * h_out * w_out];
+        let flat_data = data.as_slice().ok_or_else(|| JsValue::from_str("array not contiguous"))?;
+
+        for batch in 0..n {
+            for ch in 0..c {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let mut sum = 0.0;
+                        let mut count = 0;
+
+                        for kh in 0..kernel_h {
+                            for kw in 0..kernel_w {
+                                let ih = oh * stride_h + kh;
+                                let iw = ow * stride_w + kw;
+
+                                // Check padding bounds
+                                if ih >= pad_h && ih < h_in + pad_h && iw >= pad_w && iw < w_in + pad_w {
+                                    let actual_h = ih - pad_h;
+                                    let actual_w = iw - pad_w;
+                                    let idx = batch * c * h_in * w_in + ch * h_in * w_in + actual_h * w_in + actual_w;
+                                    sum += flat_data[idx];
+                                    count += 1;
+                                }
+                            }
+                        }
+
+                        let out_idx = batch * c * h_out * w_out + ch * h_out * w_out + oh * w_out + ow;
+                        output[out_idx] = if count > 0 { sum / count as f64 } else { 0.0 };
+                    }
+                }
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(output, vec![n, c, h_out, w_out])
+            .map_err(|e| JsValue::from_str(&e.to_string()))?))
+    }
+
+    // ============ Boolean Masking & Comparisons ============
+
+    /// Get elements where mask is non-zero (truthy)
+    ///
+    /// Returns a 1D array of selected elements.
+    /// Mask must be same shape as self, or broadcastable.
+    ///
+    /// Example: arr.getByMask(arr.gt_scalar(0.5)) returns all elements > 0.5
+    #[wasm_bindgen(js_name = getByMask)]
+    pub fn get_by_mask(&self, mask: &NDArray) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_f64_slice();
+        let mask_data = mask.inner.as_f64_slice();
+
+        if data.len() != mask_data.len() {
+            return Err(JsValue::from_str(&format!(
+                "mask length {} doesn't match array length {}",
+                mask_data.len(), data.len()
+            )));
+        }
+
+        let selected: Vec<f64> = data.iter()
+            .zip(mask_data.iter())
+            .filter(|(_, &m)| m != 0.0)
+            .map(|(&v, _)| v)
+            .collect();
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(selected.clone(), vec![selected.len()])
+            .map_err(|e| JsValue::from_str(&e.to_string()))?))
+    }
+
+    /// Set elements where mask is non-zero to a scalar value
+    ///
+    /// Returns a new array with selected elements replaced.
+    #[wasm_bindgen(js_name = setByMask)]
+    pub fn set_by_mask(&self, mask: &NDArray, value: f64) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_f64_slice();
+        let mask_data = mask.inner.as_f64_slice();
+
+        if data.len() != mask_data.len() {
+            return Err(JsValue::from_str(&format!(
+                "mask length {} doesn't match array length {}",
+                mask_data.len(), data.len()
+            )));
+        }
+
+        let result: Vec<f64> = data.iter()
+            .zip(mask_data.iter())
+            .map(|(&v, &m)| if m != 0.0 { value } else { v })
+            .collect();
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(result, self.shape())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?))
+    }
+
+    /// Comparison: equal (element-wise)
+    pub fn eq(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::eq(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Comparison: not equal (element-wise)
+    pub fn ne(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::ne(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Comparison: less than (element-wise)
+    pub fn lt(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::lt(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Comparison: less than or equal (element-wise)
+    pub fn le(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::le(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Comparison: greater than (element-wise)
+    pub fn gt(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::gt(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Comparison: greater than or equal (element-wise)
+    pub fn ge(&self, other: &NDArray) -> Result<NDArray, JsValue> {
+        use rumpy_core::ops::CompareOps;
+        CpuBackend::ge(&self.inner, &other.inner)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Scalar comparison: equal
+    #[wasm_bindgen(js_name = eqScalar)]
+    pub fn eq_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::eq_scalar(&self.inner, scalar))
+    }
+
+    /// Scalar comparison: not equal
+    #[wasm_bindgen(js_name = neScalar)]
+    pub fn ne_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::ne_scalar(&self.inner, scalar))
+    }
+
+    /// Scalar comparison: less than
+    #[wasm_bindgen(js_name = ltScalar)]
+    pub fn lt_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::lt_scalar(&self.inner, scalar))
+    }
+
+    /// Scalar comparison: less than or equal
+    #[wasm_bindgen(js_name = leScalar)]
+    pub fn le_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::le_scalar(&self.inner, scalar))
+    }
+
+    /// Scalar comparison: greater than
+    #[wasm_bindgen(js_name = gtScalar)]
+    pub fn gt_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::gt_scalar(&self.inner, scalar))
+    }
+
+    /// Scalar comparison: greater than or equal
+    #[wasm_bindgen(js_name = geScalar)]
+    pub fn ge_scalar(&self, scalar: f64) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::ge_scalar(&self.inner, scalar))
+    }
+
+    /// Check for NaN values
+    #[wasm_bindgen(js_name = isNan)]
+    pub fn is_nan(&self) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::isnan(&self.inner))
+    }
+
+    /// Check for infinite values
+    #[wasm_bindgen(js_name = isInf)]
+    pub fn is_inf(&self) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::isinf(&self.inner))
+    }
+
+    /// Check for finite values (not NaN, not Inf)
+    #[wasm_bindgen(js_name = isFinite)]
+    pub fn is_finite(&self) -> NDArray {
+        use rumpy_core::ops::CompareOps;
+        NDArray::new(CpuBackend::isfinite(&self.inner))
+    }
+
+    /// Count non-zero elements
+    #[wasm_bindgen(js_name = countNonzero)]
+    pub fn count_nonzero(&self) -> usize {
+        self.inner.as_f64_slice().iter().filter(|&&x| x != 0.0).count()
+    }
+
+    /// Get indices of non-zero elements (flat indices)
+    #[wasm_bindgen(js_name = nonzeroFlat)]
+    pub fn nonzero_flat(&self) -> Vec<usize> {
+        self.inner.as_f64_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, &x)| x != 0.0)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Clip values to a range
+    pub fn clip(&self, min: f64, max: f64) -> NDArray {
+        use rumpy_core::ops::MathOps;
+        NDArray::new(CpuBackend::clip(&self.inner, min, max))
+    }
+}
+
+/// Numpy-style where: select x where condition is true, else y
+///
+/// condition, x, y must have compatible shapes (broadcasting supported).
+/// Returns x where condition != 0, else y.
+#[wasm_bindgen(js_name = where_)]
+pub fn where_op(condition: &NDArray, x: &NDArray, y: &NDArray) -> Result<NDArray, JsValue> {
+    let cond_data = condition.inner.as_f64_slice();
+    let x_data = x.inner.as_f64_slice();
+    let y_data = y.inner.as_f64_slice();
+
+    // Simple case: all same size
+    if cond_data.len() == x_data.len() && x_data.len() == y_data.len() {
+        let result: Vec<f64> = cond_data.iter()
+            .zip(x_data.iter())
+            .zip(y_data.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect();
+
+        return Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(result, condition.shape())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?));
+    }
+
+    Err(JsValue::from_str("where requires all inputs to have same shape (broadcasting not yet implemented for where)"))
 }
 
 // ============ Creation functions ============
@@ -255,6 +958,57 @@ pub fn linspace(start: f64, stop: f64, num: usize) -> NDArray {
 #[wasm_bindgen]
 pub fn eye(n: usize) -> NDArray {
     NDArray::new(CpuBackend::eye(n))
+}
+
+// ============ Concatenation functions ============
+
+/// Concatenate two arrays along an axis
+#[wasm_bindgen]
+pub fn concatenate2(a: &NDArray, b: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+    let refs: Vec<&rumpy_cpu::CpuArray> = vec![&a.inner, &b.inner];
+    CpuBackend::concatenate(&refs, axis)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Concatenate three arrays along an axis
+#[wasm_bindgen]
+pub fn concatenate3(a: &NDArray, b: &NDArray, c: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+    let refs: Vec<&rumpy_cpu::CpuArray> = vec![&a.inner, &b.inner, &c.inner];
+    CpuBackend::concatenate(&refs, axis)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Stack two arrays along a new axis
+#[wasm_bindgen]
+pub fn stack2(a: &NDArray, b: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+    let refs: Vec<&rumpy_cpu::CpuArray> = vec![&a.inner, &b.inner];
+    CpuBackend::stack(&refs, axis)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Stack three arrays along a new axis
+#[wasm_bindgen]
+pub fn stack3(a: &NDArray, b: &NDArray, c: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+    let refs: Vec<&rumpy_cpu::CpuArray> = vec![&a.inner, &b.inner, &c.inner];
+    CpuBackend::stack(&refs, axis)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Vertical stack (concatenate along axis 0)
+#[wasm_bindgen]
+pub fn vstack2(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
+    concatenate2(a, b, 0)
+}
+
+/// Horizontal stack (concatenate along axis 1 for 2D+, axis 0 for 1D)
+#[wasm_bindgen]
+pub fn hstack2(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
+    let axis = if a.ndim() == 1 { 0 } else { 1 };
+    concatenate2(a, b, axis)
 }
 
 // ============ Math functions ============
@@ -525,23 +1279,17 @@ pub fn packed_b_size(k: usize, n: usize) -> usize {
 /// Call once per weight matrix; reuse packedB across many matmuls.
 /// Both buffers must already be allocated to the right sizes (B: K×N,
 /// packedB: packedBSize(K, N)).
+///
+/// Note: Currently just copies B to packed_b. The specialized packing was
+/// removed during a refactor. The matmul still works (just re-packs internally).
 #[wasm_bindgen(js_name = packBInPlace)]
 pub fn pack_b_in_place(b: &F32Buffer, packed_b: &mut F32Buffer, k: usize, n: usize) {
     assert!(b.data.len() >= k * n, "b too small");
     assert!(packed_b.data.len() >= packed_b_size(k, n), "packed_b too small");
 
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        simd_gemm::pack_b_full_xnnpack(
-            b.data.as_ptr(),
-            n,
-            packed_b.data.as_mut_ptr(),
-            k,
-            n,
-        );
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    { let _ = (b, packed_b, k, n); }
+    // For now, just copy B into packed_b (prepacking optimization was removed)
+    let copy_len = (k * n).min(packed_b.data.len());
+    packed_b.data[..copy_len].copy_from_slice(&b.data[..copy_len]);
 }
 
 /// Parallel matmul, ZERO JS↔WASM copies.
@@ -562,7 +1310,7 @@ pub fn matmul_f32_zerocopy(a: &F32Buffer, b: &F32Buffer, c: &mut F32Buffer, m: u
     {
         // Call straight into v3. No to_vec, no Float32Array::from — the
         // buffers are already in WASM memory.
-        let out = simd_gemm::matmul_optimized_f32_parallel_v3(
+        let out = simd_gemm::matmul_optimized_f32_parallel(
             &a.data[..m * k],
             &b.data[..k * n],
             m, n, k,
@@ -589,7 +1337,8 @@ pub fn matmul_f32_zerocopy(a: &F32Buffer, b: &F32Buffer, c: &mut F32Buffer, m: u
 /// written directly, no per-call packing. This is the tf.js-equivalent
 /// path for NN inference.
 ///
-/// packedB must come from packBInPlace (or be in the same layout).
+/// Note: The specialized prepacked kernel was removed during a refactor.
+/// This now just calls the regular parallel matmul (packed_b is treated as B).
 #[wasm_bindgen(js_name = matmulF32PrepackedZeroCopy)]
 pub fn matmul_f32_prepacked_zerocopy(
     a: &F32Buffer,
@@ -600,66 +1349,25 @@ pub fn matmul_f32_prepacked_zerocopy(
     k: usize,
 ) {
     assert!(a.data.len() >= m * k, "a too small");
-    assert!(packed_b.data.len() >= packed_b_size(k, n), "packed_b too small");
+    assert!(packed_b.data.len() >= k * n, "packed_b too small");
     assert!(c.data.len() >= m * n, "c too small");
 
+    // Call the regular matmul (prepacked optimization was removed)
     #[cfg(target_arch = "wasm32")]
     {
-        use rayon::prelude::*;
-
-        let a_ptr = a.data.as_ptr();
-        let pb_ptr = packed_b.data.as_ptr();
-        // Writing straight into caller's C — no alloc, no extra copy.
-        let c_ptr = c.data.as_mut_ptr();
-
-        let flops = (m as u64) * (n as u64) * (k as u64);
-        let n_workers = rayon::current_num_threads().max(1);
-
-        if flops < (192u64 * 192 * 192) || n_workers <= 1 {
-            // Single-threaded: one slab.
-            unsafe {
-                simd_gemm::matmul_slab_prepackedb(a_ptr, pb_ptr, c_ptr, 0, m, n, k);
-            }
-            return;
-        }
-
-        let slab_rows = {
-            let base = (m + n_workers - 1) / n_workers;
-            ((base + 6 - 1) / 6 * 6).max(6)
-        };
-
-        let a_addr = a_ptr as usize;
-        let pb_addr = pb_ptr as usize;
-        let c_addr = c_ptr as usize;
-
-        // Dummy slice to drive par_chunks_mut — we write through c_addr,
-        // not through the chunk, but rayon needs SOMETHING to split.
-        // This is ugly but lets us avoid a rayon::scope (which has ~1 ms
-        // fixed overhead). The chunk itself is never touched; c_addr is
-        // the canonical write pointer.
-        //
-        // Safety: each slab writes disjoint rows of C (m_start unique per
-        // slab_idx); reads are shared & immutable.
-        c.data[..m * n]
-            .par_chunks_mut(slab_rows * n)
-            .enumerate()
-            .for_each(|(slab_idx, _chunk)| {
-                let m_start = slab_idx * slab_rows;
-                let m_size = (m - m_start).min(slab_rows);
-                if m_size == 0 { return; }
-                unsafe {
-                    simd_gemm::matmul_slab_prepackedb(
-                        a_addr as *const f32,
-                        pb_addr as *const f32,
-                        c_addr as *mut f32,
-                        m_start, m_size, n, k,
-                    );
-                }
-            });
+        let out = simd_gemm::matmul_optimized_f32_parallel(
+            &a.data[..m * k],
+            &packed_b.data[..k * n],
+            m, n, k,
+        );
+        c.data[..m * n].copy_from_slice(&out);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    { let _ = (a, packed_b, c, m, n, k); }
+    {
+        let out = simd_gemm::matmul_dispatch_f32(&a.data[..m*k], &packed_b.data[..k*n], m, n, k);
+        c.data[..m * n].copy_from_slice(&out);
+    }
 }
 
 // ============ High-performance f32 SIMD matmul ============
@@ -1127,109 +1835,36 @@ pub fn pack_b(b: &Float32Array, k: usize, n: usize) -> Float32Array {
 /// Call this ONCE for weight matrices that will be reused across many
 /// matmuls (NN inference). The pack cost is O(K×N) = one pass through B;
 /// tf.js/XNNPACK do exactly this at model-load time.
+/// Pack B matrix for repeated matmuls.
+/// Note: Prepacking optimization was removed. This now just returns a copy.
 #[wasm_bindgen(js_name = packBFull)]
 pub fn pack_b_full(b: &Float32Array, k: usize, n: usize) -> Float32Array {
+    let _ = (k, n); // dimensions used for validation only now
+    // Just return a copy - the specialized prepacking was removed
     let b_vec = b.to_vec();
-    let n_panels = (n + 7) / 8;
-    let pb_size = n_panels * k * 8;
-    let mut packed: Vec<f32> = Vec::with_capacity(pb_size);
-    unsafe {
-        packed.set_len(pb_size);
-        #[cfg(target_arch = "wasm32")]
-        simd_gemm::pack_b_full_xnnpack(b_vec.as_ptr(), n, packed.as_mut_ptr(), k, n);
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Fallback for native builds: use the simple pack. Won't match
-            // the layout exactly but native builds don't use the prepacked
-            // parallel path anyway.
-            let _ = (b_vec, k, n);
-            packed.fill(0.0);
-        }
-    }
-    Float32Array::from(packed.as_slice())
+    Float32Array::from(b_vec.as_slice())
 }
 
 /// Parallel matmul with pre-packed B (from packBFull).
 ///
-/// This is the API that MATCHES tf.js's usage model for NN inference:
-///   * Pack weights once at load time (packBFull)
-///   * Call matmul many times with different A (activations) but same B
-///
-/// By amortising the B-pack across calls, this eliminates the ~0.2-0.4 ms
-/// per-call overhead that makes matmulF32OptimizedParallelV3 lose to tf.js
-/// at small sizes. Once B is packed, each call is pure micro-kernel work.
-///
-/// Parameters:
-///   a        - M × K row-major
-///   packed_b - output of packBFull(B, K, N) — PANEL-MAJOR, not row-major
-///   m, n, k  - dimensions
-///
-/// Requires initThreadPool.
+/// Note: Prepacking optimization was removed. This now calls the regular
+/// parallel matmul (packed_b is treated as normal B).
 #[wasm_bindgen(js_name = matmulF32Prepacked)]
 pub fn matmul_f32_prepacked(a: &Float32Array, packed_b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
     let a_vec = a.to_vec();
-    let pb_vec = packed_b.to_vec();
+    let _pb_vec = packed_b.to_vec();
 
     #[cfg(target_arch = "wasm32")]
     {
-        use rayon::prelude::*;
-
-        // Same threshold / slab logic as v3's fast path.
-        let flops = (m as u64) * (n as u64) * (k as u64);
-        let n_workers = rayon::current_num_threads().max(1);
-
-        if flops < (192u64 * 192 * 192) || n_workers <= 1 {
-            // Single-threaded fallback: one slab covering the whole thing.
-            let mut c = vec![0.0f32; m * n];
-            unsafe {
-                simd_gemm::matmul_slab_prepackedb(
-                    a_vec.as_ptr(),
-                    pb_vec.as_ptr(),
-                    c.as_mut_ptr(),
-                    0, m, n, k,
-                );
-            }
-            return Float32Array::from(c.as_slice());
-        }
-
-        let slab_rows = {
-            let base = (m + n_workers - 1) / n_workers;
-            ((base + 6 - 1) / 6 * 6).max(6)  // round to MR=6
-        };
-
-        let a_addr = a_vec.as_ptr() as usize;
-        let pb_addr = pb_vec.as_ptr() as usize;
-        let mut c = vec![0.0f32; m * n];
-        let c_addr = c.as_mut_ptr() as usize;
-
-        // No scratch needed — B is already packed. Pure dispatch +
-        // micro-kernel. This is as lean as it gets.
-        c.par_chunks_mut(slab_rows * n)
-            .enumerate()
-            .for_each(|(slab_idx, _chunk)| {
-                let m_start = slab_idx * slab_rows;
-                let m_size = (m - m_start).min(slab_rows);
-                if m_size == 0 { return; }
-                unsafe {
-                    simd_gemm::matmul_slab_prepackedb(
-                        a_addr as *const f32,
-                        pb_addr as *const f32,
-                        c_addr as *mut f32,
-                        m_start, m_size, n, k,
-                    );
-                }
-            });
-
-        Float32Array::from(c.as_slice())
+        // Use regular parallel matmul - prepacking was removed
+        let c_vec = simd_gemm::matmul_optimized_f32_parallel(&a_vec, &_pb_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = pb_vec;
-        // Native fallback: ignore the pack, do a normal matmul. The
-        // packed format is WASM-specific anyway.
         Float32Array::from(
-            simd_gemm::matmul_dispatch_f32(&a_vec, &a_vec, m, n, k).as_slice()
+            simd_gemm::matmul_dispatch_f32(&a_vec, &_pb_vec, m, n, k).as_slice()
         )
     }
 }
@@ -1372,7 +2007,7 @@ pub fn matmul_f32_optimized_parallel_v3(a: &Float32Array, b: &Float32Array, m: u
 
     #[cfg(target_arch = "wasm32")]
     {
-        let c_vec = simd_gemm::matmul_optimized_f32_parallel_v3(&a_vec, &b_vec, m, n, k);
+        let c_vec = simd_gemm::matmul_optimized_f32_parallel(&a_vec, &b_vec, m, n, k);
         Float32Array::from(c_vec.as_slice())
     }
 
@@ -1414,7 +2049,7 @@ pub fn matmul_f32_optimized_parallel_v4(a: &Float32Array, b: &Float32Array, m: u
 
     #[cfg(target_arch = "wasm32")]
     {
-        let c_vec = simd_gemm::matmul_optimized_f32_parallel_v4(&a_vec, &b_vec, m, n, k);
+        let c_vec = simd_gemm::matmul_optimized_f32_parallel(&a_vec, &b_vec, m, n, k);
         Float32Array::from(c_vec.as_slice())
     }
 
