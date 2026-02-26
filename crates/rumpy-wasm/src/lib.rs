@@ -406,6 +406,262 @@ pub fn has_shared_array_buffer() -> bool {
     js_sys::Reflect::has(&wasm_bindgen::memory(), &JsValue::from_str("buffer")).unwrap_or(false)
 }
 
+// ============================================================================
+// Zero-copy f32 buffers (eliminate JS↔WASM copy overhead)
+// ============================================================================
+//
+// The Float32Array-based matmul functions (matmulF32Optimized etc.) copy
+// A and B from JS heap → WASM heap on every call (a.to_vec()), then copy
+// C back (Float32Array::from). At small sizes this is ~20-25% of wall time:
+//
+//   256²: matmul = 0.5 ms, copies ≈ 0.12 ms (24%)
+//   128²: matmul = 0.3 ms, copies ≈ 0.06 ms (20%)
+//
+// tf.js doesn't pay this cost — tensors live in WASM memory. This API
+// lets you match that: allocate f32 buffers inside WASM once, get zero-
+// copy Float32Array views, write your data into them directly, call
+// matmulF32ZeroCopy which operates in-place.
+//
+// USAGE:
+//   const a = allocF32(M * K);           // WASM-resident buffer
+//   const b = allocF32(K * N);
+//   const c = allocF32(M * N);
+//   const packedB = allocF32(packedBSize(K, N));  // for prepacked path
+//
+//   // Fill a, b via zero-copy views (SharedArrayBuffer → no detach on grow):
+//   const mem = wasmMemory().buffer;
+//   new Float32Array(mem, a.ptr(), M*K).set(yourAData);
+//   new Float32Array(mem, b.ptr(), K*N).set(yourBData);
+//
+//   packBInPlace(b, packedB, K, N);       // once per weight matrix
+//   matmulF32PrepackedZeroCopy(a, packedB, c, M, N, K);  // many times
+//
+//   // Read result:
+//   const result = new Float32Array(mem, c.ptr(), M*N);
+//
+// MEMORY GROWTH CAVEAT: views are valid as long as WebAssembly.Memory
+// doesn't grow. With SharedArrayBuffer (which we use), growing doesn't
+// DETACH the view, but the view's `.buffer` still points at the old SAB
+// range. Re-fetch `wasmMemory().buffer` after operations that allocate.
+// (F32Buffer handles themselves stay valid — only JS-side views need
+// re-deriving.)
+
+/// WASM-resident f32 buffer. Wraps a `Vec<f32>` that lives in WASM linear
+/// memory. JS can get a zero-copy `Float32Array` view via `ptr()` + the
+/// shared memory buffer.
+///
+/// The buffer stays valid until `free()` is called or the object is GC'd.
+/// Memory growth does NOT invalidate the buffer (the Vec's address is
+/// stable), only JS-side views of `wasmMemory().buffer` need re-deriving.
+#[wasm_bindgen]
+pub struct F32Buffer {
+    data: Vec<f32>,
+}
+
+#[wasm_bindgen]
+impl F32Buffer {
+    /// Byte offset into WASM linear memory where this buffer's data starts.
+    ///
+    /// Use with `wasmMemory().buffer` to construct a zero-copy view:
+    ///   new Float32Array(wasmMemory().buffer, buf.ptr(), buf.len())
+    #[wasm_bindgen]
+    pub fn ptr(&self) -> usize {
+        self.data.as_ptr() as usize
+    }
+
+    #[wasm_bindgen]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Explicitly free this buffer's memory. The handle is consumed.
+    #[wasm_bindgen]
+    pub fn free(self) {
+        // self dropped here
+    }
+
+    /// Copy data FROM a JS Float32Array INTO this buffer.
+    /// Useful for the first fill if you can't construct data directly into
+    /// a zero-copy view (e.g. data comes from a WebGL readback).
+    #[wasm_bindgen(js_name = copyFrom)]
+    pub fn copy_from(&mut self, src: &Float32Array) {
+        let n = (src.length() as usize).min(self.data.len());
+        src.slice(0, n as u32).copy_to(&mut self.data[..n]);
+    }
+
+    /// Copy data FROM this buffer TO a JS Float32Array.
+    /// For the zero-copy path you don't need this — construct a view
+    /// instead. This exists for cases where the result needs to go to a
+    /// non-shared ArrayBuffer (e.g. postMessage to a context without SAB).
+    #[wasm_bindgen(js_name = copyTo)]
+    pub fn copy_to(&self, dst: &Float32Array) {
+        let n = (dst.length() as usize).min(self.data.len());
+        dst.subarray(0, n as u32).copy_from(&self.data[..n]);
+    }
+}
+
+/// Allocate an f32 buffer of the given length inside WASM memory.
+/// Contents are uninitialised — write before reading.
+#[wasm_bindgen(js_name = allocF32)]
+pub fn alloc_f32(len: usize) -> F32Buffer {
+    let mut data: Vec<f32> = Vec::with_capacity(len);
+    // Uninitialised: caller is expected to fill via copyFrom or a
+    // zero-copy view. Zeroing would be wasted work for input buffers
+    // (overwritten immediately) and output buffers (matmul overwrites).
+    unsafe { data.set_len(len); }
+    F32Buffer { data }
+}
+
+/// Size (in f32 elements) of a fully-packed B buffer for matmulF32PrepackedZeroCopy.
+///
+/// = ceil(N/8) × K × 8.  For N divisible by 8 (most cases), equals K × N.
+#[wasm_bindgen(js_name = packedBSize)]
+pub fn packed_b_size(k: usize, n: usize) -> usize {
+    ((n + 7) / 8) * k * 8
+}
+
+/// Pack B (in an F32Buffer) into panel-major layout (in another F32Buffer).
+///
+/// Call once per weight matrix; reuse packedB across many matmuls.
+/// Both buffers must already be allocated to the right sizes (B: K×N,
+/// packedB: packedBSize(K, N)).
+#[wasm_bindgen(js_name = packBInPlace)]
+pub fn pack_b_in_place(b: &F32Buffer, packed_b: &mut F32Buffer, k: usize, n: usize) {
+    assert!(b.data.len() >= k * n, "b too small");
+    assert!(packed_b.data.len() >= packed_b_size(k, n), "packed_b too small");
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        simd_gemm::pack_b_full_xnnpack(
+            b.data.as_ptr(),
+            n,
+            packed_b.data.as_mut_ptr(),
+            k,
+            n,
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (b, packed_b, k, n); }
+}
+
+/// Parallel matmul, ZERO JS↔WASM copies.
+///
+/// A, B, C all live in WASM memory (F32Buffers). B is packed on-the-fly
+/// (same behaviour as matmulF32OptimizedParallelV3 but without the
+/// Float32Array round-trips). C is overwritten.
+///
+/// This is the general API — B can vary call-to-call. For constant B
+/// (NN inference), use matmulF32PrepackedZeroCopy which skips the pack.
+#[wasm_bindgen(js_name = matmulF32ZeroCopy)]
+pub fn matmul_f32_zerocopy(a: &F32Buffer, b: &F32Buffer, c: &mut F32Buffer, m: usize, n: usize, k: usize) {
+    assert!(a.data.len() >= m * k, "a too small");
+    assert!(b.data.len() >= k * n, "b too small");
+    assert!(c.data.len() >= m * n, "c too small");
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Call straight into v3. No to_vec, no Float32Array::from — the
+        // buffers are already in WASM memory.
+        let out = simd_gemm::matmul_optimized_f32_parallel_v3(
+            &a.data[..m * k],
+            &b.data[..k * n],
+            m, n, k,
+        );
+        // v3 returns a Vec (it allocates its own C internally for the
+        // C-padding path). Copy into caller's buffer.
+        //
+        // TODO: add an `_into` variant of v3 that writes to a caller-
+        // provided slice when no padding is active. Would save one more
+        // M×N copy. At 256² that's 256 KiB = ~0.05 ms — 10% of the
+        // remaining gap.
+        c.data[..m * n].copy_from_slice(&out);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let out = simd_gemm::matmul_dispatch_f32(&a.data[..m*k], &b.data[..k*n], m, n, k);
+        c.data[..m * n].copy_from_slice(&out);
+    }
+}
+
+/// Parallel matmul with pre-packed B, ZERO JS↔WASM copies.
+///
+/// The leanest call path: A and packed-B already in WASM memory, C
+/// written directly, no per-call packing. This is the tf.js-equivalent
+/// path for NN inference.
+///
+/// packedB must come from packBInPlace (or be in the same layout).
+#[wasm_bindgen(js_name = matmulF32PrepackedZeroCopy)]
+pub fn matmul_f32_prepacked_zerocopy(
+    a: &F32Buffer,
+    packed_b: &F32Buffer,
+    c: &mut F32Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    assert!(a.data.len() >= m * k, "a too small");
+    assert!(packed_b.data.len() >= packed_b_size(k, n), "packed_b too small");
+    assert!(c.data.len() >= m * n, "c too small");
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        use rayon::prelude::*;
+
+        let a_ptr = a.data.as_ptr();
+        let pb_ptr = packed_b.data.as_ptr();
+        // Writing straight into caller's C — no alloc, no extra copy.
+        let c_ptr = c.data.as_mut_ptr();
+
+        let flops = (m as u64) * (n as u64) * (k as u64);
+        let n_workers = rayon::current_num_threads().max(1);
+
+        if flops < (192u64 * 192 * 192) || n_workers <= 1 {
+            // Single-threaded: one slab.
+            unsafe {
+                simd_gemm::matmul_slab_prepackedb(a_ptr, pb_ptr, c_ptr, 0, m, n, k);
+            }
+            return;
+        }
+
+        let slab_rows = {
+            let base = (m + n_workers - 1) / n_workers;
+            ((base + 6 - 1) / 6 * 6).max(6)
+        };
+
+        let a_addr = a_ptr as usize;
+        let pb_addr = pb_ptr as usize;
+        let c_addr = c_ptr as usize;
+
+        // Dummy slice to drive par_chunks_mut — we write through c_addr,
+        // not through the chunk, but rayon needs SOMETHING to split.
+        // This is ugly but lets us avoid a rayon::scope (which has ~1 ms
+        // fixed overhead). The chunk itself is never touched; c_addr is
+        // the canonical write pointer.
+        //
+        // Safety: each slab writes disjoint rows of C (m_start unique per
+        // slab_idx); reads are shared & immutable.
+        c.data[..m * n]
+            .par_chunks_mut(slab_rows * n)
+            .enumerate()
+            .for_each(|(slab_idx, _chunk)| {
+                let m_start = slab_idx * slab_rows;
+                let m_size = (m - m_start).min(slab_rows);
+                if m_size == 0 { return; }
+                unsafe {
+                    simd_gemm::matmul_slab_prepackedb(
+                        a_addr as *const f32,
+                        pb_addr as *const f32,
+                        c_addr as *mut f32,
+                        m_start, m_size, n, k,
+                    );
+                }
+            });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (a, packed_b, c, m, n, k); }
+}
+
 // ============ High-performance f32 SIMD matmul ============
 
 /// Fast f32 matrix multiplication using WASM SIMD
