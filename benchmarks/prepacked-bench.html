@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head><body><pre id="log"></pre>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+<script type="module">
+const L = document.getElementById('log');
+const log = m => { L.textContent += m + '\n'; console.log(m); };
+
+const NT = 8;
+tf.wasm.setThreadsCount(NT);
+await tf.setBackend('wasm'); await tf.ready();
+
+const r = await import('./pkg/rumpy_wasm.js');
+await r.default();
+await r.initThreadPool(NT);
+log(`tfjs + rumpy ready (${NT}t each)\n`);
+
+function med(fn, n=10) {
+  for(let i=0;i<5;i++) fn();
+  const t=[]; for(let i=0;i<n;i++){const s=performance.now();fn();t.push(performance.now()-s);}
+  t.sort((a,b)=>a-b); return t[n>>1];
+}
+function maxDiff(a,b) { let m=0; for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]); if(d>m)m=d;} return m; }
+
+// This is the APPLES-TO-APPLES comparison: tf.js reuses the same tB tensor
+// across calls (XNNPACK caches the pack), so we also pre-pack B once.
+// This is the NN-inference usage pattern — B = constant weight matrix.
+
+log('Pre-packed B head-to-head (8t vs 8t) — APPLES TO APPLES:');
+log('size | tfjs-8t | v3-dynamic | v3-prepacked | prepacked vs tfjs | err');
+log('-----+---------+------------+--------------+-------------------+----');
+
+for (const n of [128, 256, 512, 1024, 1536, 2048, 3072, 4096]) {
+  const A = new Float32Array(n*n).map(Math.random);
+  const B = new Float32Array(n*n).map(Math.random);
+
+  // tfjs — reuses tB, so B gets packed once and cached internally.
+  const tA = tf.tensor2d(A,[n,n]), tB = tf.tensor2d(B,[n,n]);
+  const iters = n >= 2048 ? 3 : 8;
+  const tf_t = med(() => { const c=tf.matMul(tA,tB); c.dataSync(); c.dispose(); }, iters);
+  const ref = (()=>{const c=tf.matMul(tA,tB);const d=c.dataSync();c.dispose();return d;})();
+  tA.dispose(); tB.dispose();
+
+  // rumpy v3 (packs B every call — the "dynamic" API)
+  const v3dyn_t = med(() => r.matmulF32OptimizedParallelV3(A,B,n,n,n), iters);
+
+  // rumpy prepacked — pack B ONCE outside the timed loop (like tf.js does)
+  const packedB = r.packBFull(B, n, n);
+  const v3pre_t = med(() => r.matmulF32Prepacked(A, packedB, n, n, n), iters);
+  const out = r.matmulF32Prepacked(A, packedB, n, n, n);
+  const err = maxDiff(out, ref);
+  const ok = err < 1e-2 ? '✅' : `❌${err.toExponential(1)}`;
+
+  const ratio = v3pre_t / tf_t;
+  const marker = ratio <= 1.0 ? ' ⭐' : (ratio <= 1.1 ? ' 🎯' : '');
+
+  log(`${n.toString().padStart(4)} | ${tf_t.toFixed(2).padStart(7)} | ${v3dyn_t.toFixed(2).padStart(10)} | ${v3pre_t.toFixed(2).padStart(12)} | ${ratio.toFixed(2).padStart(5)}×${marker} | ${ok}`);
+}
+
+log('\n⭐ = beats tfjs  🎯 = within 10%');
+log('\nThe prepacked API is the fair comparison: tf.js also caches packed B.');
+window.DONE = true;
+</script></body></html>

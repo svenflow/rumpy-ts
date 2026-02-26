@@ -3161,6 +3161,166 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
 #[cfg(target_arch = "wasm32")]
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
+/// Pack ALL of B into XNNPACK panel-major layout.
+///
+/// Output layout: for each NR-column panel (0..ceil(N/NR)), emit K rows
+/// of NR floats contiguously. Panel p occupies [p × K × NR, (p+1) × K × NR).
+///
+/// The last panel is zero-padded to NR width if N % NR != 0. This lets
+/// the micro-kernel always do full-width v128 stores; the caller just
+/// discards the padded columns from C.
+///
+/// This is the "pre-pack once, matmul many" layout that tf.js/XNNPACK
+/// uses for weight matrices. We do it per-matmul here (B varies), but
+/// ONCE per call instead of once per slab — with 8 parallel slabs at
+/// 256² that's 8× less packing work.
+///
+/// Safety: dest must have space for ceil(N/NR) × K × NR floats.
+#[cfg(target_arch = "wasm32")]
+#[inline(never)]  // big serial loop, inlining bloats callers
+pub unsafe fn pack_b_full_xnnpack(
+    b: *const f32,
+    ldb: usize,     // = N (B's row stride)
+    dest: *mut f32,
+    k: usize,
+    n: usize,
+) {
+    let n_full_panels = n / OPT_NR;
+    let n_tail = n % OPT_NR;
+
+    let mut d = dest;
+
+    // Full NR-wide panels: pure SIMD copy.
+    for panel in 0..n_full_panels {
+        let j0 = panel * OPT_NR;
+        let mut src = b.add(j0);
+        // For each K-row, copy NR=8 contiguous floats.
+        // This is 2 v128 loads + 2 v128 stores per row — the read side
+        // is sequential within each row (stride 1), write side is
+        // fully streaming. Hardware prefetchers handle both.
+        for _ in 0..k {
+            let v0 = v128_load(src as *const v128);
+            let v1 = v128_load(src.add(4) as *const v128);
+            v128_store(d as *mut v128, v0);
+            v128_store(d.add(4) as *mut v128, v1);
+            src = src.add(ldb);
+            d = d.add(OPT_NR);
+        }
+    }
+
+    // Tail panel: scalar copy for valid cols, zero-pad the rest.
+    // Rare (only when N % 8 != 0) so not worth SIMD-ing.
+    if n_tail > 0 {
+        let j0 = n_full_panels * OPT_NR;
+        let mut src = b.add(j0);
+        let zero = f32x4_splat(0.0);
+        for _ in 0..k {
+            // Zero all 8 slots first, then overwrite real cols.
+            v128_store(d as *mut v128, zero);
+            v128_store(d.add(4) as *mut v128, zero);
+            for c in 0..n_tail {
+                *d.add(c) = *src.add(c);
+            }
+            src = src.add(ldb);
+            d = d.add(OPT_NR);
+        }
+    }
+}
+
+/// GEMM over an M-slab using pre-packed B.
+///
+/// B is already in panel-major layout (from pack_b_full_xnnpack), so
+/// there's NO B-packing inside this loop — just a pointer offset per
+/// (j, p) block. The entire per-slab cost is micro-kernel calls.
+///
+/// Still does KC-blocking on the K dimension: reading K floats of A per
+/// micro-kernel call would blow L1, so we process K in chunks of KC=256.
+/// Between KC-blocks, C is accumulated (beta=1 after the first block).
+///
+/// lda = k (A's natural stride), ldc = n (C's natural stride). No
+/// pow-of-2 padding here — if you hit that, the pow2 path in v3 handles
+/// it separately.
+///
+/// Safety: packed_b must cover ceil(n/NR) × k × NR floats in the layout
+/// produced by pack_b_full_xnnpack; c must have space for (m_start+m_size)
+/// rows × n cols.
+///
+/// PUBLIC: also used by matmulF32Prepacked — the persistent-B API where
+/// JS calls packBFull() once and reuses the result for many matmuls
+/// (NN inference: B = constant weights).
+#[cfg(target_arch = "wasm32")]
+pub unsafe fn matmul_slab_prepackedb(
+    a: *const f32,
+    packed_b: *const f32,
+    c: *mut f32,
+    m_start: usize,
+    m_size: usize,
+    n: usize,
+    k: usize,
+) {
+    let a = a.add(m_start * k);
+    let c = c.add(m_start * n);
+
+    let n_panels = (n + OPT_NR - 1) / OPT_NR;
+    let i_main = m_size / OPT_MR * OPT_MR;
+
+    // K-loop outermost so each KC-block's worth of B stays hot in L1
+    // across all (ii, jj) tiles before advancing.
+    let mut p = 0;
+    while p < k {
+        let p_block = (k - p).min(OPT_KC);
+        let beta = if p == 0 { 0.0 } else { 1.0 };
+
+        // jj outer, ii inner: processing one NR-panel's K-block across
+        // all M-rows before moving to the next panel keeps THAT panel's
+        // floats in L1 for the whole M sweep. Same iteration order as
+        // matmul_optimized_f32's (j, p, i) — just without the pack.
+        for panel in 0..n_panels {
+            // Packed B for this panel, this K-block, is at:
+            //   packed_b + panel × k × NR + p × NR
+            // (panel stride = k × NR, within-panel stride per K = NR)
+            let pb = packed_b.add(panel * k * OPT_NR + p * OPT_NR);
+            let jj = panel * OPT_NR;
+            let n_rem = n - jj;
+
+            let mut ii = 0;
+            while ii < i_main {
+                if n_rem >= OPT_NR {
+                    micro_kernel_6x8_fma(
+                        p_block,
+                        a.add(ii * k + p), k,
+                        pb,
+                        c.add(ii * n + jj), n,
+                        beta,
+                    );
+                } else {
+                    micro_kernel_edge(
+                        OPT_MR, n_rem, p_block,
+                        a.add(ii * k + p), k,
+                        pb,
+                        c.add(ii * n + jj), n,
+                        beta,
+                    );
+                }
+                ii += OPT_MR;
+            }
+            // M tail
+            if ii < m_size {
+                let m_rem = m_size - ii;
+                micro_kernel_edge(
+                    m_rem, n_rem.min(OPT_NR), p_block,
+                    a.add(ii * k + p), k,
+                    pb,
+                    c.add(ii * n + jj), n,
+                    beta,
+                );
+            }
+        }
+
+        p += OPT_KC;
+    }
+}
+
 /// Run the BLIS GEMM over a 2D rectangle of C, packing BOTH A and B.
 ///
 /// Computes `C[m_start..m_start+m_size, n_start..n_start+n_size] +=
@@ -3446,30 +3606,96 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
     }
 
     // ========================================================================
-    // FAST PATH (non-pow2 K and N)
+    // FAST PATH (non-pow2 K and N) — shared packed-B, single dispatch
     // ========================================================================
-    // When neither A-packing nor C-padding is needed, v3 is just "legacy
-    // v1 minus the per-thread allocations". rayon::scope has ~1 ms fixed
-    // overhead vs par_chunks_mut (Box<dyn> per spawn + join barrier), so
-    // we use par_chunks_mut here. Each chunk still uses the zero-alloc
-    // slab — no dlmalloc contention, no extra copy. That's the v3 win
-    // over v1 at medium sizes; small sizes get v1-equivalent perf.
+    //
+    // At small sizes (256-512) the per-slab B-packing was the dominant
+    // cost: 8 slabs × full-K×full-N pack = 8× redundant work. For 256²
+    // that's ~0.4 ms of packing for ~0.05 ms of useful compute.
+    //
+    // Fix: pack B ONCE here (serial, full K × N in panel-major layout),
+    // then workers read from the shared packed buffer.  Each worker's
+    // inner loop is then pure micro-kernel calls — no B-copy at all.
+    //
+    // Pack layout: XNNPACK-style, one NR-column panel at a time, K rows
+    // contiguous within each panel.  Panel p (cols p×NR .. (p+1)×NR)
+    // occupies packed_b[p × K × NR .. (p+1) × K × NR].
+    //
+    // The K-loop still does KC-blocking for L1-residency but now
+    // B is already contiguous, so "packing" inside the K-block is just
+    // a pointer offset into the pre-packed buffer.
     if !pack_a_enabled && !c_padded {
         use rayon::prelude::*;
 
-        // Scratch arena indexed by chunk (= slab). par_chunks_mut gives
-        // at most total_tiles chunks ≤ n_workers, so that many slots.
-        // The caller doesn't participate in par_chunks_mut — fine: no
-        // pow2 to worry about, so losing N+1 parallelism doesn't matter.
+        // Two strategies for B, picked by whether packed-B fits in L2:
+        //
+        //   SHARED PACKED-B (small K×N): pack B once serially, workers
+        //   read from the shared panel-major buffer. Each worker's B
+        //   reads hit L2 (everyone reads the same cache lines). At 256²
+        //   this beat tf.js by 37% — the 8× packing redundancy of
+        //   per-slab B was the entire gap.
+        //
+        //   PER-SLAB PACKED-B (large K×N): each worker packs its own
+        //   KC×NC sub-panel into L1-resident scratch. The full packed-B
+        //   wouldn't fit in L2 anyway, so sharing doesn't help — and the
+        //   8× redundant packing is O(K×N) which is o(K×N×M_slab) compute.
+        //   Measured: per-slab wins by ~20% at 1024²+.
+        //
+        // Crossover at packed-B ≈ 512 KiB (half a typical L2 — leave room
+        // for A and C lines).  512 KiB = 128 K floats.  k × n ≤ 131072.
+        // For square problems that's n ≈ 360.
+        const L2_BUDGET_FLOATS: usize = 128 * 1024;
+        let b_fits_l2 = k * n <= L2_BUDGET_FLOATS;
+
+        if b_fits_l2 {
+            // SHARED PACKED-B path.
+            let n_panels = (n + OPT_NR - 1) / OPT_NR;
+            let pb_size = n_panels * k * OPT_NR;
+            // Uninitialised: pack_b_full_xnnpack overwrites everything.
+            let mut packed_b: Vec<f32> = Vec::with_capacity(pb_size);
+            unsafe { packed_b.set_len(pb_size); }
+
+            // Pack serially. ONE pass through B.  At 256² this is 64 K
+            // f32 = 256 KiB ≈ 0.05 ms. Once, not 8×.
+            unsafe {
+                pack_b_full_xnnpack(b.as_ptr(), n, packed_b.as_mut_ptr(), k, n);
+            }
+
+            let a_addr = a.as_ptr() as usize;
+            let pb_addr = packed_b.as_ptr() as usize;
+            let mut c = vec![0.0f32; m * n];
+            let c_addr = c.as_mut_ptr() as usize;
+
+            c.par_chunks_mut(slab_rows * n)
+                .enumerate()
+                .for_each(|(slab_idx, _chunk)| {
+                    let m_start = slab_idx * slab_rows;
+                    let m_size = (m - m_start).min(slab_rows);
+                    if m_size == 0 { return; }
+                    unsafe {
+                        matmul_slab_prepackedb(
+                            a_addr as *const f32,
+                            pb_addr as *const f32,
+                            c_addr as *mut f32,
+                            m_start, m_size,
+                            n, k,
+                        );
+                    }
+                });
+
+            drop(packed_b);
+            return c;
+        }
+
+        // PER-SLAB PACKED-B path: each worker packs its own KC×NC panel
+        // into L1-resident scratch.  matmul_optimized_f32_slab does
+        // exactly this internally (pack_a=false → only B-packing).
+        //
+        // Uninitialised scratch (pack_b_optimized writes before reading).
+        // `mut` + as_mut_ptr is REQUIRED for provenance — LLVM elided
+        // writes through (as_ptr() as usize as *mut) giving ~8× slowdown.
         let pb_region = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
         let scratch_stride_fast = pb_region + 17;
-        // Uninitialised scratch: pack_b_optimized writes before reading so
-        // zero-fill is wasted. At 128² with 8 slabs, vec![0.0; N] was
-        // zeroing ~1 MiB = ~200 μs = 60% of total wall time.
-        //
-        // `mut` + as_mut_ptr is REQUIRED for correct provenance — without
-        // it LLVM assumed scratch was never mutated and reordered/elided
-        // writes (measured ~8× slowdown at 128² from that UB alone).
         let mut scratch_arena: Vec<f32> = Vec::with_capacity(scratch_stride_fast * total_tiles);
         unsafe { scratch_arena.set_len(scratch_stride_fast * total_tiles); }
 
@@ -3477,9 +3703,6 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
         let b_addr = b.as_ptr() as usize;
         let scratch_addr = scratch_arena.as_mut_ptr() as usize;
 
-        // C must be zeroed: the micro-kernel with beta=0 overwrites, but
-        // edge tiles use micro_kernel_edge which does NOT fully overwrite.
-        // Safer to zero; M×N is small compared to scratch.
         let mut c = vec![0.0f32; m * n];
         let c_addr = c.as_mut_ptr() as usize;
 
@@ -3500,10 +3723,10 @@ pub fn matmul_optimized_f32_parallel_v3(a: &[f32], b: &[f32], m: usize, n: usize
                         b_addr as *const f32,
                         c_addr as *mut f32,
                         m_start, m_size,
-                        0, n,      // full N width
-                        k, n, n,   // lda, ldb, ldc — no padding needed
+                        0, n,
+                        k, n, n,
                         k,
-                        false,     // no A-packing (K not pow2)
+                        false,
                         scratch,
                     );
                 }
