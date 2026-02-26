@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head><body><pre id="log"></pre>
+<script type="module">
+const L = document.getElementById('log');
+const log = m => { L.textContent += m + '\n'; console.log(m); };
+
+const r = await import('./pkg/rumpy_wasm.js');
+await r.default();
+await r.initThreadPool(8);
+log(`rumpy: ${r.getNumThreads()} threads\n`);
+
+function med(fn, n=10) {
+  for(let i=0;i<5;i++) fn();
+  const t=[]; for(let i=0;i<n;i++){const s=performance.now();fn();t.push(performance.now()-s);}
+  t.sort((a,b)=>a-b); return t[n>>1];
+}
+
+// Hypothesis: at small sizes the gap vs tf.js is dominated by JS↔WASM
+// copies (a.to_vec, b.to_vec, Float32Array::from). tf.js keeps tensors
+// in WASM memory and doesn't pay this per call.
+//
+// Test: time checksum() (= to_vec + one loop) to measure copy cost.
+// Compare to matmul time. If copies are ~50% of matmul at 256, that's it.
+
+log('Breakdown: JS↔WASM copy cost vs matmul cost');
+log('size | to_vec (ms) | matmul-v3 (ms) | copy/total | est. compute');
+for (const n of [128, 256, 512, 1024]) {
+  const A = new Float32Array(n*n).map(Math.random);
+  const B = new Float32Array(n*n).map(Math.random);
+
+  // checksum does: a.to_vec() + sum loop. The sum loop is O(n²) adds,
+  // negligible vs the copy. So this measures ~1 JS→WASM copy.
+  const t_checksum = med(() => r.checksum(A), 20);
+
+  // A full matmul does: 2× to_vec (A, B) + compute + 1× from (C).
+  // So ~3× checksum-worth of copies + compute.
+  const t_matmul = med(() => r.matmulF32OptimizedParallelV3(A, B, n, n, n), 10);
+
+  // Rough estimate: copy portion = 3 × t_checksum. Compute = rest.
+  const est_copy = 3 * t_checksum;
+  const est_compute = t_matmul - est_copy;
+  const copy_frac = est_copy / t_matmul;
+
+  log(`${n.toString().padStart(4)} | ${t_checksum.toFixed(4).padStart(11)} | ${t_matmul.toFixed(4).padStart(14)} | ${(copy_frac*100).toFixed(0)}% | ${Math.max(0, est_compute).toFixed(3)}ms`);
+}
+
+log('\nConclusion: if copy/total is ~50%+ at small sizes, a zero-copy');
+log('API (WASM-resident buffers, no to_vec per call) would close the gap.');
+
+window.DONE = true;
+</script></body></html>

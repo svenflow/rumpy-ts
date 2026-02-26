@@ -7,7 +7,6 @@ members = [
     "crates/rumpy-webgpu",   # WebGPU backend (future)
     "crates/rumpy-tests",    # Shared test suite
     "crates/pthreadpool-rs", # Thread pool for parallel computation
-    "crates/wasm-threadpool", # High-perf WASM thread pool (no rayon)
 ]
 
 [workspace.package]

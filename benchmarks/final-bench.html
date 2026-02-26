@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head><body><pre id="log"></pre>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+<script type="module">
+const L = document.getElementById('log');
+const log = m => { L.textContent += m + '\n'; console.log(m); };
+
+const NT = 8;
+
+// Two tf.js backends: 1 thread (ST comparison) and NT threads (MT comparison).
+// tf.js doesn't support changing thread count after init, so we test 1-thread
+// first, then re-init multi-threaded. This means the multi-threaded numbers
+// come from a fresh JS-side context but same WASM memory.
+tf.wasm.setThreadsCount(1);
+await tf.setBackend('wasm'); await tf.ready();
+log(`tfjs backend: ${tf.getBackend()} (will test both 1t and ${NT}t)`);
+
+const r = await import('./pkg/rumpy_wasm.js');
+await r.default();
+await r.initThreadPool(NT);
+log(`rumpy ready: ${r.getNumThreads()} threads\n`);
+
+function med(fn, n=5) {
+  for(let i=0;i<3;i++) fn();
+  const t=[]; for(let i=0;i<n;i++){const s=performance.now();fn();t.push(performance.now()-s);}
+  t.sort((a,b)=>a-b); return t[n>>1];
+}
+function maxDiff(a,b) { let m=0; for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]); if(d>m)m=d;} return m; }
+
+const R = {};
+const SIZES = [128, 256, 512, 1024, 1536, 2048, 2056, 3072, 4096];
+
+// Pass 1: tf.js single-threaded + rumpy single-threaded.
+log('=== PASS 1: single-threaded head-to-head ===');
+for (const n of SIZES) {
+  R[n] = {};
+  const A = new Float32Array(n*n).map(Math.random);
+  const B = new Float32Array(n*n).map(Math.random);
+
+  const tA = tf.tensor2d(A,[n,n]), tB = tf.tensor2d(B,[n,n]);
+  R[n].tf1 = med(() => { const c=tf.matMul(tA,tB); c.dataSync(); c.dispose(); }, n>=2048?3:5);
+  const ref = (()=>{const c=tf.matMul(tA,tB);const d=c.dataSync();c.dispose();return d;})();
+  tA.dispose(); tB.dispose();
+
+  R[n].rst = med(() => r.matmulF32Optimized(A,B,n,n,n), n>=2048?3:5);
+
+  log(`${n.toString().padStart(4)}: tfjs-1t=${R[n].tf1.toFixed(2).padStart(8)}ms  rumpy-st=${R[n].rst.toFixed(2).padStart(8)}ms  (${(R[n].rst/R[n].tf1).toFixed(2)}× vs tfjs)`);
+
+  // Store ref for correctness checks in pass 2.
+  R[n]._ref = ref;
+  R[n]._A = A; R[n]._B = B;
+}
+
+// Switch tf.js to multi-threaded.
+log(`\nSwitching tfjs to ${NT} threads (re-init backend)...`);
+tf.wasm.setThreadsCount(NT);
+await tf.setBackend('cpu');  // force a switch
+await tf.setBackend('wasm');
+await tf.ready();
+log(`tfjs now at ${NT} threads\n`);
+
+// Pass 2: multi-threaded.
+log('=== PASS 2: multi-threaded head-to-head ===');
+for (const n of SIZES) {
+  const A = R[n]._A, B = R[n]._B, ref = R[n]._ref;
+
+  const tA = tf.tensor2d(A,[n,n]), tB = tf.tensor2d(B,[n,n]);
+  R[n].tfN = med(() => { const c=tf.matMul(tA,tB); c.dataSync(); c.dispose(); }, n>=2048?3:5);
+  tA.dispose(); tB.dispose();
+
+  R[n].rv3 = med(() => r.matmulF32OptimizedParallelV3(A,B,n,n,n), n>=2048?3:5);
+  const v3out = r.matmulF32OptimizedParallelV3(A,B,n,n,n);
+  const err = maxDiff(v3out, ref);
+  const ok = err < 1e-2 ? 'OK' : `ERR ${err.toExponential(1)}`;
+
+  log(`${n.toString().padStart(4)}: tfjs-${NT}t=${R[n].tfN.toFixed(2).padStart(8)}ms  rumpy-v3=${R[n].rv3.toFixed(2).padStart(8)}ms  (${(R[n].rv3/R[n].tfN).toFixed(2)}× vs tfjs)  scaling=${(R[n].rst/R[n].rv3).toFixed(2)}×  [${ok}]`);
+  delete R[n]._ref; delete R[n]._A; delete R[n]._B;
+}
+
+log('\n=== SUMMARY ===');
+log('size | tf-1t | rp-st | ST ratio | tf-8t | rp-v3 | MT ratio | rp scaling');
+for (const n of SIZES) {
+  const r_ = R[n];
+  log(`${n.toString().padStart(4)} | ${r_.tf1.toFixed(1).padStart(6)} | ${r_.rst.toFixed(1).padStart(6)} | ${(r_.rst/r_.tf1).toFixed(2).padStart(5)}× | ${r_.tfN.toFixed(1).padStart(6)} | ${r_.rv3.toFixed(1).padStart(6)} | ${(r_.rv3/r_.tfN).toFixed(2).padStart(5)}× | ${(r_.rst/r_.rv3).toFixed(2)}×`);
+}
+
+window.DONE = true;
+window.R = R;
+</script></body></html>

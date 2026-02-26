@@ -11,6 +11,13 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["console_error_panic_hook"]
+# Enable the raw-futex GEMM dispatch (spawns its own Web Worker pool via
+# wasm_thread, bypassing Rayon). Off by default: it's experimental and
+# requires ES-module Workers at runtime.
+#
+# To build with it:
+#   wasm-pack build crates/rumpy-wasm --target web --release -- --features futex-pool
+futex-pool = ["pthreadpool-rs/wasm-futex", "rumpy-cpu/wasm-futex"]
 
 [dependencies]
 rumpy-core = { path = "../rumpy-core" }

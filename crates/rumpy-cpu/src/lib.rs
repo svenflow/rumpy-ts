@@ -3,6 +3,14 @@
 //! Uses ndarray for array operations and faer for linear algebra.
 //! On WASM targets with simd128, uses hand-optimized SIMD GEMM kernels.
 
+// memory_atomic_wait32/notify are still unstable as of 2025-12 nightly.
+// We use them in the v4 parallel GEMM kernel for spin-then-park workers
+// (the pthreadpool dispatch model, hosted inside Rayon's Web Workers).
+#![cfg_attr(
+    all(target_arch = "wasm32", target_feature = "atomics"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 mod array;
 mod broadcast;
 mod compare;

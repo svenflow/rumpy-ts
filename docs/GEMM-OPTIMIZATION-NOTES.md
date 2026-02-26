@@ -137,6 +137,92 @@ Old results with `matmulXnnpack` (our previous best):
 
 **We are 1.5-5x SLOWER than tfjs at most sizes with fair threading!**
 
+---
+
+## 🔧 Parallel V3 (2026-02-26) — ROOT CAUSE ANALYSIS
+
+After deep-diving `matmul_optimized_f32_parallel` and comparing against how
+XNNPACK drives `pthreadpool_parallelize_2d_tile_2d`, we found **four**
+independent sources of waste in the legacy parallel path. Each one is a
+~1.5× hit; multiplied together they explain the 1.5–5× gap.
+
+### Bug #1: Every thread re-packs B (N× redundant work)
+
+```rust
+c.par_chunks_mut(rows_per_thread * n).for_each(|(_, c_chunk)| {
+    let local_c = matmul_optimized_f32(a_slice, b, local_m, n, k);  // ← packs B!
+    c_chunk.copy_from_slice(&local_c);
+});
+```
+
+`matmul_optimized_f32` is a complete, self-contained GEMM — it allocates a
+packing buffer and packs every KC×NC block of B internally. With 14 threads
+you do 14× the packing. For 1024² @ KC=256, NC=128, that's packing 8 blocks
+of 32 K floats each × 14 threads = **3.5 M extra float stores** per matmul,
+vs 250 K for a pack-once path.
+
+### Bug #2: Per-thread heap allocation under a global lock
+
+Both `Vec::with_capacity(m*n)` for C and `Vec::with_capacity(KC*NC)` for
+packed_b go through WASM's `dlmalloc`, which is globally mutexed. 14 threads
+simultaneously trying to allocate serialise on that lock. This is *worse*
+than native: on Linux you'd get per-thread arenas; on WASM you get nothing.
+
+### Bug #3: `par_chunks_mut` caller doesn't compute
+
+When called from outside the Rayon pool (i.e. from the JS main thread),
+`par_iter` family functions dispatch all work to pool workers and block the
+caller. With N Rayon workers you get N-way parallelism, not N+1. Contrast
+with pthreadpool where the caller *is* thread 0 and does its share.
+
+### Bug #4: Extra `copy_from_slice` at the end
+
+Each thread computes into a fresh `local_c: Vec<f32>` then copies back
+into the real C. For 1024² @ 14 threads, that's 14 × (1024/14) × 1024 = 1 M
+extra f32 stores.
+
+### Bug #5 (architectural): 1D slab partitioning = zero load balancing
+
+Splitting M into N_threads equal slabs means each thread gets exactly one
+task. If one core is slow (Apple Silicon efficiency cores!), it holds
+everyone back — there's nothing to steal. XNNPACK tiles into ~MC×NC chunks
+and lets workers drain a queue, so slow cores just do fewer tiles.
+
+### The fix: `matmul_optimized_f32_parallel_v3`
+
+| | legacy | v3 |
+|---|---|---|
+| B packing | per-thread (N×) | once, shared read-only |
+| per-task alloc | 2× `Vec` per thread | 0 (pointers into pre-alloc'd buffers) |
+| caller computes | no (waits) | yes (thread 0 via `rayon::scope` inline) |
+| work distribution | N fixed slabs | atomic counter, ~15 tiles/block, stealable |
+| final copy | `copy_from_slice` | workers write directly to C |
+
+**Expected speedup**: 2–4× over legacy. May match/beat tf.js at 256–1024.
+
+### The harder fix: raw-futex pool (`wasm_futex.rs`)
+
+v3 still goes through Rayon's `scope`/`spawn`, which `Box`es each spawned
+closure and uses `park()`/`unpark()` for the join barrier. For sub-ms GEMM
+blocks this is measurable.
+
+The `wasm_futex` module reimplements the pthreadpool algorithm natively:
+workers spin ~100 μs then `memory.atomic.wait32`; the caller bumps a
+generation counter + one `atomic.notify` to dispatch; one atomic `fetch_sub`
+per claimed tile.  For back-to-back GEMM blocks (the KC loop dispatches
+every ~200 μs) workers never actually park — they're still spinning when
+the next generation lands.
+
+**Build**: `wasm-pack build --features futex-pool` — pulls in `wasm_thread`
+for Web Worker spawning (`std::thread::spawn` panics on wasm32).
+
+**Caveat**: the futex pool spawns its *own* workers separate from Rayon's.
+If you're using both, don't size both to full `navigator.hardwareConcurrency`
+or you oversubscribe. For a pure-rumpy app, use futex-pool alone and skip
+`initThreadPool`.
+
+---
+
 ### V2 vs V1 Parallel (both 14 threads)
 
 | Size | V1 | V2 | V2 Speedup | Notes |

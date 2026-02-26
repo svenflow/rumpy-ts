@@ -61,6 +61,20 @@ pub use pool_wasm::ThreadPool;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+// Raw WASM futex pool — bypasses Rayon entirely for latency-critical dispatch.
+// Uses `memory.atomic.wait32`/`notify` directly, spin-then-park on workers,
+// spin-only on the main thread. See module docs for rationale.
+//
+// Feature-gated because it pulls in `wasm_thread` for Web Worker spawning
+// (std::thread::spawn panics on wasm32-unknown-unknown — there's no OS thread
+// API to call, you need JS glue to create Workers).
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub mod wasm_futex;
+
 /// Flags for controlling parallelization behavior.
 pub mod flags {
     /// Disable denormal floating-point numbers for performance.

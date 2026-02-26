@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>quick bench</title></head>
+<body>
+<pre id="log">init...</pre>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+<script type="module">
+const logEl = document.getElementById('log');
+function log(m) { logEl.textContent += '\n' + m; console.log(m); }
+
+// Tunables. With hw=64 cores on this box, cap to something sane so we're
+// measuring algorithmic scaling not core-count-go-brrr.
+const N_THREADS = 8;
+const SIZES = [128, 256, 512, 1024, 2048];
+const ITERS = 20;
+
+// tfjs setup — match thread count for apples-to-apples.
+// (We'll also bench tfjs @ 1 thread for single-threaded comparison.)
+tf.wasm.setThreadsCount(N_THREADS);
+await tf.setBackend('wasm'); await tf.ready();
+log(`tfjs ready: ${tf.getBackend()} @ ${N_THREADS} threads`);
+
+// rumpy setup
+const rumpy = await import('./pkg/rumpy_wasm.js');
+await rumpy.default();
+await rumpy.initThreadPool(N_THREADS);
+log(`rumpy ready: ${rumpy.getNumThreads()} threads`);
+log(`  V3 available: ${!!rumpy.matmulF32OptimizedParallelV3}`);
+log(`  V4 available: ${!!rumpy.matmulF32OptimizedParallelV4}`);
+
+function bench(fn, iters) {
+  for (let i = 0; i < 3; i++) fn();  // warmup
+  const t = [];
+  for (let i = 0; i < iters; i++) {
+    const s = performance.now(); fn(); t.push(performance.now() - s);
+  }
+  t.sort((a, b) => a - b);
+  return t[Math.floor(t.length / 2)];  // median
+}
+
+function maxDiff(a, b) {
+  let m = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = Math.abs(a[i] - b[i]);
+    if (d > m) m = d;
+  }
+  return m;
+}
+
+window.RESULTS = {};
+
+for (const n of SIZES) {
+  log(`\n=== ${n}×${n} ===`);
+  window.RESULTS[n] = {};
+  const R = window.RESULTS[n];
+
+  const A = new Float32Array(n*n).map(() => Math.random());
+  const B = new Float32Array(n*n).map(() => Math.random());
+
+  // tfjs reference
+  const tA = tf.tensor2d(A, [n, n]);
+  const tB = tf.tensor2d(B, [n, n]);
+  const tC = tf.matMul(tA, tB);
+  const ref = tC.dataSync();
+  tC.dispose();
+
+  // tfjs timing
+  R.tfjs = bench(() => {
+    const c = tf.matMul(tA, tB); c.dataSync(); c.dispose();
+  }, ITERS);
+  tA.dispose(); tB.dispose();
+  log(`tfjs(${N_THREADS}t):      ${R.tfjs.toFixed(3)} ms`);
+
+  // rumpy single-threaded optimised (baseline — this already beats tfjs 1t)
+  R.opt_st = bench(() => rumpy.matmulF32Optimized(A, B, n, n, n), ITERS);
+  const chk_st = maxDiff(rumpy.matmulF32Optimized(A, B, n, n, n), ref);
+  log(`rumpy opt(1t):  ${R.opt_st.toFixed(3)} ms  [err ${chk_st.toExponential(1)}]`);
+
+  // legacy parallel
+  R.par_v1 = bench(() => rumpy.matmulF32OptimizedParallel(A, B, n, n, n), ITERS);
+  log(`rumpy par-v1:   ${R.par_v1.toFixed(3)} ms  (${(R.opt_st/R.par_v1).toFixed(2)}× st)`);
+
+  // v3 — single scope, per-thread scratch, atomic tiles
+  R.par_v3 = bench(() => rumpy.matmulF32OptimizedParallelV3(A, B, n, n, n), ITERS);
+  const chk_v3 = maxDiff(rumpy.matmulF32OptimizedParallelV3(A, B, n, n, n), ref);
+  log(`rumpy par-v3:   ${R.par_v3.toFixed(3)} ms  (${(R.opt_st/R.par_v3).toFixed(2)}× st, ${(R.par_v3/R.tfjs).toFixed(2)}× tfjs)  [err ${chk_v3.toExponential(1)}]`);
+
+  // v4 — atomic.wait hijack, shared packed B
+  R.par_v4 = bench(() => rumpy.matmulF32OptimizedParallelV4(A, B, n, n, n), ITERS);
+  const chk_v4 = maxDiff(rumpy.matmulF32OptimizedParallelV4(A, B, n, n, n), ref);
+  log(`rumpy par-v4:   ${R.par_v4.toFixed(3)} ms  (${(R.opt_st/R.par_v4).toFixed(2)}× st, ${(R.par_v4/R.tfjs).toFixed(2)}× tfjs)  [err ${chk_v4.toExponential(1)}]`);
+}
+
+log('\nDONE');
+window.BENCH_DONE = true;
+</script>
+</body>
+</html>
