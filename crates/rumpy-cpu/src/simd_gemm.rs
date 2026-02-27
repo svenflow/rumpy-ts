@@ -2219,7 +2219,9 @@ pub fn matmul_parallel_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -
     use rayon::prelude::*;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // CRITICAL: WASM usize is 32-bit. m*n*k at 2048³ = 8.6e9 overflows to 0
+    // → silent single-threaded fallback. See docs/GEMM-OPTIMIZATION-NOTES.md.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2268,7 +2270,9 @@ pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
     use rayon::prelude::*;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // CRITICAL: WASM usize is 32-bit. m*n*k at 2048³ = 8.6e9 overflows to 0
+    // → silent single-threaded fallback. See docs/GEMM-OPTIMIZATION-NOTES.md.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2318,7 +2322,9 @@ pub fn matmul_pthreadpool_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
     use pthreadpool_rs::ThreadPool;
 
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // CRITICAL: WASM usize is 32-bit. m*n*k at 2048³ = 8.6e9 overflows to 0
+    // → silent single-threaded fallback. See docs/GEMM-OPTIMIZATION-NOTES.md.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2380,7 +2386,9 @@ pub fn matmul_pthreadpool_f32_with_pool(
     k: usize,
 ) -> Vec<f32> {
     // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // CRITICAL: WASM usize is 32-bit. m*n*k at 2048³ = 8.6e9 overflows to 0
+    // → silent single-threaded fallback. See docs/GEMM-OPTIMIZATION-NOTES.md.
+    if (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2875,8 +2883,13 @@ pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) 
 pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use rayon::prelude::*;
 
-    // For small matrices, single-threaded is faster
-    if m * n * k < 128 * 128 * 128 {
+    // For small matrices, single-threaded is faster.
+    //
+    // CRITICAL: WASM usize is 32-bit. At (2048, 2048, 2048), m*n*k = 8.6e9
+    // overflows to EXACTLY 0 → this check passes → silent single-threaded
+    // fallback → "1.00× speedup" that looked like cache aliasing for 6 hours.
+    // Always use u64 for flop estimates on wasm32.
+    if (m as u64) * (n as u64) * (k as u64) < (128u64 * 128 * 128) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
