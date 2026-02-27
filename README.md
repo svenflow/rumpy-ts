@@ -105,15 +105,20 @@ All backends implement the same operation traits:
 
 rumpy.ts **beats TensorFlow.js WASM backend** on matrix multiplication, especially at large sizes:
 
-| Size | rumpy.ts | TF.js WASM | vs TF.js |
-|------|----------|------------|----------|
-| 512 | 0.8ms | 0.7ms | 0.97x (tied) |
-| 1024 | 4.4ms | 5.4ms | **1.23x faster** ⭐ |
-| 2048 | 31ms | 41ms | **1.32x faster** ⭐ |
-| 4096 | 199ms | 322ms | **1.62x faster** ⭐ |
-| 8192 | 1.5s | 2.6s | **1.74x faster** ⭐ |
+| Size | rumpy.ts | TF.js WASM | NumPy | vs TF.js | vs NumPy |
+|------|----------|------------|-------|----------|----------|
+| 512 | 0.8ms | 0.7ms | 1.1ms | 0.97x | **1.37x** ⭐ |
+| 1024 | 4.4ms | 5.4ms | 1.9ms | **1.23x** ⭐ | 0.43x |
+| 2048 | 31ms | 41ms | 9.5ms | **1.32x** ⭐ | 0.31x |
+| 4096 | 199ms | 322ms | 74ms | **1.62x** ⭐ | 0.37x |
+| 8192 | 1.5s | 2.6s | 596ms | **1.74x** ⭐ | 0.40x |
 
-*Benchmarked on M3 Max Mac, 14 threads, inference mode (pre-packed weights). Both using WASM SIMD + threads.*
+*Benchmarked on Mac mini M4 Pro (14 cores, 64GB RAM). rumpy.ts and TF.js use WASM SIMD + threads. NumPy uses Apple Accelerate (native ARM BLAS with AMX coprocessor).*
+
+**Key takeaways:**
+- rumpy.ts is **1.2-1.7x faster than TensorFlow.js** at sizes ≥1024
+- NumPy with native BLAS is 2.5-3x faster than any WASM implementation (hardware advantage)
+- At 512×512, rumpy.ts actually beats NumPy due to lower overhead
 
 ### Auto-Pack API (tfjs-like)
 
