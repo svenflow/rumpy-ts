@@ -1,7 +1,7 @@
 {
   "generated_by": "numpy",
   "numpy_version": "2.4.2",
-  "test_count": 54,
+  "test_count": 57,
   "tests": [
     {
       "name": "permute 2x3 -> 3x2",
@@ -2051,6 +2051,130 @@
       "expected_shape": [
         4,
         4
+      ]
+    },
+    {
+      "name": "layerNorm transposed input",
+      "op": "layerNorm",
+      "inputs": {
+        "data": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0,
+          7.0,
+          8.0
+        ],
+        "shape": [
+          2,
+          4
+        ],
+        "normalized_shape": [
+          4
+        ],
+        "gamma": null,
+        "beta": null,
+        "eps": 1e-05
+      },
+      "expected": [
+        -1.3416354199689269,
+        -0.447211806656309,
+        0.447211806656309,
+        1.3416354199689269,
+        -1.3416354199689269,
+        -0.447211806656309,
+        0.447211806656309,
+        1.3416354199689269
+      ],
+      "expected_shape": [
+        2,
+        4
+      ]
+    },
+    {
+      "name": "tril transposed k=0",
+      "op": "tril",
+      "inputs": {
+        "data": [
+          0.0,
+          3.0,
+          6.0,
+          1.0,
+          4.0,
+          7.0,
+          2.0,
+          5.0,
+          8.0
+        ],
+        "shape": [
+          3,
+          3
+        ],
+        "k": 0
+      },
+      "expected": [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        4.0,
+        0.0,
+        2.0,
+        5.0,
+        8.0
+      ],
+      "expected_shape": [
+        3,
+        3
+      ]
+    },
+    {
+      "name": "topk transposed 2D k=2",
+      "op": "topk",
+      "inputs": {
+        "data": [
+          3.0,
+          1.0,
+          4.0,
+          1.0,
+          5.0,
+          9.0
+        ],
+        "shape": [
+          2,
+          3
+        ],
+        "k": 2,
+        "axis": 1,
+        "sorted": true
+      },
+      "expected": {
+        "values": [
+          [
+            4.0,
+            3.0
+          ],
+          [
+            9.0,
+            5.0
+          ]
+        ],
+        "indices": [
+          [
+            2,
+            0
+          ],
+          [
+            2,
+            1
+          ]
+        ]
+      },
+      "expected_shape": [
+        2,
+        2
       ]
     }
   ]

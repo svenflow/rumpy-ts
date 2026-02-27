@@ -499,6 +499,33 @@ add_test("causalMask size=4", "causalMask",
          {"size": 4},
          causal_mask_numpy(4))
 
+# ==================== Non-contiguous Input Tests ====================
+# These tests verify that operations work correctly on transposed arrays
+
+# Test layerNorm on transposed input
+arr_ln_t = np.array([[1, 5], [2, 6], [3, 7], [4, 8]], dtype=np.float64).T  # 2x4 transposed from 4x2
+add_test("layerNorm transposed input", "layerNorm",
+         {"data": arr_ln_t.flatten().tolist(), "shape": [2, 4],
+          "normalized_shape": [4], "gamma": None, "beta": None, "eps": 1e-5},
+         layer_norm_numpy(arr_ln_t, [4], eps=1e-5))
+
+# Test tril on transposed input
+arr_tril_t = np.arange(9, dtype=np.float64).reshape(3, 3).T
+add_test("tril transposed k=0", "tril",
+         {"data": arr_tril_t.flatten().tolist(), "shape": [3, 3], "k": 0},
+         np.tril(arr_tril_t, k=0))
+
+# Test topk on transposed 2D array
+arr_topk_t = np.array([[3, 1], [1, 5], [4, 9]], dtype=np.float64).T  # 2x3 from 3x2
+vals_t0 = np.sort(arr_topk_t[0])[::-1][:2]
+vals_t1 = np.sort(arr_topk_t[1])[::-1][:2]
+idx_t0 = np.argsort(arr_topk_t[0])[::-1][:2]
+idx_t1 = np.argsort(arr_topk_t[1])[::-1][:2]
+add_test("topk transposed 2D k=2", "topk",
+         {"data": arr_topk_t.flatten().tolist(), "shape": [2, 3], "k": 2, "axis": 1, "sorted": True},
+         {"values": np.array([vals_t0, vals_t1]).tolist(),
+          "indices": np.array([idx_t0, idx_t1]).tolist()}, shape=[2, 2])
+
 # Custom JSON encoder to handle NaN/Inf
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):

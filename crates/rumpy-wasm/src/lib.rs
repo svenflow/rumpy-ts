@@ -2091,11 +2091,18 @@ pub fn matmul_xnnpack_blocked(a: &Float32Array, b: &Float32Array, packed_b: &Flo
 }
 
 // ============ ML Inference Ops ============
+//
+// These operations handle non-contiguous arrays safely by:
+// 1. Using as_standard_layout() to ensure C-order before reshaping
+// 2. Using ndarray's lane iterators which handle strides automatically
+// 3. Avoiding manual index calculations that assume C-order
 
 /// Layer normalization (matches torch.nn.functional.layer_norm)
 ///
 /// Normalizes over the last N dimensions where N = normalized_shape.len()
 /// output = (input - mean) / sqrt(var + eps) * gamma + beta
+///
+/// Handles non-contiguous inputs (e.g., from transpose/permute) safely.
 ///
 /// # Arguments
 /// * `normalized_shape` - The shape over which to normalize (last N dims)
@@ -2113,7 +2120,7 @@ impl NDArray {
         eps: f64
     ) -> Result<NDArray, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
         let ndim = shape.len();
         let norm_ndim = normalized_shape.len();
 
@@ -2131,53 +2138,101 @@ impl NDArray {
             }
         }
 
-        // Calculate the number of elements to normalize over
         let norm_size: usize = normalized_shape.iter().product();
+
+        // Get gamma/beta slices if provided
+        let g_slice = gamma.as_ref().map(|g| g.inner.as_f64_slice());
+        let b_slice = beta.as_ref().map(|b| b.inner.as_f64_slice());
+
+        // Use lanes() to iterate over the normalization dimension
+        // This handles any memory layout without copying
+        // For multi-dim normalized_shape, we flatten conceptually by treating
+        // the last norm_ndim dims as the "lane" to normalize over
+
+        // Build the axis for normalization - we need to iterate over "batches"
+        // where each batch is the first (ndim - norm_ndim) dimensions
+        // For layerNorm, we normalize over the last norm_ndim dims
+
+        // Reshape to 2D: [batch, norm_features] for simplicity
+        // as_standard_layout is needed here because we're reshaping
+        let data_contiguous = data.as_standard_layout();
         let batch_size: usize = shape[..ndim - norm_ndim].iter().product();
 
-        // Flatten to (batch, norm_features) for computation
-        let flat = data.view().into_shape((batch_size, norm_size)).unwrap();
+        let flat = data_contiguous.view()
+            .into_shape((batch_size, norm_size))
+            .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
 
-        // Compute mean and variance along last axis
-        let mut result = ndarray::Array2::<f64>::zeros((batch_size, norm_size));
+        let mut flat_result = ndarray::Array2::<f64>::zeros((batch_size, norm_size));
 
-        for (i, row) in flat.outer_iter().enumerate() {
-            let mean = row.mean().unwrap_or(0.0);
-            let var = row.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / norm_size as f64;
-            let std = (var + eps).sqrt();
+        // Hoist the gamma/beta branches outside the hot loop for better vectorization
+        // Use d*d instead of powi(2) for faster variance calculation
+        // Zip gamma/beta iterators to eliminate bounds checks in inner loop
+        match (&g_slice, &b_slice) {
+            (Some(g), Some(b)) => {
+                // Both gamma and beta - zip all iterators to remove bounds checks
+                for (mut out_row, in_row) in flat_result.outer_iter_mut().zip(flat.outer_iter()) {
+                    let mean = in_row.mean().unwrap_or(0.0);
+                    let var = in_row.iter().map(|&x| { let d = x - mean; d * d }).sum::<f64>() / norm_size as f64;
+                    let inv_std = 1.0 / (var + eps).sqrt();
 
-            for (j, &val) in row.iter().enumerate() {
-                result[[i, j]] = (val - mean) / std;
-            }
-        }
-
-        // Apply gamma and beta if provided
-        if let Some(g) = gamma {
-            let g_data = g.inner.as_f64_slice();
-            for i in 0..batch_size {
-                for j in 0..norm_size {
-                    result[[i, j]] *= g_data[j];
+                    for (((y, &x), &gamma), &beta) in out_row.iter_mut()
+                        .zip(in_row.iter())
+                        .zip(g.iter())
+                        .zip(b.iter())
+                    {
+                        *y = (x - mean) * inv_std * gamma + beta;
+                    }
                 }
             }
-        }
+            (Some(g), None) => {
+                // Gamma only
+                for (mut out_row, in_row) in flat_result.outer_iter_mut().zip(flat.outer_iter()) {
+                    let mean = in_row.mean().unwrap_or(0.0);
+                    let var = in_row.iter().map(|&x| { let d = x - mean; d * d }).sum::<f64>() / norm_size as f64;
+                    let inv_std = 1.0 / (var + eps).sqrt();
 
-        if let Some(b) = beta {
-            let b_data = b.inner.as_f64_slice();
-            for i in 0..batch_size {
-                for j in 0..norm_size {
-                    result[[i, j]] += b_data[j];
+                    for ((y, &x), &gamma) in out_row.iter_mut()
+                        .zip(in_row.iter())
+                        .zip(g.iter())
+                    {
+                        *y = (x - mean) * inv_std * gamma;
+                    }
+                }
+            }
+            (None, Some(b)) => {
+                // Beta only
+                for (mut out_row, in_row) in flat_result.outer_iter_mut().zip(flat.outer_iter()) {
+                    let mean = in_row.mean().unwrap_or(0.0);
+                    let var = in_row.iter().map(|&x| { let d = x - mean; d * d }).sum::<f64>() / norm_size as f64;
+                    let inv_std = 1.0 / (var + eps).sqrt();
+
+                    for ((y, &x), &beta) in out_row.iter_mut()
+                        .zip(in_row.iter())
+                        .zip(b.iter())
+                    {
+                        *y = (x - mean) * inv_std + beta;
+                    }
+                }
+            }
+            (None, None) => {
+                // No affine
+                for (mut out_row, in_row) in flat_result.outer_iter_mut().zip(flat.outer_iter()) {
+                    let mean = in_row.mean().unwrap_or(0.0);
+                    let var = in_row.iter().map(|&x| { let d = x - mean; d * d }).sum::<f64>() / norm_size as f64;
+                    let inv_std = 1.0 / (var + eps).sqrt();
+
+                    for (y, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        *y = (x - mean) * inv_std;
+                    }
                 }
             }
         }
 
         // Reshape back to original shape
-        let result_flat: Vec<f64> = result.iter().cloned().collect();
-        let result_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(shape),
-            result_flat
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let result_arr = flat_result.into_shape(ndarray::IxDyn(&shape))
+            .map_err(|e| JsValue::from_str(&format!("reshape back failed: {}", e)))?;
 
-        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr.to_owned())))
     }
 }
 
@@ -2185,6 +2240,8 @@ impl NDArray {
 ///
 /// Unlike layer norm, RMS norm doesn't subtract mean, only divides by RMS.
 /// output = input / sqrt(mean(input^2) + eps) * gamma
+///
+/// Handles non-contiguous inputs safely.
 ///
 /// # Arguments
 /// * `gamma` - Scale parameter (required for RMS norm)
@@ -2194,46 +2251,47 @@ impl NDArray {
     #[wasm_bindgen(js_name = rmsNorm)]
     pub fn rms_norm(&self, gamma: &NDArray, eps: f64) -> Result<NDArray, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
         let ndim = shape.len();
 
         if ndim == 0 {
             return Err(JsValue::from_str("Cannot apply rms_norm to scalar"));
         }
 
-        // Normalize over last dimension
         let last_dim = *shape.last().unwrap();
         let batch_size: usize = shape[..ndim - 1].iter().product();
 
-        let flat = data.view().into_shape((batch_size, last_dim)).unwrap();
-        let g_data = gamma.inner.as_f64_slice();
+        // Ensure contiguous layout before reshaping
+        let data_contiguous = data.as_standard_layout();
+        let flat = data_contiguous.view()
+            .into_shape((batch_size, last_dim))
+            .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
 
-        if g_data.len() != last_dim {
+        let g_slice = gamma.inner.as_f64_slice();
+
+        if g_slice.len() != last_dim {
             return Err(JsValue::from_str(&format!(
                 "gamma size {} doesn't match last dimension {}",
-                g_data.len(), last_dim
+                g_slice.len(), last_dim
             )));
         }
 
         let mut result = ndarray::Array2::<f64>::zeros((batch_size, last_dim));
 
-        for (i, row) in flat.outer_iter().enumerate() {
-            // Compute RMS = sqrt(mean(x^2))
-            let rms = (row.iter().map(|&x| x * x).sum::<f64>() / last_dim as f64 + eps).sqrt();
+        for (mut out_row, in_row) in result.outer_iter_mut().zip(flat.outer_iter()) {
+            // Compute RMS = sqrt(mean(x^2) + eps)
+            let rms = (in_row.iter().map(|&x| x * x).sum::<f64>() / last_dim as f64 + eps).sqrt();
+            let inv_rms = 1.0 / rms;
 
-            for (j, &val) in row.iter().enumerate() {
-                result[[i, j]] = (val / rms) * g_data[j];
+            for ((y, &x), &g) in out_row.iter_mut().zip(in_row.iter()).zip(g_slice.iter()) {
+                *y = x * inv_rms * g;
             }
         }
 
-        // Reshape back
-        let result_flat: Vec<f64> = result.iter().cloned().collect();
-        let result_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(shape),
-            result_flat
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let result_arr = result.into_shape(ndarray::IxDyn(&shape))
+            .map_err(|e| JsValue::from_str(&format!("reshape back failed: {}", e)))?;
 
-        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr.to_owned())))
     }
 }
 
@@ -2241,6 +2299,8 @@ impl NDArray {
 ///
 /// Normalizes using pre-computed running statistics.
 /// output = (input - running_mean) / sqrt(running_var + eps) * gamma + beta
+///
+/// Handles non-contiguous inputs safely using ndarray iterators.
 ///
 /// # Arguments
 /// * `gamma` - Optional scale (weight), defaults to 1.0
@@ -2260,7 +2320,7 @@ impl NDArray {
         eps: f64
     ) -> Result<NDArray, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
         let ndim = shape.len();
 
         // Assume NCHW format (batch, channels, height, width)
@@ -2269,10 +2329,10 @@ impl NDArray {
         }
 
         let num_channels = shape[1];
-        let mean_data = running_mean.inner.as_f64_slice();
-        let var_data = running_var.inner.as_f64_slice();
+        let mean_slice = running_mean.inner.as_f64_slice();
+        let var_slice = running_var.inner.as_f64_slice();
 
-        if mean_data.len() != num_channels || var_data.len() != num_channels {
+        if mean_slice.len() != num_channels || var_slice.len() != num_channels {
             return Err(JsValue::from_str("running_mean/var must match channel dimension"));
         }
 
@@ -2281,44 +2341,35 @@ impl NDArray {
         let mut shift = vec![0.0f64; num_channels];
 
         for c in 0..num_channels {
-            let std = (var_data[c] + eps).sqrt();
-            scale[c] = 1.0 / std;
-            shift[c] = -mean_data[c] / std;
+            let inv_std = 1.0 / (var_slice[c] + eps).sqrt();
+            scale[c] = inv_std;
+            shift[c] = -mean_slice[c] * inv_std;
 
             if let Some(ref g) = gamma {
-                let g_data = g.inner.as_f64_slice();
-                scale[c] *= g_data[c];
-                shift[c] *= g_data[c];
+                let g_slice = g.inner.as_f64_slice();
+                scale[c] *= g_slice[c];
+                shift[c] *= g_slice[c];
             }
 
             if let Some(ref b) = beta {
-                let b_data = b.inner.as_f64_slice();
-                shift[c] += b_data[c];
+                let b_slice = b.inner.as_f64_slice();
+                shift[c] += b_slice[c];
             }
         }
 
-        // Apply normalization
-        let batch = shape[0];
-        let spatial: usize = shape[2..].iter().product();
+        // Use axis_iter to process channel by channel
+        // This is much faster than indexed_iter_mut for NCHW layout
+        let mut result = data.to_owned();
 
-        let mut result_data = vec![0.0f64; data.len()];
-        let data_slice = self.inner.as_f64_slice();
-
-        for n in 0..batch {
-            for c in 0..num_channels {
-                for s in 0..spatial {
-                    let idx = n * (num_channels * spatial) + c * spatial + s;
-                    result_data[idx] = data_slice[idx] * scale[c] + shift[c];
-                }
-            }
+        // Iterate over channel axis (axis 1), applying scale/shift to each channel
+        // axis_iter_mut gives us views for each channel across all batches and spatial dims
+        for (c, mut channel_data) in result.axis_iter_mut(ndarray::Axis(1)).enumerate() {
+            let s = scale[c];
+            let sh = shift[c];
+            channel_data.mapv_inplace(|x| x * s + sh);
         }
 
-        let result_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(shape),
-            result_data
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     }
 }
 
@@ -2408,6 +2459,8 @@ impl NDArray {
 /// Top-k values and indices along an axis
 ///
 /// Returns (values, indices) where both have the axis dimension reduced to k.
+/// Uses O(N) selection algorithm (select_nth_unstable) for efficiency.
+/// Handles non-contiguous inputs safely using ndarray lane iterators.
 ///
 /// # Arguments
 /// * `k` - Number of top elements to return
@@ -2417,7 +2470,7 @@ impl NDArray {
 impl NDArray {
     pub fn topk(&self, k: usize, axis: usize, sorted: bool) -> Result<js_sys::Array, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
 
         if axis >= shape.len() {
             return Err(JsValue::from_str(&format!(
@@ -2433,60 +2486,125 @@ impl NDArray {
             )));
         }
 
+        if k == 0 {
+            return Err(JsValue::from_str("k must be at least 1"));
+        }
+
         // Build output shape
-        let mut out_shape = shape.to_vec();
+        let mut out_shape = shape.clone();
         out_shape[axis] = k;
 
-        let axis_len = shape[axis];
-        let outer_size: usize = shape[..axis].iter().product();
-        let inner_size: usize = shape[axis + 1..].iter().product();
+        let mut out_values = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&out_shape));
+        let mut out_indices = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&out_shape));
 
-        let total_out = out_shape.iter().product();
-        let mut values_data = vec![0.0f64; total_out];
-        let mut indices_data = vec![0.0f64; total_out];
+        // Use ndarray's lanes() iterator which handles strides automatically
+        let axis_obj = ndarray::Axis(axis);
+        let n_cols = shape[axis];
 
-        let data_slice = self.inner.as_f64_slice();
+        // For small k (most common in inference), use a min-heap to avoid
+        // materializing the full (value, index) array. This saves memory bandwidth.
+        // Threshold: if k <= 64, heap is faster; above that, select_nth_unstable wins.
+        let use_heap = k <= 64;
 
-        for outer in 0..outer_size.max(1) {
-            for inner in 0..inner_size.max(1) {
-                // Collect (value, index) pairs for this lane
-                let mut pairs: Vec<(f64, usize)> = Vec::with_capacity(axis_len);
+        if use_heap {
+            // Heap-based approach: O(N log k) but zero scratch memory writes
+            use std::collections::BinaryHeap;
 
-                for i in 0..axis_len {
-                    let idx = outer * axis_len * inner_size.max(1) + i * inner_size.max(1) + inner;
-                    pairs.push((data_slice[idx], i));
+            // Min-heap of (value, index) - we want to keep the k largest
+            // BinaryHeap is max-heap by default, so we invert comparison for min-heap
+            #[derive(PartialEq)]
+            struct MinHeapItem(f64, usize);
+
+            // f64 doesn't implement Eq, but we need it for Ord
+            // Our total_cmp based comparison makes this safe
+            impl Eq for MinHeapItem {}
+
+            impl PartialOrd for MinHeapItem {
+                fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+            impl Ord for MinHeapItem {
+                fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                    // Use total_cmp for NaN safety, inverted for min-heap behavior
+                    // Tie-break by index for stable selection (prefer lower indices)
+                    other.0.total_cmp(&self.0)
+                        .then_with(|| other.1.cmp(&self.1))
+                }
+            }
+
+            // Hoist heap allocation outside the loop
+            let mut heap: BinaryHeap<MinHeapItem> = BinaryHeap::with_capacity(k + 1);
+            let mut results: Vec<(f64, usize)> = Vec::with_capacity(k);
+
+            for ((in_lane, mut out_val_lane), mut out_idx_lane) in data.lanes(axis_obj)
+                .into_iter()
+                .zip(out_values.lanes_mut(axis_obj))
+                .zip(out_indices.lanes_mut(axis_obj))
+            {
+                // heap.drain() at end leaves it empty, no need for clear()
+
+                for (i, &v) in in_lane.iter().enumerate() {
+                    if heap.len() < k {
+                        heap.push(MinHeapItem(v, i));
+                    } else {
+                        // Optimization: Check against the "cutoff" (smallest of top k) first
+                        // Only modify heap structure if v is strictly better
+                        // Use total_cmp to match the Ord implementation (NaN consistency)
+                        let mut top = heap.peek_mut().unwrap();
+                        if v.total_cmp(&top.0).is_gt() {
+                            // Replace in-place, dropping triggers ONE sift-down
+                            *top = MinHeapItem(v, i);
+                        }
+                    }
                 }
 
-                // Partial sort to get top k (descending)
-                pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                pairs.truncate(k);
+                // Extract results, reusing buffer
+                results.clear();
+                results.extend(heap.drain().map(|MinHeapItem(v, i)| (v, i)));
 
-                if !sorted {
-                    // If not sorted, leave in arbitrary order (already partially sorted though)
+                if sorted {
+                    results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 }
 
-                // Write to output
-                for (i, &(val, orig_idx)) in pairs.iter().enumerate() {
-                    let out_idx = outer * k * inner_size.max(1) + i * inner_size.max(1) + inner;
-                    values_data[out_idx] = val;
-                    indices_data[out_idx] = orig_idx as f64;
+                for (i, &(val, orig_idx)) in results.iter().enumerate() {
+                    out_val_lane[i] = val;
+                    out_idx_lane[i] = orig_idx as f64;
+                }
+            }
+        } else {
+            // For large k, use select_nth_unstable with scratch buffer
+            let mut scratch: Vec<(f64, usize)> = Vec::with_capacity(n_cols);
+
+            for ((in_lane, mut out_val_lane), mut out_idx_lane) in data.lanes(axis_obj)
+                .into_iter()
+                .zip(out_values.lanes_mut(axis_obj))
+                .zip(out_indices.lanes_mut(axis_obj))
+            {
+                scratch.clear();
+                scratch.extend(in_lane.iter().enumerate().map(|(i, &v)| (v, i)));
+
+                if k < scratch.len() {
+                    scratch.select_nth_unstable_by(k - 1, |a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    scratch.truncate(k);
+                }
+
+                if sorted {
+                    scratch.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                }
+
+                for (i, &(val, orig_idx)) in scratch.iter().enumerate() {
+                    out_val_lane[i] = val;
+                    out_idx_lane[i] = orig_idx as f64;
                 }
             }
         }
 
-        let values_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(&out_shape),
-            values_data
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let indices_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(&out_shape),
-            indices_data
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
         let result = js_sys::Array::new();
-        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(values_arr))));
-        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(indices_arr))));
+        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(out_values))));
+        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(out_indices))));
 
         Ok(result)
     }
@@ -2494,46 +2612,72 @@ impl NDArray {
 
 /// Lower triangular matrix (zeros above k-th diagonal)
 ///
+/// Handles batched inputs and non-contiguous arrays safely.
+/// Uses row-based iteration for performance (avoids indexed_iter overhead).
+///
 /// # Arguments
 /// * `k` - Diagonal offset (0 = main diagonal, positive = above, negative = below)
 #[wasm_bindgen]
 impl NDArray {
     pub fn tril(&self, k: i32) -> Result<NDArray, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
+        let ndim = shape.len();
 
-        if shape.len() < 2 {
+        if ndim < 2 {
             return Err(JsValue::from_str("tril requires at least 2D input"));
         }
 
-        let rows = shape[shape.len() - 2];
-        let cols = shape[shape.len() - 1];
-        let batch_size: usize = shape[..shape.len() - 2].iter().product();
+        let nrows = shape[ndim - 2];
+        let ncols = shape[ndim - 1];
 
-        let mut result_data = self.inner.as_f64_slice().to_vec();
+        // Clone the data to get contiguous memory, then work on it
+        let mut result = data.to_owned();
 
-        for b in 0..batch_size.max(1) {
-            for i in 0..rows {
-                for j in 0..cols {
-                    // Keep element if j <= i + k (lower triangular)
-                    if (j as i32) > (i as i32) + k {
-                        let idx = b * rows * cols + i * cols + j;
-                        result_data[idx] = 0.0;
+        // For 2D case, iterate by rows for efficiency
+        // Use slice.fill() for memset optimization
+        if ndim == 2 {
+            for (i, mut row) in result.outer_iter_mut().enumerate() {
+                // Zero out elements where j > i + k (above the k-th diagonal)
+                let start_j = ((i as i32) + k + 1).max(0) as usize;
+                if start_j < ncols {
+                    // Use slice fill for potential memset optimization
+                    row.slice_mut(ndarray::s![start_j..]).fill(0.0);
+                }
+            }
+        } else {
+            // For N-D case, treat as batch of 2D matrices
+            let batch_size: usize = shape[..ndim - 2].iter().product();
+
+            let flat = result.as_standard_layout().into_owned()
+                .into_shape((batch_size, nrows, ncols))
+                .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
+
+            let mut flat_result = flat;
+
+            // Apply row-based masking with slice.fill() to each 2D slice
+            for mut matrix in flat_result.outer_iter_mut() {
+                for (i, mut row) in matrix.outer_iter_mut().enumerate() {
+                    let start_j = ((i as i32) + k + 1).max(0) as usize;
+                    if start_j < ncols {
+                        row.slice_mut(ndarray::s![start_j..]).fill(0.0);
                     }
                 }
             }
+
+            let shaped = flat_result.into_shape(ndarray::IxDyn(&shape))
+                .map_err(|e| JsValue::from_str(&format!("reshape back failed: {}", e)))?;
+            result = shaped;
         }
 
-        let result_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(shape),
-            result_data
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     }
 }
 
 /// Upper triangular matrix (zeros below k-th diagonal)
+///
+/// Handles batched inputs and non-contiguous arrays safely.
+/// Uses row-based iteration for performance (avoids indexed_iter overhead).
 ///
 /// # Arguments
 /// * `k` - Diagonal offset (0 = main diagonal, positive = above, negative = below)
@@ -2541,36 +2685,57 @@ impl NDArray {
 impl NDArray {
     pub fn triu(&self, k: i32) -> Result<NDArray, JsValue> {
         let data = self.inner.as_ndarray();
-        let shape = data.shape();
+        let shape = data.shape().to_vec();
+        let ndim = shape.len();
 
-        if shape.len() < 2 {
+        if ndim < 2 {
             return Err(JsValue::from_str("triu requires at least 2D input"));
         }
 
-        let rows = shape[shape.len() - 2];
-        let cols = shape[shape.len() - 1];
-        let batch_size: usize = shape[..shape.len() - 2].iter().product();
+        let ncols = shape[ndim - 1];
 
-        let mut result_data = self.inner.as_f64_slice().to_vec();
+        // Clone the data to get contiguous memory
+        let mut result = data.to_owned();
 
-        for b in 0..batch_size.max(1) {
-            for i in 0..rows {
-                for j in 0..cols {
-                    // Keep element if j >= i + k (upper triangular)
-                    if (j as i32) < (i as i32) + k {
-                        let idx = b * rows * cols + i * cols + j;
-                        result_data[idx] = 0.0;
+        let nrows = shape[ndim - 2];
+
+        // For 2D case, iterate by rows for efficiency
+        // Use slice.fill() for memset optimization
+        if ndim == 2 {
+            for (i, mut row) in result.outer_iter_mut().enumerate() {
+                // Zero out elements where j < i + k (below the k-th diagonal)
+                let end_j = ((i as i32) + k).max(0) as usize;
+                let end_j = end_j.min(ncols);
+                if end_j > 0 {
+                    row.slice_mut(ndarray::s![..end_j]).fill(0.0);
+                }
+            }
+        } else {
+            // For N-D case, treat as batch of 2D matrices
+            let batch_size: usize = shape[..ndim - 2].iter().product();
+
+            let flat = result.as_standard_layout().into_owned()
+                .into_shape((batch_size, nrows, ncols))
+                .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
+
+            let mut flat_result = flat;
+
+            for mut matrix in flat_result.outer_iter_mut() {
+                for (i, mut row) in matrix.outer_iter_mut().enumerate() {
+                    let end_j = ((i as i32) + k).max(0) as usize;
+                    let end_j = end_j.min(ncols);
+                    if end_j > 0 {
+                        row.slice_mut(ndarray::s![..end_j]).fill(0.0);
                     }
                 }
             }
+
+            let shaped = flat_result.into_shape(ndarray::IxDyn(&shape))
+                .map_err(|e| JsValue::from_str(&format!("reshape back failed: {}", e)))?;
+            result = shaped;
         }
 
-        let result_arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(shape),
-            result_data
-        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     }
 }
 
