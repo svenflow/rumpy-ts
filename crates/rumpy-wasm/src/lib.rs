@@ -2152,7 +2152,8 @@ pub fn futex_workers_ready_count() -> u32 {
 pub fn matmul_f32_futex(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
     let a_vec = a.to_vec();
     let b_vec = b.to_vec();
-    let c_vec = simd_gemm::matmul_futex_f32(&a_vec, &b_vec, m, n, k);
+    // Use tiled version for better parallel efficiency (shared B packing)
+    let c_vec = simd_gemm::matmul_futex_f32_tiled(&a_vec, &b_vec, m, n, k);
     Float32Array::from(c_vec.as_slice())
 }
 

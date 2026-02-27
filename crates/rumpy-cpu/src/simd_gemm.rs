@@ -3158,6 +3158,215 @@ pub fn matmul_futex_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> V
     c
 }
 
+/// Parallel GEMM using futex pool with proper MC/NC/KC tiling and shared B packing.
+///
+/// This version fixes the efficiency issue where each thread was redundantly packing B.
+/// Now: pack B once upfront, share across threads, distribute M-rows via futex.
+///
+/// Key optimizations:
+/// 1. Pack B matrix once (pre-allocate, shared across threads)
+/// 2. Distribute work by M-rows (each thread gets rows_per_thread)
+/// 3. Each thread processes its rows with proper MC/KC tiling
+/// 4. Use futex pool for low dispatch overhead (~10μs vs ~150μs rayon)
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub fn matmul_futex_f32_tiled(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use pthreadpool_rs::wasm_futex;
+
+    let pool = match wasm_futex::get_pool() {
+        Some(p) => p,
+        None => {
+            return matmul_optimized_f32(a, b, m, n, k);
+        }
+    };
+
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    // Shape-aware parallel decision
+    if below_parallel_threshold(m, n, k) {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // Heuristic with futex's lower overhead
+    let flops = 2u64 * (m as u64) * (n as u64) * (k as u64);
+    const FUTEX_DISPATCH_NS: u64 = 10_000;
+    const GFLOPS_PER_THREAD: u64 = 75;
+    const PARALLEL_EFFICIENCY_PCT: u64 = 70;
+
+    let time_st_ns = flops / GFLOPS_PER_THREAD;
+    let effective_threads = (num_threads as u64 * PARALLEL_EFFICIENCY_PCT) / 100;
+    let time_mt_ns = flops / (effective_threads.max(1) * GFLOPS_PER_THREAD) + FUTEX_DISPATCH_NS;
+
+    if time_mt_ns >= time_st_ns {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // Pre-allocate output
+    let c = vec![0.0f32; m * n];
+
+    // Pre-pack entire B matrix (shared across all threads)
+    // B is [k, n], pack in NC-wide panels
+    let n_panels = (n + OPT_NC - 1) / OPT_NC;
+    let k_blocks = (k + OPT_KC - 1) / OPT_KC;
+    let panel_size = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
+    let packed_b_size = n_panels * k_blocks * panel_size;
+    let mut packed_b = vec![0.0f32; packed_b_size];
+
+    // Pack B: for each NC panel, for each KC block
+    unsafe {
+        let mut panel_offset = 0;
+        let mut j = 0;
+        while j < n {
+            let j_block = (n - j).min(OPT_NC);
+            let mut p = 0;
+            while p < k {
+                let p_block = (k - p).min(OPT_KC);
+                pack_b_optimized(
+                    b.as_ptr().add(p * n + j),
+                    n,
+                    packed_b.as_mut_ptr().add(panel_offset),
+                    p_block,
+                    j_block,
+                );
+                panel_offset += panel_size;
+                p += OPT_KC;
+            }
+            j += OPT_NC;
+        }
+    }
+
+    // Calculate work distribution
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+    let num_chunks = (m + rows_per_thread - 1) / rows_per_thread;
+
+    // Convert to usize for Send+Sync
+    let a_addr = a.as_ptr() as usize;
+    let c_addr = c.as_ptr() as usize;
+    let packed_b_addr = packed_b.as_ptr() as usize;
+
+    // Dispatch work via futex pool
+    pool.parallelize(num_chunks, |chunk_idx| {
+        let m_start = chunk_idx * rows_per_thread;
+        if m_start >= m {
+            return;
+        }
+        let m_end = (m_start + rows_per_thread).min(m);
+        let tile_height = m_end - m_start;
+
+        if tile_height == 0 {
+            return;
+        }
+
+        unsafe {
+            let a_ptr = a_addr as *const f32;
+            let c_ptr = c_addr as *mut f32;
+            let packed_b_ptr = packed_b_addr as *const f32;
+
+            // Process this row chunk with proper MC/KC tiling
+            // Loop over N in NC blocks
+            let mut j = 0;
+            let mut n_panel_idx = 0;
+            while j < n {
+                let j_block = (n - j).min(OPT_NC);
+                let j_panels = (j_block + OPT_NR - 1) / OPT_NR;
+
+                // Loop over K in KC blocks
+                let mut p = 0;
+                let mut k_block_idx = 0;
+                while p < k {
+                    let p_block = (k - p).min(OPT_KC);
+                    let beta = if p == 0 { 0.0 } else { 1.0 };
+
+                    // Get pre-packed B panel for this (j, p) block
+                    let packed_panel_offset = (n_panel_idx * k_blocks + k_block_idx) * panel_size;
+                    let b_packed = packed_b_ptr.add(packed_panel_offset);
+
+                    // Loop over M in MC blocks (within our chunk)
+                    let mut i = m_start;
+                    while i < m_end {
+                        let i_block = (m_end - i).min(OPT_MC);
+                        let i_main = i_block / OPT_MR * OPT_MR;
+
+                        // Process full MR×NR tiles
+                        let mut ii = 0;
+                        while ii < i_main {
+                            let mut jj = 0;
+                            while jj < j_panels * OPT_NR && jj < j_block {
+                                let panel_idx = jj / OPT_NR;
+                                let b_panel_ptr = b_packed.add(panel_idx * p_block * OPT_NR);
+                                let n_rem = j_block - jj;
+
+                                if n_rem >= OPT_NR {
+                                    micro_kernel_6x8_fma(
+                                        p_block,
+                                        a_ptr.add((i + ii) * k + p),
+                                        k,
+                                        b_panel_ptr,
+                                        c_ptr.add((i + ii) * n + j + jj),
+                                        n,
+                                        beta,
+                                    );
+                                } else {
+                                    micro_kernel_edge(
+                                        OPT_MR,
+                                        n_rem,
+                                        p_block,
+                                        a_ptr.add((i + ii) * k + p),
+                                        k,
+                                        b_panel_ptr,
+                                        c_ptr.add((i + ii) * n + j + jj),
+                                        n,
+                                        beta,
+                                    );
+                                }
+                                jj += OPT_NR;
+                            }
+                            ii += OPT_MR;
+                        }
+
+                        // Handle remaining rows
+                        if ii < i_block {
+                            let m_rem = i_block - ii;
+                            let mut jj = 0;
+                            while jj < j_panels * OPT_NR && jj < j_block {
+                                let panel_idx = jj / OPT_NR;
+                                let b_panel_ptr = b_packed.add(panel_idx * p_block * OPT_NR);
+                                let n_rem = (j_block - jj).min(OPT_NR);
+
+                                micro_kernel_edge(
+                                    m_rem,
+                                    n_rem,
+                                    p_block,
+                                    a_ptr.add((i + ii) * k + p),
+                                    k,
+                                    b_panel_ptr,
+                                    c_ptr.add((i + ii) * n + j + jj),
+                                    n,
+                                    beta,
+                                );
+                                jj += OPT_NR;
+                            }
+                        }
+
+                        i += OPT_MC;
+                    }
+
+                    p += OPT_KC;
+                    k_block_idx += 1;
+                }
+
+                j += OPT_NC;
+                n_panel_idx += 1;
+            }
+        }
+    });
+
+    c
+}
+
 /// Initialize the futex pool with n threads.
 /// Call this from JS before using matmul_futex_f32.
 #[cfg(all(
