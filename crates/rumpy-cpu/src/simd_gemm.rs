@@ -3357,6 +3357,154 @@ pub fn matmul_futex_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> V
 
 /// Parallel GEMM using futex pool with proper MC/NC/KC tiling and shared B packing.
 ///
+/// Parallel GEMM WITHOUT B-packing for medium matrices (128³ to 512³).
+///
+/// At these sizes, the B-packing overhead (~130μs for 256×256) dominates.
+/// tfjs uses direct strided access here, so we do the same.
+///
+/// Uses the simpler 4x8 FMA kernel with direct B access.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+fn matmul_futex_f32_no_pack(
+    pool: &pthreadpool_rs::wasm_futex::FutexPool,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    num_threads: usize,
+) -> Vec<f32> {
+    use core::arch::wasm32::*;
+
+    let c = vec![0.0f32; m * n];
+
+    // Simple row distribution
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+    let num_chunks = (m + rows_per_thread - 1) / rows_per_thread;
+
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_ptr() as usize;
+
+    pool.parallelize(num_chunks, |chunk_idx| {
+        let m_start = chunk_idx * rows_per_thread;
+        if m_start >= m {
+            return;
+        }
+        let m_end = (m_start + rows_per_thread).min(m);
+
+        unsafe {
+            let a_ptr = a_addr as *const f32;
+            let b_ptr = b_addr as *const f32;
+            let c_ptr = c_addr as *mut f32;
+
+            // Process 4 rows at a time, 8 columns at a time
+            const MR: usize = 4;
+            const NR: usize = 8;
+            const KU: usize = 4;
+
+            let mut i = m_start;
+            while i + MR <= m_end {
+                let mut j = 0;
+                while j + NR <= n {
+                    // Accumulator registers
+                    let mut acc00 = f32x4_splat(0.0);
+                    let mut acc01 = f32x4_splat(0.0);
+                    let mut acc10 = f32x4_splat(0.0);
+                    let mut acc11 = f32x4_splat(0.0);
+                    let mut acc20 = f32x4_splat(0.0);
+                    let mut acc21 = f32x4_splat(0.0);
+                    let mut acc30 = f32x4_splat(0.0);
+                    let mut acc31 = f32x4_splat(0.0);
+
+                    // K loop unrolled 4x
+                    let k_main = k / KU * KU;
+                    let mut kk = 0;
+                    while kk < k_main {
+                        for u in 0..KU {
+                            let a0 = f32x4_splat(*a_ptr.add((i + 0) * k + kk + u));
+                            let a1 = f32x4_splat(*a_ptr.add((i + 1) * k + kk + u));
+                            let a2 = f32x4_splat(*a_ptr.add((i + 2) * k + kk + u));
+                            let a3 = f32x4_splat(*a_ptr.add((i + 3) * k + kk + u));
+                            let b_base = (kk + u) * n + j;
+                            let b0 = v128_load(b_ptr.add(b_base) as *const v128);
+                            let b1 = v128_load(b_ptr.add(b_base + 4) as *const v128);
+                            acc00 = f32x4_relaxed_madd(a0, b0, acc00);
+                            acc01 = f32x4_relaxed_madd(a0, b1, acc01);
+                            acc10 = f32x4_relaxed_madd(a1, b0, acc10);
+                            acc11 = f32x4_relaxed_madd(a1, b1, acc11);
+                            acc20 = f32x4_relaxed_madd(a2, b0, acc20);
+                            acc21 = f32x4_relaxed_madd(a2, b1, acc21);
+                            acc30 = f32x4_relaxed_madd(a3, b0, acc30);
+                            acc31 = f32x4_relaxed_madd(a3, b1, acc31);
+                        }
+                        kk += KU;
+                    }
+                    // K remainder
+                    while kk < k {
+                        let a0 = f32x4_splat(*a_ptr.add((i + 0) * k + kk));
+                        let a1 = f32x4_splat(*a_ptr.add((i + 1) * k + kk));
+                        let a2 = f32x4_splat(*a_ptr.add((i + 2) * k + kk));
+                        let a3 = f32x4_splat(*a_ptr.add((i + 3) * k + kk));
+                        let b_base = kk * n + j;
+                        let b0 = v128_load(b_ptr.add(b_base) as *const v128);
+                        let b1 = v128_load(b_ptr.add(b_base + 4) as *const v128);
+                        acc00 = f32x4_relaxed_madd(a0, b0, acc00);
+                        acc01 = f32x4_relaxed_madd(a0, b1, acc01);
+                        acc10 = f32x4_relaxed_madd(a1, b0, acc10);
+                        acc11 = f32x4_relaxed_madd(a1, b1, acc11);
+                        acc20 = f32x4_relaxed_madd(a2, b0, acc20);
+                        acc21 = f32x4_relaxed_madd(a2, b1, acc21);
+                        acc30 = f32x4_relaxed_madd(a3, b0, acc30);
+                        acc31 = f32x4_relaxed_madd(a3, b1, acc31);
+                        kk += 1;
+                    }
+
+                    // Store results
+                    v128_store(c_ptr.add((i + 0) * n + j) as *mut v128, acc00);
+                    v128_store(c_ptr.add((i + 0) * n + j + 4) as *mut v128, acc01);
+                    v128_store(c_ptr.add((i + 1) * n + j) as *mut v128, acc10);
+                    v128_store(c_ptr.add((i + 1) * n + j + 4) as *mut v128, acc11);
+                    v128_store(c_ptr.add((i + 2) * n + j) as *mut v128, acc20);
+                    v128_store(c_ptr.add((i + 2) * n + j + 4) as *mut v128, acc21);
+                    v128_store(c_ptr.add((i + 3) * n + j) as *mut v128, acc30);
+                    v128_store(c_ptr.add((i + 3) * n + j + 4) as *mut v128, acc31);
+
+                    j += NR;
+                }
+                // N remainder (columns not divisible by 8)
+                while j < n {
+                    for ii in 0..MR {
+                        let mut sum = 0.0f32;
+                        for kk in 0..k {
+                            sum += *a_ptr.add((i + ii) * k + kk) * *b_ptr.add(kk * n + j);
+                        }
+                        *c_ptr.add((i + ii) * n + j) = sum;
+                    }
+                    j += 1;
+                }
+                i += MR;
+            }
+            // M remainder (rows not divisible by 4)
+            while i < m_end {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for kk in 0..k {
+                        sum += *a_ptr.add(i * k + kk) * *b_ptr.add(kk * n + j);
+                    }
+                    *c_ptr.add(i * n + j) = sum;
+                }
+                i += 1;
+            }
+        }
+    });
+
+    c
+}
+
 /// This version fixes the efficiency issue where each thread was redundantly packing B.
 /// Now: pack B once upfront, share across threads, distribute M-rows via futex.
 ///
@@ -3382,13 +3530,20 @@ pub fn matmul_futex_f32_tiled(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
 
     let num_threads = pthreadpool_rs::wasm_futex::threads_count();
 
-    // Shape-aware parallel decision - raised threshold since parallel
-    // overhead dominates at small sizes even with low dispatch latency
+    // Shape-aware parallel decision
     let total_elements = (m as u64) * (n as u64) * (k as u64);
-    // Only parallelize at 512³ or larger (was 256³)
-    // At 256³ we're ~0.6x vs tfjs due to packing overhead
-    if total_elements < (512u64 * 512 * 512) {
+
+    // For very small matrices (<128³), single-threaded is fastest
+    // dispatch overhead (~16μs) > parallel benefit at this scale
+    if total_elements < (128u64 * 128 * 128) {
         return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // For medium matrices (128³ to 384³), parallel WITHOUT B-packing
+    // Avoid packing overhead, accept slightly worse cache behavior
+    // 384³ threshold: at 512, packing is ~250μs but helps cache efficiency
+    if total_elements < (384u64 * 384 * 384) {
+        return matmul_futex_f32_no_pack(pool, a, b, m, n, k, num_threads);
     }
 
     // Heuristic with futex's lower overhead + B-packing cost

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Minimal WASM Dispatch Benchmark</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+    .result { margin: 10px 0; padding: 10px; background: #16213e; border-radius: 4px; }
+    .good { border-left: 4px solid #0f3; }
+    .bad { border-left: 4px solid #f30; }
+    button { padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; }
+    pre { background: #0f0f23; padding: 15px; border-radius: 4px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Minimal WASM Futex Dispatch Benchmark</h1>
+  <p>Testing theoretical minimum overhead for thread dispatch coordination</p>
+
+  <div>
+    <button onclick="runBenchmark()">Run Dispatch Benchmark</button>
+    <button onclick="runWithWorkers()">Run With Real Workers</button>
+  </div>
+
+  <div id="results"></div>
+  <pre id="log"></pre>
+
+  <script>
+    const log = (msg) => {
+      document.getElementById('log').textContent += msg + '\n';
+      console.log(msg);
+    };
+
+    const clearLog = () => {
+      document.getElementById('log').textContent = '';
+    };
+
+    let wasmModule = null;
+    let memory = null;
+    let workers = [];
+
+    async function loadWasm() {
+      // Create shared memory (1 page = 64KB)
+      memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+
+      const response = await fetch('minimal_dispatch.wasm');
+      const bytes = await response.arrayBuffer();
+
+      const importObject = {
+        env: { memory }
+      };
+
+      const result = await WebAssembly.instantiate(bytes, importObject);
+      wasmModule = result.instance.exports;
+
+      log('✓ WASM module loaded');
+      log(`  Memory: ${memory.buffer.byteLength} bytes (shared: ${memory.buffer instanceof SharedArrayBuffer})`);
+    }
+
+    // Benchmark main-thread-only dispatch coordination (no actual workers)
+    async function runBenchmark() {
+      clearLog();
+      if (!wasmModule) await loadWasm();
+
+      log('\n=== Main-Thread-Only Dispatch Coordination ===');
+      log('Measuring: dispatch_start() + immediate completion signal\n');
+
+      const n_threads = 14;
+      const iterations = 10000;
+
+      // Warm up
+      for (let i = 0; i < 100; i++) {
+        wasmModule.reset();
+        wasmModule.dispatch_start(n_threads);
+        // Simulate instant completion (main thread does all work)
+        const view = new Int32Array(memory.buffer);
+        Atomics.store(view, 1, 0); // Set active to 0
+      }
+
+      // Benchmark dispatch_start only (the coordination overhead)
+      const start1 = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        wasmModule.dispatch_start(n_threads);
+        // Simulate instant completion
+        const view = new Int32Array(memory.buffer);
+        Atomics.store(view, 1, 0);
+      }
+      const time1 = performance.now() - start1;
+
+      log(`dispatch_start() only: ${(time1 / iterations * 1000).toFixed(2)} μs/call`);
+      log(`  Total time for ${iterations} iterations: ${time1.toFixed(2)} ms`);
+
+      // Benchmark dispatch_start + dispatch_wait (full round-trip)
+      wasmModule.reset();
+      const start2 = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        wasmModule.dispatch_start(n_threads);
+        // Simulate instant completion from main thread perspective
+        const view = new Int32Array(memory.buffer);
+        Atomics.store(view, 1, 0);
+        wasmModule.dispatch_wait();
+      }
+      const time2 = performance.now() - start2;
+
+      log(`\ndispatch_start() + dispatch_wait(): ${(time2 / iterations * 1000).toFixed(2)} μs/call`);
+      log(`  This is the coordination overhead WITHOUT actual worker wakeup\n`);
+
+      // Compare to JS atomics directly
+      const view = new Int32Array(memory.buffer);
+      const start3 = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        Atomics.add(view, 0, 1);  // Bump generation
+        Atomics.notify(view, 0);  // Wake workers
+        Atomics.store(view, 1, 0); // Simulate done
+      }
+      const time3 = performance.now() - start3;
+
+      log(`Pure JS Atomics equivalent: ${(time3 / iterations * 1000).toFixed(2)} μs/call`);
+      log(`  (Atomics.add + Atomics.notify + Atomics.store)\n`);
+
+      showResult('Main-thread coordination', time2 / iterations * 1000, 5);
+    }
+
+    // Run with actual Web Workers to measure real dispatch latency
+    async function runWithWorkers() {
+      clearLog();
+      if (!wasmModule) await loadWasm();
+
+      log('\n=== Full Dispatch With Real Workers ===');
+
+      const n_workers = navigator.hardwareConcurrency - 1;
+      log(`Spawning ${n_workers} workers...`);
+
+      // Terminate any existing workers
+      workers.forEach(w => w.terminate());
+      workers = [];
+
+      // Create worker code as a blob
+      const workerCode = `
+        let wasm = null;
+        let memory = null;
+        let workerId = -1;
+
+        self.onmessage = async (e) => {
+          if (e.data.type === 'init') {
+            workerId = e.data.workerId;
+            memory = e.data.memory;
+
+            const response = await fetch(e.data.wasmUrl);
+            const bytes = await response.arrayBuffer();
+            const result = await WebAssembly.instantiate(bytes, { env: { memory } });
+            wasm = result.instance.exports;
+
+            self.postMessage({ type: 'ready', workerId });
+
+            // Start worker loop
+            workerLoop();
+          }
+        };
+
+        function workerLoop() {
+          let lastGen = 0;
+
+          // Continuous spin loop - no setTimeout delays
+          while (true) {
+            // Wait for new generation (this is what we're benchmarking)
+            // worker_wait spins then futex waits
+            const newGen = wasm.worker_wait(lastGen);
+            lastGen = newGen;
+
+            // Signal done
+            wasm.worker_done();
+          }
+        }
+      `;
+
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(blob);
+
+      // Get absolute URL for WASM
+      const wasmUrl = new URL('minimal_dispatch.wasm', location.href).href;
+
+      // Spawn workers
+      let readyCount = 0;
+      const workersReady = new Promise(resolve => {
+        for (let i = 0; i < n_workers; i++) {
+          const worker = new Worker(workerUrl, { type: 'module' });
+          workers.push(worker);
+
+          worker.onmessage = (e) => {
+            if (e.data.type === 'ready') {
+              readyCount++;
+              if (readyCount === n_workers) {
+                resolve();
+              }
+            }
+          };
+
+          worker.postMessage({
+            type: 'init',
+            workerId: i + 1, // Worker IDs 1..n, main thread is 0
+            memory: memory,
+            wasmUrl: wasmUrl
+          });
+        }
+      });
+
+      await workersReady;
+      log(`✓ All ${n_workers} workers ready\n`);
+
+      // Now benchmark full dispatch round-trip
+      const iterations = 1000;
+
+      // Warm up
+      log('Warming up...');
+      for (let i = 0; i < 50; i++) {
+        const n_threads = n_workers + 1;
+        wasmModule.dispatch_start(n_threads);
+        wasmModule.worker_done(); // Main thread's share
+        wasmModule.dispatch_wait();
+        // Small delay to let workers complete
+        await new Promise(r => setTimeout(r, 1));
+      }
+
+      log(`Running ${iterations} dispatches...`);
+      const times = [];
+
+      for (let i = 0; i < iterations; i++) {
+        const n_threads = n_workers + 1;
+
+        const start = performance.now();
+        wasmModule.dispatch_start(n_threads);
+        wasmModule.worker_done(); // Main thread completes immediately
+        wasmModule.dispatch_wait();
+        const elapsed = performance.now() - start;
+
+        times.push(elapsed);
+
+        // Small delay between iterations
+        if (i % 100 === 0) {
+          await new Promise(r => setTimeout(r, 1));
+        }
+      }
+
+      // Stats
+      times.sort((a, b) => a - b);
+      const median = times[Math.floor(times.length / 2)];
+      const p95 = times[Math.floor(times.length * 0.95)];
+      const p99 = times[Math.floor(times.length * 0.99)];
+      const mean = times.reduce((a, b) => a + b, 0) / times.length;
+      const min = times[0];
+      const max = times[times.length - 1];
+
+      log('\n=== Results ===');
+      log(`Threads: ${n_workers + 1} (1 main + ${n_workers} workers)`);
+      log(`Iterations: ${iterations}`);
+      log(`\nDispatch latency (ms):`);
+      log(`  Min:    ${(min * 1000).toFixed(2)} μs`);
+      log(`  Median: ${(median * 1000).toFixed(2)} μs`);
+      log(`  Mean:   ${(mean * 1000).toFixed(2)} μs`);
+      log(`  P95:    ${(p95 * 1000).toFixed(2)} μs`);
+      log(`  P99:    ${(p99 * 1000).toFixed(2)} μs`);
+      log(`  Max:    ${(max * 1000).toFixed(2)} μs`);
+
+      showResult('Full dispatch with workers', median * 1000, 5);
+
+      // Cleanup
+      workers.forEach(w => w.terminate());
+      workers = [];
+      URL.revokeObjectURL(workerUrl);
+    }
+
+    function showResult(name, value, target) {
+      const div = document.createElement('div');
+      div.className = 'result ' + (value <= target ? 'good' : 'bad');
+      div.innerHTML = `
+        <strong>${name}:</strong> ${value.toFixed(2)} μs
+        (target: ${target} μs)
+        ${value <= target ? '✓' : '✗'}
+      `;
+      document.getElementById('results').appendChild(div);
+    }
+
+    // Auto-load
+    loadWasm().catch(e => log('Error loading WASM: ' + e));
+  </script>
+</body>
+</html>
