@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>rumpy-ts Feature Tests</title>
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        .pass { color: green; }
+        .fail { color: red; }
+        .section { margin: 20px 0; border-top: 1px solid #ccc; padding-top: 10px; }
+        pre { background: #f5f5f5; padding: 10px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>rumpy-ts Feature Tests</h1>
+    <div id="output"></div>
+    <script type="module">
+        import init, * as rumpy from './pkg-web/rumpy_wasm.js';
+
+        const output = document.getElementById('output');
+        let passed = 0, failed = 0;
+
+        function log(msg, isPass = null) {
+            const div = document.createElement('div');
+            if (isPass === true) {
+                div.className = 'pass';
+                div.textContent = '✓ ' + msg;
+                passed++;
+            } else if (isPass === false) {
+                div.className = 'fail';
+                div.textContent = '✗ ' + msg;
+                failed++;
+            } else {
+                div.textContent = msg;
+            }
+            output.appendChild(div);
+        }
+
+        function section(name) {
+            const div = document.createElement('div');
+            div.className = 'section';
+            div.innerHTML = `<h2>${name}</h2>`;
+            output.appendChild(div);
+        }
+
+        function assertClose(actual, expected, tol = 1e-6, msg = '') {
+            // Convert BigInt to Number if needed
+            const actualNum = typeof actual === 'bigint' ? Number(actual) : actual;
+            const expectedNum = typeof expected === 'bigint' ? Number(expected) : expected;
+            const diff = Math.abs(actualNum - expectedNum);
+            if (diff <= tol) {
+                log(`${msg}: ${actualNum} ≈ ${expectedNum}`, true);
+            } else {
+                log(`${msg}: expected ${expectedNum}, got ${actualNum} (diff=${diff})`, false);
+            }
+        }
+
+        function assertArrayClose(actual, expected, tol = 1e-6, msg = '') {
+            if (actual.length !== expected.length) {
+                log(`${msg}: length mismatch ${actual.length} vs ${expected.length}`, false);
+                return;
+            }
+            let maxDiff = 0;
+            for (let i = 0; i < actual.length; i++) {
+                maxDiff = Math.max(maxDiff, Math.abs(actual[i] - expected[i]));
+            }
+            if (maxDiff < tol) {
+                log(`${msg}: arrays match (maxDiff=${maxDiff.toExponential(2)})`, true);
+            } else {
+                log(`${msg}: arrays differ (maxDiff=${maxDiff})`, false);
+                console.log('actual:', actual);
+                console.log('expected:', expected);
+            }
+        }
+
+        function assertShape(arr, expected, msg = '') {
+            const actual = Array.from(arr.shape);
+            if (JSON.stringify(actual) === JSON.stringify(expected)) {
+                log(`${msg}: shape ${JSON.stringify(actual)}`, true);
+            } else {
+                log(`${msg}: expected shape ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`, false);
+            }
+        }
+
+        async function runTests() {
+            await init();
+            log('WASM initialized');
+
+            // ===================== SPRINT 1: Structural =====================
+            section('Sprint 1: Structural Operations');
+
+            // Test permute
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1,2,3,4,5,6]), [2,3]);
+                const permuted = arr.permute([1, 0]);
+                assertShape(permuted, [3, 2], 'permute([1,0]) shape');
+                const data = permuted.toTypedArray();
+                assertArrayClose(data, [1, 4, 2, 5, 3, 6], 1e-10, 'permute([1,0]) data');
+            }
+
+            // Test sumAxis
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1,2,3,4,5,6]), [2,3]);
+                const sumAxis0 = arr.sumAxis(0, false);
+                assertShape(sumAxis0, [3], 'sumAxis(0) shape');
+                assertArrayClose(sumAxis0.toTypedArray(), [5, 7, 9], 1e-10, 'sumAxis(0) values');
+
+                const sumAxis1 = arr.sumAxis(1, false);
+                assertShape(sumAxis1, [2], 'sumAxis(1) shape');
+                assertArrayClose(sumAxis1.toTypedArray(), [6, 15], 1e-10, 'sumAxis(1) values');
+
+                const sumAxis0Keepdims = arr.sumAxis(0, true);
+                assertShape(sumAxis0Keepdims, [1, 3], 'sumAxis(0, keepdims) shape');
+            }
+
+            // Test meanAxis
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1,2,3,4,5,6]), [2,3]);
+                const meanAxis0 = arr.meanAxis(0, false);
+                assertArrayClose(meanAxis0.toTypedArray(), [2.5, 3.5, 4.5], 1e-10, 'meanAxis(0) values');
+            }
+
+            // Test maxAxis / minAxis
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1,5,3,4,2,6]), [2,3]);
+                const maxAxis1 = arr.maxAxis(1, false);
+                assertArrayClose(maxAxis1.toTypedArray(), [5, 6], 1e-10, 'maxAxis(1) values');
+                const minAxis1 = arr.minAxis(1, false);
+                assertArrayClose(minAxis1.toTypedArray(), [1, 2], 1e-10, 'minAxis(1) values');
+            }
+
+            // Test softmax
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1, 2, 3]), [1, 3]);
+                const sm = arr.softmax(1);
+                const data = sm.toTypedArray();
+                // softmax should sum to 1
+                const sum = data[0] + data[1] + data[2];
+                assertClose(sum, 1.0, 1e-6, 'softmax sums to 1');
+                // values should be in increasing order
+                if (data[0] < data[1] && data[1] < data[2]) {
+                    log('softmax ordering correct (increasing)', true);
+                } else {
+                    log('softmax ordering incorrect', false);
+                }
+            }
+
+            // Test relu
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([-2, -1, 0, 1, 2]), [5]);
+                const r = arr.relu();
+                assertArrayClose(r.toTypedArray(), [0, 0, 0, 1, 2], 1e-10, 'relu values');
+            }
+
+            // Test gelu
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([0, 1, -1]), [3]);
+                const g = arr.gelu();
+                const data = g.toTypedArray();
+                assertClose(data[0], 0, 1e-6, 'gelu(0)');
+                // gelu(1) ≈ 0.841
+                assertClose(data[1], 0.841, 0.01, 'gelu(1)');
+                // gelu(-1) ≈ -0.159
+                assertClose(data[2], -0.159, 0.01, 'gelu(-1)');
+            }
+
+            // Test argmax/argmin
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([3, 1, 4, 1, 5, 9, 2, 6]), [8]);
+                const maxIdx = arr.argmax();
+                const minIdx = arr.argmin();
+                assertClose(maxIdx, 5, 0, 'argmax index');
+                assertClose(minIdx, 1, 0, 'argmin index');
+            }
+
+            // ===================== SPRINT 2: CNN Operations =====================
+            section('Sprint 2: CNN Operations');
+
+            // Test slice
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([0,1,2,3,4,5,6,7,8,9]), [10]);
+                // slice [2:5]
+                const sliced = arr.slice([2], [5], [1]);
+                assertShape(sliced, [3], 'slice [2:5] shape');
+                assertArrayClose(sliced.toTypedArray(), [2, 3, 4], 1e-10, 'slice [2:5] values');
+            }
+
+            // Test slice with negative indices
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([0,1,2,3,4,5,6,7,8,9]), [10]);
+                // slice [-3:] (last 3 elements)
+                const sliced = arr.slice([-3], [2147483647], [1]);
+                assertShape(sliced, [3], 'slice [-3:] shape');
+                assertArrayClose(sliced.toTypedArray(), [7, 8, 9], 1e-10, 'slice [-3:] values');
+            }
+
+            // Test sliceAxis
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([
+                    1,2,3,4,5,
+                    6,7,8,9,10,
+                    11,12,13,14,15
+                ]), [3, 5]);
+                const sliced = arr.sliceAxis(1, 1, 4);
+                assertShape(sliced, [3, 3], 'sliceAxis shape');
+                assertArrayClose(sliced.toTypedArray(), [2,3,4, 7,8,9, 12,13,14], 1e-10, 'sliceAxis values');
+            }
+
+            // Test im2col (basic)
+            {
+                // 1x1x4x4 image, 2x2 kernel, stride 1, no padding
+                const img = rumpy.arrayFromTyped(new Float64Array([
+                    1,2,3,4,
+                    5,6,7,8,
+                    9,10,11,12,
+                    13,14,15,16
+                ]), [1, 1, 4, 4]);
+                const col = img.im2col(2, 2, 1, 1, 0, 0);
+                // Output should be (9, 4) - 9 patches, each 2x2=4 elements
+                assertShape(col, [9, 4], 'im2col shape');
+                // First patch is top-left 2x2
+                const data = col.toTypedArray();
+                assertArrayClose([data[0], data[1], data[2], data[3]], [1, 2, 5, 6], 1e-10, 'im2col first patch');
+            }
+
+            // Test maxPool2d
+            {
+                const img = rumpy.arrayFromTyped(new Float64Array([
+                    1,2,3,4,
+                    5,6,7,8,
+                    9,10,11,12,
+                    13,14,15,16
+                ]), [1, 1, 4, 4]);
+                const pooled = img.maxPool2d(2, 2, 2, 2, 0, 0);
+                assertShape(pooled, [1, 1, 2, 2], 'maxPool2d shape');
+                assertArrayClose(pooled.toTypedArray(), [6, 8, 14, 16], 1e-10, 'maxPool2d values');
+            }
+
+            // Test avgPool2d
+            {
+                const img = rumpy.arrayFromTyped(new Float64Array([
+                    1,2,3,4,
+                    5,6,7,8,
+                    9,10,11,12,
+                    13,14,15,16
+                ]), [1, 1, 4, 4]);
+                const pooled = img.avgPool2d(2, 2, 2, 2, 0, 0);
+                assertShape(pooled, [1, 1, 2, 2], 'avgPool2d shape');
+                // avg of [1,2,5,6] = 3.5, [3,4,7,8] = 5.5, etc
+                assertArrayClose(pooled.toTypedArray(), [3.5, 5.5, 11.5, 13.5], 1e-10, 'avgPool2d values');
+            }
+
+            // ===================== SPRINT 3: Boolean Masking =====================
+            section('Sprint 3: Boolean Masking');
+
+            // Test gtScalar
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1, 2, 3, 4, 5]), [5]);
+                const mask = arr.gtScalar(3);
+                assertArrayClose(mask.toTypedArray(), [0, 0, 0, 1, 1], 1e-10, 'gtScalar(3)');
+            }
+
+            // Test getByMask
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1, 2, 3, 4, 5]), [5]);
+                const mask = arr.gtScalar(2);
+                const selected = arr.getByMask(mask);
+                assertArrayClose(selected.toTypedArray(), [3, 4, 5], 1e-10, 'getByMask(x > 2)');
+            }
+
+            // Test setByMask
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1, 2, 3, 4, 5]), [5]);
+                const mask = arr.gtScalar(3);
+                const result = arr.setByMask(mask, 0);
+                assertArrayClose(result.toTypedArray(), [1, 2, 3, 0, 0], 1e-10, 'setByMask(x > 3, 0)');
+            }
+
+            // Test where_
+            {
+                const cond = rumpy.arrayFromTyped(new Float64Array([1, 0, 1, 0, 1]), [5]);
+                const x = rumpy.arrayFromTyped(new Float64Array([10, 20, 30, 40, 50]), [5]);
+                const y = rumpy.arrayFromTyped(new Float64Array([1, 2, 3, 4, 5]), [5]);
+                const result = rumpy.where_(cond, x, y);
+                assertArrayClose(result.toTypedArray(), [10, 2, 30, 4, 50], 1e-10, 'where_');
+            }
+
+            // Test eq/ne comparisons
+            {
+                const a = rumpy.arrayFromTyped(new Float64Array([1, 2, 3]), [3]);
+                const b = rumpy.arrayFromTyped(new Float64Array([1, 5, 3]), [3]);
+                const eqResult = a.eq(b);
+                assertArrayClose(eqResult.toTypedArray(), [1, 0, 1], 1e-10, 'eq comparison');
+                const neResult = a.ne(b);
+                assertArrayClose(neResult.toTypedArray(), [0, 1, 0], 1e-10, 'ne comparison');
+            }
+
+            // Test isNan/isInf
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([1, NaN, Infinity, -Infinity, 0]), [5]);
+                const nanMask = arr.isNan();
+                assertArrayClose(nanMask.toTypedArray(), [0, 1, 0, 0, 0], 1e-10, 'isNan');
+                const infMask = arr.isInf();
+                assertArrayClose(infMask.toTypedArray(), [0, 0, 1, 1, 0], 1e-10, 'isInf');
+            }
+
+            // Test clip
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([-5, 0, 5, 10, 15]), [5]);
+                const clipped = arr.clip(0, 10);
+                assertArrayClose(clipped.toTypedArray(), [0, 0, 5, 10, 10], 1e-10, 'clip(0, 10)');
+            }
+
+            // Test countNonzero
+            {
+                const arr = rumpy.arrayFromTyped(new Float64Array([0, 1, 0, 2, 0, 3]), [6]);
+                const count = arr.countNonzero();
+                assertClose(count, 3, 0, 'countNonzero');
+            }
+
+            // ===================== Summary =====================
+            section('Summary');
+            log(`Passed: ${passed}, Failed: ${failed}`);
+            if (failed === 0) {
+                log('All tests passed!', true);
+            } else {
+                log(`${failed} tests failed`, false);
+            }
+        }
+
+        runTests().catch(e => {
+            log('Error: ' + e.message, false);
+            console.error(e);
+        });
+    </script>
+</body>
+</html>
