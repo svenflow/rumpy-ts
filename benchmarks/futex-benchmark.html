@@ -46,9 +46,10 @@
         const iters = 5;
         const results = [];
 
-        log('\n=== BENCHMARK: Futex Pool vs TensorFlow.js WASM ===\n');
-        log('Size | ST | Futex | tfjs | Speedup | vs tfjs');
-        log('-----|-----|-------|------|---------|--------');
+        log('\n=== BENCHMARK: Rumpy vs TensorFlow.js WASM ===\n');
+        log('Note: Futex path autotunes - small sizes fall back to ST\n');
+        log('Size | ST | Auto | tfjs | ST/tfjs | Auto/tfjs');
+        log('-----|-----|------|------|---------|----------');
 
         for (const n of sizes) {
           const a = new Float32Array(n*n).map(() => Math.random());
@@ -89,32 +90,34 @@
           tA.dispose();
           tB.dispose();
 
-          const speedup = (stTime / futexTime).toFixed(2);
-          const vsFutexTfjs = (tfjsTime / futexTime).toFixed(2);
+          // Auto path: use futex result (it autoselects ST for small sizes)
+          const stVsTfjs = (tfjsTime / stTime).toFixed(2);
+          const autoVsTfjs = (tfjsTime / futexTime).toFixed(2);
 
           const row = {
             size: n,
             st: stTime,
-            futex: futexTime,
+            auto: futexTime,
             tfjs: tfjsTime,
-            speedup: speedup,
-            futexVsTfjs: vsFutexTfjs
+            stVsTfjs: stVsTfjs,
+            autoVsTfjs: autoVsTfjs
           };
           results.push(row);
 
           log(
             n.toString().padStart(4) + ' | ' +
             stTime.toFixed(1).padStart(3) + 'ms | ' +
-            futexTime.toFixed(1).padStart(5) + 'ms | ' +
+            futexTime.toFixed(1).padStart(4) + 'ms | ' +
             tfjsTime.toFixed(1).padStart(4) + 'ms | ' +
-            speedup.padStart(7) + 'x | ' +
-            vsFutexTfjs.padStart(6) + 'x'
+            stVsTfjs.padStart(7) + 'x | ' +
+            autoVsTfjs.padStart(9) + 'x'
           );
         }
 
         log('\n=== ANALYSIS ===');
-        log('Futex beats Rayon when > 1.00x');
-        log('Futex beats tfjs when > 1.00x');
+        log('ST/tfjs > 1.00 = our ST beats tfjs');
+        log('Auto/tfjs > 1.00 = our autotuned path beats tfjs');
+        log('Values > 1.00 mean rumpy is faster\n');
 
         window.BENCHMARK_RESULTS = results;
         log('\nDONE - results in window.BENCHMARK_RESULTS');
