@@ -57,9 +57,10 @@
         const results = [];
 
         log('\n=== BENCHMARK: Rumpy vs TensorFlow.js WASM ===\n');
-        log('Note: Futex path autotunes - small sizes fall back to ST\n');
-        log('Size | ST | Auto | tfjs | ST/tfjs | Auto/tfjs');
-        log('-----|-----|------|------|---------|----------');
+        log('INFERENCE MODE: both pre-pack B (fair apples-to-apples)');
+        log('AD-HOC MODE: we pack each call, tfjs creates fresh tensors\n');
+        log('Size | Packed | tfjs-Inf | ratio | Ad-hoc |  tfjs-Adhoc');
+        log('-----|--------|----------|-------|--------|------------');
 
         for (const n of sizes) {
           const a = new Float32Array(n*n).map(() => Math.random());
@@ -79,12 +80,25 @@
             stTime = Math.min(stTime, performance.now() - start);
           }
 
-          // Benchmark futex
+          // Benchmark futex (our default path - packs B each call)
           let futexTime = Infinity;
           for (let i = 0; i < iters; i++) {
             const start = performance.now();
             mod.matmulF32Futex(a, b, n, n, n);
             futexTime = Math.min(futexTime, performance.now() - start);
+          }
+
+          // Benchmark with pre-packed B (matches tfjs inference model)
+          let packedTime = Infinity;
+          if (mod.packBForGemm && mod.matmulWithPackedB && n >= 128) {
+            // Pre-pack B once (not timed - this is "compile time")
+            const packedB = mod.packBForGemm(b, n, n);
+            // Time the matmul with pre-packed B
+            for (let i = 0; i < iters; i++) {
+              const start = performance.now();
+              mod.matmulWithPackedB(a, packedB, n, n, n);
+              packedTime = Math.min(packedTime, performance.now() - start);
+            }
           }
 
           // Also benchmark forced-parallel (skip threshold check)
@@ -97,47 +111,85 @@
             }
           }
 
-          // Benchmark tfjs
-          let tfjsTime = Infinity;
+          // Benchmark tfjs - two scenarios:
+          // 1. "Inference" mode: reuse tensors (tfjs pre-packs)
+          // 2. "Ad-hoc" mode: fresh tensors each time (both pay creation cost)
+
+          // INFERENCE MODE: tfjs reuses pre-packed tensors
+          let tfjsInferenceTime = Infinity;
           for (let i = 0; i < iters; i++) {
             const start = performance.now();
             const res = tf.matMul(tA, tB);
             res.dataSync();
             res.dispose();
-            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+            tfjsInferenceTime = Math.min(tfjsInferenceTime, performance.now() - start);
           }
+
+          // AD-HOC MODE: tfjs creates fresh tensors (pays creation cost)
+          let tfjsAdhocTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const tA_fresh = tf.tensor2d(Array.from(a), [n, n]);
+            const tB_fresh = tf.tensor2d(Array.from(b), [n, n]);
+            const res = tf.matMul(tA_fresh, tB_fresh);
+            res.dataSync();
+            res.dispose();
+            tA_fresh.dispose();
+            tB_fresh.dispose();
+            tfjsAdhocTime = Math.min(tfjsAdhocTime, performance.now() - start);
+          }
+
+          // Measure warmup time (tensor creation + first matmul)
+          const warmupStart = performance.now();
+          const tA_warmup = tf.tensor2d(Array.from(a), [n, n]);
+          const tB_warmup = tf.tensor2d(Array.from(b), [n, n]);
+          const resWarmup = tf.matMul(tA_warmup, tB_warmup);
+          resWarmup.dataSync();
+          resWarmup.dispose();
+          tA_warmup.dispose();
+          tB_warmup.dispose();
+          const tfjsWarmupTime = performance.now() - warmupStart;
+
+          // Our warmup (first call with fresh data)
+          const ourWarmupStart = performance.now();
+          mod.matmulF32Futex(a, b, n, n, n);
+          const ourWarmupTime = performance.now() - ourWarmupStart;
 
           tA.dispose();
           tB.dispose();
 
-          // Auto path: use futex result (it autoselects ST for small sizes)
-          const stVsTfjs = (tfjsTime / stTime).toFixed(2);
-          const autoVsTfjs = (tfjsTime / futexTime).toFixed(2);
+          // Compare: our packed vs tfjs inference (both pre-pack B)
+          const packedVsTfjsInf = packedTime !== Infinity
+            ? (tfjsInferenceTime / packedTime).toFixed(2)
+            : 'N/A';
 
           const row = {
             size: n,
-            st: stTime,
+            packed: packedTime,
             auto: futexTime,
-            tfjs: tfjsTime,
-            stVsTfjs: stVsTfjs,
-            autoVsTfjs: autoVsTfjs
+            tfjsInference: tfjsInferenceTime,
+            tfjsAdhoc: tfjsAdhocTime,
+            ourWarmup: ourWarmupTime,
+            tfjsWarmup: tfjsWarmupTime
           };
           results.push(row);
 
+          // Log: Size | OurPacked | tfjs-Inf | ratio | OurAdhoc | tfjs-Adhoc | ratio
+          const packStr = packedTime !== Infinity ? packedTime.toFixed(1) + 'ms' : '  N/A';
           log(
             n.toString().padStart(4) + ' | ' +
-            stTime.toFixed(1).padStart(3) + 'ms | ' +
-            futexTime.toFixed(1).padStart(4) + 'ms | ' +
-            tfjsTime.toFixed(1).padStart(4) + 'ms | ' +
-            stVsTfjs.padStart(7) + 'x | ' +
-            autoVsTfjs.padStart(9) + 'x'
+            packStr.padStart(7) + ' | ' +
+            tfjsInferenceTime.toFixed(1).padStart(6) + 'ms | ' +
+            packedVsTfjsInf.padStart(5) + 'x | ' +
+            futexTime.toFixed(1).padStart(6) + 'ms | ' +
+            tfjsAdhocTime.toFixed(1).padStart(8) + 'ms'
           );
         }
 
         log('\n=== ANALYSIS ===');
-        log('ST/tfjs > 1.00 = our ST beats tfjs');
-        log('Auto/tfjs > 1.00 = our autotuned path beats tfjs');
-        log('Values > 1.00 mean rumpy is faster\n');
+        log('vs-Inf > 1.00 = we beat tfjs inference mode');
+        log('vs-Adhoc > 1.00 = we beat tfjs ad-hoc mode');
+        log('Warmup = first call time (us / tfjs)\n');
 
         window.BENCHMARK_RESULTS = results;
         log('\nDONE - results in window.BENCHMARK_RESULTS');

@@ -1959,6 +1959,70 @@ pub fn matmul_f32_optimized(a: &Float32Array, b: &Float32Array, m: usize, n: usi
     }
 }
 
+/// Pre-pack B matrix for repeated matmuls with the same weights.
+///
+/// This amortizes packing cost across multiple matmuls (like tfjs inference mode).
+/// Returns a Float32Array containing the packed B data.
+///
+/// Example:
+/// ```javascript
+/// const packedB = packBForGemm(weights, k, n);
+/// // Later, for each input:
+/// const result = matmulWithPackedB(input, packedB, m, n, k);
+/// ```
+#[wasm_bindgen(js_name = packBForGemm)]
+pub fn pack_b_for_gemm(b: &Float32Array, k: usize, n: usize) -> Float32Array {
+    let b_vec = b.to_vec();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let packed = simd_gemm::pack_b_for_gemm(&b_vec, k, n);
+        Float32Array::from(packed.as_slice())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM: just return the original (no packing needed for native)
+        Float32Array::from(b_vec.as_slice())
+    }
+}
+
+/// GEMM with pre-packed B matrix (inference mode).
+///
+/// Use packBForGemm to create packedB once, then call this for each matmul.
+/// This matches how tfjs/XNNPACK works for inference.
+/// Uses parallel execution via futex pool when available.
+#[wasm_bindgen(js_name = matmulWithPackedB)]
+pub fn matmul_with_packed_b(a: &Float32Array, packed_b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let packed_b_vec = packed_b.to_vec();
+
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "atomics",
+        feature = "futex-pool"
+    ))]
+    {
+        // Use parallel version when futex pool is available
+        let c_vec = simd_gemm::matmul_with_packed_b_parallel_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(all(target_feature = "atomics", feature = "futex-pool"))))]
+    {
+        // Fallback to ST when no futex pool
+        let c_vec = simd_gemm::matmul_with_packed_b_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM: packed_b is just regular B, use normal matmul
+        let c_vec = simd_gemm::matmul_dispatch_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+}
+
 /// Parallel version of optimized 6x8 GEMM using rayon (LEGACY)
 ///
 /// Kept for A/B benchmarking. Has known problems — see v3 below.
