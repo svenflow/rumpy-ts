@@ -56,11 +56,16 @@ pub fn should_parallelize(m: usize, n: usize, k: usize, num_threads: usize) -> b
 
 /// Minimum work threshold - below this, don't even consider parallel.
 /// This is a fast-path to avoid the should_parallelize calculation overhead.
-/// 64³ = 262K FLOPs, takes ~30μs single-threaded, not worth parallelizing.
+///
+/// Raised to 256³ because:
+/// - Thread dispatch overhead (~10-150μs) dominates at small sizes
+/// - B-packing overhead doesn't amortize below ~256
+/// - tfjs uses similar threshold (~512K FLOPs min)
 #[inline]
 pub fn below_parallel_threshold(m: usize, n: usize, k: usize) -> bool {
     // Use u64 to avoid overflow on wasm32
-    (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64)
+    // 256³ = 16.7M elements, ~0.3ms single-threaded
+    (m as u64) * (n as u64) * (k as u64) < (256u64 * 256 * 256)
 }
 
 /// XNNPACK-style 6x8 kernel with vectorized A loading
@@ -3372,15 +3377,23 @@ pub fn matmul_futex_f32_tiled(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
-    // Heuristic with futex's lower overhead
+    // Heuristic with futex's lower overhead + B-packing cost
     let flops = 2u64 * (m as u64) * (n as u64) * (k as u64);
-    const FUTEX_DISPATCH_NS: u64 = 10_000;
+    const FUTEX_DISPATCH_NS: u64 = 10_000;  // ~10μs dispatch overhead
     const GFLOPS_PER_THREAD: u64 = 75;
     const PARALLEL_EFFICIENCY_PCT: u64 = 70;
 
+    // B-packing overhead: ~2 ns/float (load + store + some math)
+    // For small matrices this can dominate!
+    let b_elements = (k as u64) * (n as u64);
+    const PACK_NS_PER_FLOAT: u64 = 2;
+    let pack_overhead_ns = b_elements * PACK_NS_PER_FLOAT;
+
     let time_st_ns = flops / GFLOPS_PER_THREAD;
     let effective_threads = (num_threads as u64 * PARALLEL_EFFICIENCY_PCT) / 100;
-    let time_mt_ns = flops / (effective_threads.max(1) * GFLOPS_PER_THREAD) + FUTEX_DISPATCH_NS;
+    let time_mt_ns = flops / (effective_threads.max(1) * GFLOPS_PER_THREAD)
+                   + FUTEX_DISPATCH_NS
+                   + pack_overhead_ns;
 
     if time_mt_ns >= time_st_ns {
         return matmul_optimized_f32(a, b, m, n, k);
