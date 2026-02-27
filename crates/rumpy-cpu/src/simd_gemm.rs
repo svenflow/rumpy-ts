@@ -2760,6 +2760,186 @@ pub unsafe fn micro_kernel_6x8_fma(
     }
 }
 
+/// K-unrolled 6x8 micro-kernel with optimized pointer handling
+///
+/// Optimizations over basic kernel:
+/// 1. K-unroll by 2: halves loop overhead (11 WASM instructions → 5.5/K)
+/// 2. Incremental pointer bumping: avoids re-deriving A pointers each K
+/// 3. Loop peeling for odd K remainder
+#[cfg(target_arch = "wasm32")]
+#[inline(never)] // Prevent multiple inlined copies with different codegen
+pub unsafe fn micro_kernel_6x8_fma_unrolled(
+    k_size: usize,
+    a_ptr: *const f32,
+    lda: usize,
+    b_packed: *const f32,
+    c_ptr: *mut f32,
+    ldc: usize,
+    beta: f32,
+) {
+    // Setup A row pointers - these will be incremented, not re-derived
+    let mut a0 = a_ptr;
+    let mut a1 = a_ptr.add(lda);
+    let mut a2 = a_ptr.add(lda * 2);
+    let mut a3 = a_ptr.add(lda * 3);
+    let mut a4 = a_ptr.add(lda * 4);
+    let mut a5 = a_ptr.add(lda * 5);
+
+    // 12 accumulators: 6 rows × 2 vectors (8 cols)
+    let mut c00 = f32x4_splat(0.0);
+    let mut c01 = f32x4_splat(0.0);
+    let mut c10 = f32x4_splat(0.0);
+    let mut c11 = f32x4_splat(0.0);
+    let mut c20 = f32x4_splat(0.0);
+    let mut c21 = f32x4_splat(0.0);
+    let mut c30 = f32x4_splat(0.0);
+    let mut c31 = f32x4_splat(0.0);
+    let mut c40 = f32x4_splat(0.0);
+    let mut c41 = f32x4_splat(0.0);
+    let mut c50 = f32x4_splat(0.0);
+    let mut c51 = f32x4_splat(0.0);
+
+    let mut b_run = b_packed;
+    let k_main = k_size / 2 * 2; // Round down to even
+
+    // Main K loop - unrolled by 2
+    let mut kk = 0;
+    while kk < k_main {
+        // === K iteration 0 ===
+        let vb0_0 = v128_load(b_run as *const v128);
+        let vb1_0 = v128_load(b_run.add(4) as *const v128);
+
+        let va0_0 = v128_load32_splat(a0 as *const u32);
+        c00 = f32x4_relaxed_madd(va0_0, vb0_0, c00);
+        c01 = f32x4_relaxed_madd(va0_0, vb1_0, c01);
+
+        let va1_0 = v128_load32_splat(a1 as *const u32);
+        c10 = f32x4_relaxed_madd(va1_0, vb0_0, c10);
+        c11 = f32x4_relaxed_madd(va1_0, vb1_0, c11);
+
+        let va2_0 = v128_load32_splat(a2 as *const u32);
+        c20 = f32x4_relaxed_madd(va2_0, vb0_0, c20);
+        c21 = f32x4_relaxed_madd(va2_0, vb1_0, c21);
+
+        let va3_0 = v128_load32_splat(a3 as *const u32);
+        c30 = f32x4_relaxed_madd(va3_0, vb0_0, c30);
+        c31 = f32x4_relaxed_madd(va3_0, vb1_0, c31);
+
+        let va4_0 = v128_load32_splat(a4 as *const u32);
+        c40 = f32x4_relaxed_madd(va4_0, vb0_0, c40);
+        c41 = f32x4_relaxed_madd(va4_0, vb1_0, c41);
+
+        let va5_0 = v128_load32_splat(a5 as *const u32);
+        c50 = f32x4_relaxed_madd(va5_0, vb0_0, c50);
+        c51 = f32x4_relaxed_madd(va5_0, vb1_0, c51);
+
+        // === K iteration 1 ===
+        let vb0_1 = v128_load(b_run.add(8) as *const v128);
+        let vb1_1 = v128_load(b_run.add(12) as *const v128);
+
+        let va0_1 = v128_load32_splat(a0.add(1) as *const u32);
+        c00 = f32x4_relaxed_madd(va0_1, vb0_1, c00);
+        c01 = f32x4_relaxed_madd(va0_1, vb1_1, c01);
+
+        let va1_1 = v128_load32_splat(a1.add(1) as *const u32);
+        c10 = f32x4_relaxed_madd(va1_1, vb0_1, c10);
+        c11 = f32x4_relaxed_madd(va1_1, vb1_1, c11);
+
+        let va2_1 = v128_load32_splat(a2.add(1) as *const u32);
+        c20 = f32x4_relaxed_madd(va2_1, vb0_1, c20);
+        c21 = f32x4_relaxed_madd(va2_1, vb1_1, c21);
+
+        let va3_1 = v128_load32_splat(a3.add(1) as *const u32);
+        c30 = f32x4_relaxed_madd(va3_1, vb0_1, c30);
+        c31 = f32x4_relaxed_madd(va3_1, vb1_1, c31);
+
+        let va4_1 = v128_load32_splat(a4.add(1) as *const u32);
+        c40 = f32x4_relaxed_madd(va4_1, vb0_1, c40);
+        c41 = f32x4_relaxed_madd(va4_1, vb1_1, c41);
+
+        let va5_1 = v128_load32_splat(a5.add(1) as *const u32);
+        c50 = f32x4_relaxed_madd(va5_1, vb0_1, c50);
+        c51 = f32x4_relaxed_madd(va5_1, vb1_1, c51);
+
+        // Bump pointers by 2 (one unroll iteration)
+        a0 = a0.add(2);
+        a1 = a1.add(2);
+        a2 = a2.add(2);
+        a3 = a3.add(2);
+        a4 = a4.add(2);
+        a5 = a5.add(2);
+        b_run = b_run.add(16); // 2 × 8 floats
+
+        kk += 2;
+    }
+
+    // Handle odd K remainder (if k_size is odd)
+    if k_size & 1 != 0 {
+        let vb0 = v128_load(b_run as *const v128);
+        let vb1 = v128_load(b_run.add(4) as *const v128);
+
+        let va0 = v128_load32_splat(a0 as *const u32);
+        c00 = f32x4_relaxed_madd(va0, vb0, c00);
+        c01 = f32x4_relaxed_madd(va0, vb1, c01);
+
+        let va1 = v128_load32_splat(a1 as *const u32);
+        c10 = f32x4_relaxed_madd(va1, vb0, c10);
+        c11 = f32x4_relaxed_madd(va1, vb1, c11);
+
+        let va2 = v128_load32_splat(a2 as *const u32);
+        c20 = f32x4_relaxed_madd(va2, vb0, c20);
+        c21 = f32x4_relaxed_madd(va2, vb1, c21);
+
+        let va3 = v128_load32_splat(a3 as *const u32);
+        c30 = f32x4_relaxed_madd(va3, vb0, c30);
+        c31 = f32x4_relaxed_madd(va3, vb1, c31);
+
+        let va4 = v128_load32_splat(a4 as *const u32);
+        c40 = f32x4_relaxed_madd(va4, vb0, c40);
+        c41 = f32x4_relaxed_madd(va4, vb1, c41);
+
+        let va5 = v128_load32_splat(a5 as *const u32);
+        c50 = f32x4_relaxed_madd(va5, vb0, c50);
+        c51 = f32x4_relaxed_madd(va5, vb1, c51);
+    }
+
+    // Store results
+    let c0 = c_ptr;
+    let c1 = c_ptr.add(ldc);
+    let c2 = c_ptr.add(ldc * 2);
+    let c3 = c_ptr.add(ldc * 3);
+    let c4 = c_ptr.add(ldc * 4);
+    let c5 = c_ptr.add(ldc * 5);
+
+    if beta == 0.0 {
+        v128_store(c0 as *mut v128, c00);
+        v128_store(c0.add(4) as *mut v128, c01);
+        v128_store(c1 as *mut v128, c10);
+        v128_store(c1.add(4) as *mut v128, c11);
+        v128_store(c2 as *mut v128, c20);
+        v128_store(c2.add(4) as *mut v128, c21);
+        v128_store(c3 as *mut v128, c30);
+        v128_store(c3.add(4) as *mut v128, c31);
+        v128_store(c4 as *mut v128, c40);
+        v128_store(c4.add(4) as *mut v128, c41);
+        v128_store(c5 as *mut v128, c50);
+        v128_store(c5.add(4) as *mut v128, c51);
+    } else {
+        v128_store(c0 as *mut v128, f32x4_add(v128_load(c0 as *const v128), c00));
+        v128_store(c0.add(4) as *mut v128, f32x4_add(v128_load(c0.add(4) as *const v128), c01));
+        v128_store(c1 as *mut v128, f32x4_add(v128_load(c1 as *const v128), c10));
+        v128_store(c1.add(4) as *mut v128, f32x4_add(v128_load(c1.add(4) as *const v128), c11));
+        v128_store(c2 as *mut v128, f32x4_add(v128_load(c2 as *const v128), c20));
+        v128_store(c2.add(4) as *mut v128, f32x4_add(v128_load(c2.add(4) as *const v128), c21));
+        v128_store(c3 as *mut v128, f32x4_add(v128_load(c3 as *const v128), c30));
+        v128_store(c3.add(4) as *mut v128, f32x4_add(v128_load(c3.add(4) as *const v128), c31));
+        v128_store(c4 as *mut v128, f32x4_add(v128_load(c4 as *const v128), c40));
+        v128_store(c4.add(4) as *mut v128, f32x4_add(v128_load(c4.add(4) as *const v128), c41));
+        v128_store(c5 as *mut v128, f32x4_add(v128_load(c5 as *const v128), c50));
+        v128_store(c5.add(4) as *mut v128, f32x4_add(v128_load(c5.add(4) as *const v128), c51));
+    }
+}
+
 /// Handle edge cases where M < 6 or N < 8
 #[cfg(target_arch = "wasm32")]
 unsafe fn micro_kernel_edge(
@@ -2852,7 +3032,8 @@ pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) 
                             let n_rem = j_block - jj;
 
                             if n_rem >= OPT_NR {
-                                micro_kernel_6x8_fma(
+                                // Use K-unrolled kernel for better codegen
+                                micro_kernel_6x8_fma_unrolled(
                                     p_block,
                                     a.as_ptr().add((i + ii) * k + p),
                                     k,
@@ -3004,7 +3185,8 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
                                 let c_ptr = c.as_ptr() as *mut f32;
 
                                 if n_rem >= OPT_NR {
-                                    micro_kernel_6x8_fma(
+                                    // Use K-unrolled kernel
+                                    micro_kernel_6x8_fma_unrolled(
                                         p_block,
                                         a.as_ptr().add((i + ii) * k + p),
                                         k,
@@ -3300,7 +3482,8 @@ pub fn matmul_futex_f32_tiled(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
                                 let n_rem = j_block - jj;
 
                                 if n_rem >= OPT_NR {
-                                    micro_kernel_6x8_fma(
+                                    // Use K-unrolled kernel for better codegen
+                                    micro_kernel_6x8_fma_unrolled(
                                         p_block,
                                         a_ptr.add((i + ii) * k + p),
                                         k,
