@@ -170,6 +170,11 @@ pub struct FutexPool {
     /// 0 → everyone's done.
     active: AtomicU32,
 
+    /// Number of workers that have started their main loop.
+    /// Incremented by each worker (threads 1..n) when they enter `worker_main`.
+    /// When this equals `threads - 1`, all workers are ready.
+    workers_ready: AtomicU32,
+
     /// Per-thread work ranges.
     slots: Box<[Slot]>,
 
@@ -194,6 +199,7 @@ impl FutexPool {
             threads: n,
             generation: AtomicI32::new(0),
             active: AtomicU32::new(0),
+            workers_ready: AtomicU32::new(0),
             slots,
             task: UnsafeCell::new(None),
         }
@@ -324,6 +330,15 @@ impl FutexPool {
 /// next generation bump arrives before the spin runs out, so we *never* hit
 /// `atomic.wait` and the wakeup latency is ~zero.
 fn worker_main(pool: &'static FutexPool, tid: usize) {
+    // Signal that this worker is ready. The main thread can poll `workers_ready`
+    // to know when all workers have started.
+    pool.workers_ready.fetch_add(1, Release);
+
+    // Also wake the main thread's readiness wait (if any).
+    unsafe {
+        memory_atomic_notify(pool.workers_ready.as_ptr() as *mut i32, 1);
+    }
+
     let mut seen_gen = 0i32;
 
     loop {
@@ -441,4 +456,22 @@ pub fn parallelize<F: Fn(usize) + Sync>(pool: &FutexPool, range: usize, task: F)
 /// For benchmark exposure: how many threads (including thread 0) we have.
 pub fn threads_count() -> usize {
     POOL.get().map(|p| p.threads).unwrap_or(1)
+}
+
+/// Check if all workers are ready.
+/// Returns true if all `n-1` workers (where n is the thread count) have started.
+/// Returns false if the pool isn't initialized or not all workers are ready.
+pub fn workers_ready() -> bool {
+    match POOL.get() {
+        Some(p) => {
+            let expected = (p.threads as u32).saturating_sub(1);
+            p.workers_ready.load(Acquire) >= expected
+        }
+        None => false,
+    }
+}
+
+/// Get the number of workers that have started (for debugging).
+pub fn workers_ready_count() -> u32 {
+    POOL.get().map(|p| p.workers_ready.load(Acquire)).unwrap_or(0)
 }

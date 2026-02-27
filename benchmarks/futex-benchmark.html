@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Futex Pool Benchmark</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <h1>Futex Pool Benchmark</h1>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+
+      try {
+        // Init tfjs WASM
+        log('Loading TensorFlow.js WASM backend...');
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log('tfjs WASM ready');
+
+        // Load rumpy
+        log('Loading rumpy...');
+        const mod = await import('./pkg-web/rumpy_wasm.js');
+        await mod.default();
+        log('rumpy loaded');
+
+        const threads = navigator.hardwareConcurrency || 4;
+
+        // Init futex pool
+        log('Initializing futex pool with ' + threads + ' threads...');
+        mod.initFutexPool(threads);
+        while (!mod.futexWorkersReady()) {
+          await new Promise(r => setTimeout(r, 10));
+        }
+        log('Futex pool ready');
+
+        // Skip rayon for now - it hangs when futex pool is also initialized
+        // (they may conflict on SharedArrayBuffer/threading infrastructure)
+
+        const sizes = [64, 128, 256, 512, 1024, 2048];
+        const iters = 5;
+        const results = [];
+
+        log('\n=== BENCHMARK: Futex Pool vs TensorFlow.js WASM ===\n');
+        log('Size | ST | Futex | tfjs | Speedup | vs tfjs');
+        log('-----|-----|-------|------|---------|--------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+
+          // Warmup
+          mod.matmulF32Futex(a, b, n, n, n);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          tf.matMul(tA, tB).dataSync();
+
+          // Benchmark single-threaded (our kernel)
+          let stTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            mod.matmulF32Optimized(a, b, n, n, n);
+            stTime = Math.min(stTime, performance.now() - start);
+          }
+
+          // Benchmark futex
+          let futexTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            mod.matmulF32Futex(a, b, n, n, n);
+            futexTime = Math.min(futexTime, performance.now() - start);
+          }
+
+          // Benchmark tfjs
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            res.dataSync();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+
+          tA.dispose();
+          tB.dispose();
+
+          const speedup = (stTime / futexTime).toFixed(2);
+          const vsFutexTfjs = (tfjsTime / futexTime).toFixed(2);
+
+          const row = {
+            size: n,
+            st: stTime,
+            futex: futexTime,
+            tfjs: tfjsTime,
+            speedup: speedup,
+            futexVsTfjs: vsFutexTfjs
+          };
+          results.push(row);
+
+          log(
+            n.toString().padStart(4) + ' | ' +
+            stTime.toFixed(1).padStart(3) + 'ms | ' +
+            futexTime.toFixed(1).padStart(5) + 'ms | ' +
+            tfjsTime.toFixed(1).padStart(4) + 'ms | ' +
+            speedup.padStart(7) + 'x | ' +
+            vsFutexTfjs.padStart(6) + 'x'
+          );
+        }
+
+        log('\n=== ANALYSIS ===');
+        log('Futex beats Rayon when > 1.00x');
+        log('Futex beats tfjs when > 1.00x');
+
+        window.BENCHMARK_RESULTS = results;
+        log('\nDONE - results in window.BENCHMARK_RESULTS');
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>

@@ -3069,3 +3069,112 @@ pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k
 
     c
 }
+
+/// Parallel GEMM using the raw futex pool (bypasses Rayon entirely).
+///
+/// This achieves much lower dispatch overhead (~5-10μs) compared to Rayon (~150μs)
+/// by using:
+/// - Direct memory.atomic.wait32/notify for worker synchronization
+/// - Spin-then-wait pattern (workers spin ~100μs before parking)
+/// - Main thread participates as thread 0 (no wasted core)
+/// - Single atomic per work item (no chase-lev deques)
+///
+/// Requires the `wasm-futex` feature and calling `init_futex_pool()` from JS first.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub fn matmul_futex_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use pthreadpool_rs::wasm_futex;
+
+    let pool = match wasm_futex::get_pool() {
+        Some(p) => p,
+        None => {
+            // Futex pool not initialized, fall back to single-threaded
+            return matmul_optimized_f32(a, b, m, n, k);
+        }
+    };
+
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    // Shape-aware parallel decision (lower threshold for futex since overhead is lower)
+    // With ~10μs dispatch overhead, we can profitably parallelize smaller matrices
+    if below_parallel_threshold(m, n, k) {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // For futex, adjust the heuristic with lower overhead
+    let flops = 2u64 * (m as u64) * (n as u64) * (k as u64);
+    const FUTEX_DISPATCH_NS: u64 = 10_000; // 10 microseconds (vs 150 for rayon)
+    const GFLOPS_PER_THREAD: u64 = 75;
+    const PARALLEL_EFFICIENCY_PCT: u64 = 65; // Slightly better than rayon
+
+    let time_st_ns = flops / GFLOPS_PER_THREAD;
+    let effective_threads = (num_threads as u64 * PARALLEL_EFFICIENCY_PCT) / 100;
+    let time_mt_ns = flops / (effective_threads.max(1) * GFLOPS_PER_THREAD) + FUTEX_DISPATCH_NS;
+
+    if time_mt_ns >= time_st_ns {
+        return matmul_optimized_f32(a, b, m, n, k);
+    }
+
+    // Pre-allocate output
+    let c = vec![0.0f32; m * n];
+
+    // Calculate rows per thread
+    let rows_per_thread = (m + num_threads - 1) / num_threads;
+
+    // Convert pointers to usize for Send+Sync
+    let a_addr = a.as_ptr() as usize;
+    let b_addr = b.as_ptr() as usize;
+    let c_addr = c.as_ptr() as usize;
+
+    // Number of row chunks to process
+    let num_chunks = (m + rows_per_thread - 1) / rows_per_thread;
+
+    // Dispatch via futex pool
+    pool.parallelize(num_chunks, |chunk_idx| {
+        let start_row = chunk_idx * rows_per_thread;
+        if start_row >= m {
+            return;
+        }
+
+        let end_row = (start_row + rows_per_thread).min(m);
+        let local_m = end_row - start_row;
+
+        unsafe {
+            let a_ptr = a_addr as *const f32;
+            let b_ptr = b_addr as *const f32;
+            let c_ptr = c_addr as *mut f32;
+
+            let a_slice = std::slice::from_raw_parts(a_ptr.add(start_row * k), local_m * k);
+            let b_slice = std::slice::from_raw_parts(b_ptr, k * n);
+            let c_slice = std::slice::from_raw_parts_mut(c_ptr.add(start_row * n), local_m * n);
+
+            matmul_dispatch_f32_into(a_slice, b_slice, c_slice, local_m, n, k);
+        }
+    });
+
+    c
+}
+
+/// Initialize the futex pool with n threads.
+/// Call this from JS before using matmul_futex_f32.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub fn init_futex_pool(n: usize) {
+    pthreadpool_rs::wasm_futex::init(n);
+}
+
+/// Get the number of threads in the futex pool.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "wasm-futex"
+))]
+pub fn futex_threads_count() -> usize {
+    pthreadpool_rs::wasm_futex::threads_count()
+}

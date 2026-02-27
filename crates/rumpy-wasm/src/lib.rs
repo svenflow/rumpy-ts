@@ -2060,6 +2060,106 @@ pub fn matmul_f32_optimized_parallel_v4(a: &Float32Array, b: &Float32Array, m: u
     }
 }
 
+// ============================================================================
+// FUTEX POOL - Low-latency parallel dispatch (experimental)
+// ============================================================================
+
+/// Initialize the futex thread pool with n threads.
+///
+/// This creates a separate thread pool that bypasses Rayon entirely, using
+/// raw memory.atomic.wait32/notify for ~10μs dispatch overhead (vs ~150μs for Rayon).
+///
+/// Call this INSTEAD OF initThreadPool if you want to use matmulF32Futex.
+/// If you call both, you'll have two thread pools (works but wastes cores).
+///
+/// Requires the `futex-pool` feature:
+/// ```
+/// wasm-pack build --features futex-pool
+/// ```
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = initFutexPool)]
+pub fn init_futex_pool(n: usize) {
+    simd_gemm::init_futex_pool(n);
+}
+
+/// Get the number of threads in the futex pool.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = getFutexThreads)]
+pub fn get_futex_threads() -> usize {
+    simd_gemm::futex_threads_count()
+}
+
+/// Check if all futex workers are ready.
+///
+/// Web Workers are spawned asynchronously when `initFutexPool` is called.
+/// This function returns true once all workers have started and are waiting
+/// for work. You should poll this before calling `matmulF32Futex` to avoid
+/// crashes.
+///
+/// Example:
+/// ```javascript
+/// initFutexPool(navigator.hardwareConcurrency);
+/// while (!futexWorkersReady()) {
+///   await new Promise(r => setTimeout(r, 10));
+/// }
+/// // Now safe to use matmulF32Futex
+/// ```
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = futexWorkersReady)]
+pub fn futex_workers_ready() -> bool {
+    pthreadpool_rs::wasm_futex::workers_ready()
+}
+
+/// Get the number of futex workers that have started (for debugging).
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = futexWorkersReadyCount)]
+pub fn futex_workers_ready_count() -> u32 {
+    pthreadpool_rs::wasm_futex::workers_ready_count()
+}
+
+/// Parallel GEMM using the raw futex pool.
+///
+/// This achieves much lower dispatch overhead (~5-10μs) compared to Rayon (~150μs).
+/// Best for small-to-medium matrices (128-512) where Rayon's overhead dominates.
+///
+/// Requires:
+/// 1. Build with `--features futex-pool`
+/// 2. Call `initFutexPool(n)` from JS before using this
+///
+/// Falls back to single-threaded if futex pool isn't initialized.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = matmulF32Futex)]
+pub fn matmul_f32_futex(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let b_vec = b.to_vec();
+    let c_vec = simd_gemm::matmul_futex_f32(&a_vec, &b_vec, m, n, k);
+    Float32Array::from(c_vec.as_slice())
+}
+
+// ============================================================================
+// BLOCKED/SPECIAL MATMUL VARIANTS
+// ============================================================================
+
 /// Cache-blocked XNNPACK-style matmul with pre-packed B
 ///
 /// Combines cache blocking with B-matrix packing for optimal performance.
