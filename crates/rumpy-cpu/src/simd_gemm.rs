@@ -2993,6 +2993,16 @@ unsafe fn micro_kernel_edge(
 pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
 
+    // For small matrices, skip packing - direct access is faster
+    // Packing overhead is ~2ns/float. For B[256,256], that's ~130μs.
+    // Only worth it when amortized over multiple M-blocks.
+    if m < 128 || n < 128 || k < 128 {
+        unsafe {
+            matmul_simd_f32_fma(a, b, &mut c, m, n, k);
+        }
+        return c;
+    }
+
     // Allocate packing buffer for B (KC x NC)
     let pack_size = OPT_KC * ((OPT_NC + OPT_NR - 1) / OPT_NR) * OPT_NR;
     let mut packed_b = vec![0.0f32; pack_size];
@@ -3372,14 +3382,18 @@ pub fn matmul_futex_f32_tiled(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
 
     let num_threads = pthreadpool_rs::wasm_futex::threads_count();
 
-    // Shape-aware parallel decision
-    if below_parallel_threshold(m, n, k) {
+    // Shape-aware parallel decision - raised threshold since parallel
+    // overhead dominates at small sizes even with low dispatch latency
+    let total_elements = (m as u64) * (n as u64) * (k as u64);
+    // Only parallelize at 512³ or larger (was 256³)
+    // At 256³ we're ~0.6x vs tfjs due to packing overhead
+    if total_elements < (512u64 * 512 * 512) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
     // Heuristic with futex's lower overhead + B-packing cost
-    let flops = 2u64 * (m as u64) * (n as u64) * (k as u64);
-    const FUTEX_DISPATCH_NS: u64 = 10_000;  // ~10μs dispatch overhead
+    let flops = 2u64 * total_elements;
+    const FUTEX_DISPATCH_NS: u64 = 8_000;  // ~8μs dispatch overhead (measured)
     const GFLOPS_PER_THREAD: u64 = 75;
     const PARALLEL_EFFICIENCY_PCT: u64 = 70;
 

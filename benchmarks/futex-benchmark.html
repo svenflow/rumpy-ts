@@ -39,6 +39,16 @@
         }
         log('Futex pool ready');
 
+        // Measure dispatch overhead
+        if (mod.measureDispatchOverhead) {
+          const dispatchUs = mod.measureDispatchOverhead(1000);
+          log('Dispatch overhead (with atomic inc): ' + dispatchUs.toFixed(2) + 'μs per call');
+        }
+        if (mod.measurePureDispatchOverhead) {
+          const pureUs = mod.measurePureDispatchOverhead(1000);
+          log('Dispatch overhead (pure sync): ' + pureUs.toFixed(2) + 'μs per call');
+        }
+
         // Skip rayon for now - it hangs when futex pool is also initialized
         // (they may conflict on SharedArrayBuffer/threading infrastructure)
 
@@ -75,6 +85,16 @@
             const start = performance.now();
             mod.matmulF32Futex(a, b, n, n, n);
             futexTime = Math.min(futexTime, performance.now() - start);
+          }
+
+          // Also benchmark forced-parallel (skip threshold check)
+          let forcedParallelTime = Infinity;
+          if (mod.matmulF32FutexForced) {
+            for (let i = 0; i < iters; i++) {
+              const start = performance.now();
+              mod.matmulF32FutexForced(a, b, n, n, n);
+              forcedParallelTime = Math.min(forcedParallelTime, performance.now() - start);
+            }
           }
 
           // Benchmark tfjs

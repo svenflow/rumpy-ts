@@ -2133,6 +2133,85 @@ pub fn futex_workers_ready_count() -> u32 {
     pthreadpool_rs::wasm_futex::workers_ready_count()
 }
 
+/// Measure dispatch overhead by calling parallelize with minimal work.
+/// Returns average dispatch time in microseconds.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = measureDispatchOverhead)]
+pub fn measure_dispatch_overhead(iterations: u32) -> f64 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let pool = match pthreadpool_rs::wasm_futex::get_pool() {
+        Some(p) => p,
+        None => return -1.0, // Pool not initialized
+    };
+
+    // Minimal work function - just increment a counter
+    let counter = AtomicU32::new(0);
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    let start = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    for _ in 0..iterations {
+        pool.parallelize(num_threads, |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    let end = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    let total_ms = end - start;
+    let avg_us = (total_ms * 1000.0) / (iterations as f64);
+    avg_us
+}
+
+/// Measure pure dispatch overhead with no actual work (just coordination).
+/// Returns average dispatch time in microseconds.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = measurePureDispatchOverhead)]
+pub fn measure_pure_dispatch_overhead(iterations: u32) -> f64 {
+    let pool = match pthreadpool_rs::wasm_futex::get_pool() {
+        Some(p) => p,
+        None => return -1.0,
+    };
+
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    let start = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    for _ in 0..iterations {
+        // Dispatch with minimal work - each thread runs once with no-op
+        pool.parallelize(num_threads, |_| {
+            // No-op - just sync overhead
+        });
+    }
+
+    let end = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    let total_ms = end - start;
+    let avg_us = (total_ms * 1000.0) / (iterations as f64);
+    avg_us
+}
+
 /// Parallel GEMM using the raw futex pool.
 ///
 /// This achieves much lower dispatch overhead (~5-10μs) compared to Rayon (~150μs).
