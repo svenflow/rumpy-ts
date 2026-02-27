@@ -527,6 +527,96 @@ add_test("topk transposed 2D k=2", "topk",
           "indices": np.array([idx_t0, idx_t1]).tolist()}, shape=[2, 2])
 
 # Custom JSON encoder to handle NaN/Inf
+# ==================== SPRINT 5: Additional LLM Ops ====================
+
+# Test split
+arr_split = np.arange(12, dtype=np.float64).reshape(2, 6)
+splits = np.split(arr_split, 3, axis=1)
+add_test("split 2x6 into 3 along axis 1", "split",
+         {"data": arr_split.flatten().tolist(), "shape": [2, 6], "num_splits": 3, "axis": 1},
+         splits[0])  # Just test first split for simplicity
+
+# Test chunk (using array_split for uneven)
+arr_chunk = np.arange(10, dtype=np.float64)
+chunks = [arr_chunk[:4], arr_chunk[4:8], arr_chunk[8:]]
+add_test("chunk size 4", "chunk",
+         {"data": arr_chunk.flatten().tolist(), "shape": [10], "chunk_size": 4, "axis": 0},
+         chunks[0])  # Test first chunk
+
+# Test cumsum
+arr_cumsum = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float64)
+add_test("cumsum axis=1", "cumsum",
+         {"data": arr_cumsum.flatten().tolist(), "shape": [2, 3], "axis": 1},
+         np.cumsum(arr_cumsum, axis=1))
+
+add_test("cumsum axis=0", "cumsum",
+         {"data": arr_cumsum.flatten().tolist(), "shape": [2, 3], "axis": 0},
+         np.cumsum(arr_cumsum, axis=0))
+
+# Test cumprod
+add_test("cumprod axis=1", "cumprod",
+         {"data": arr_cumsum.flatten().tolist(), "shape": [2, 3], "axis": 1},
+         np.cumprod(arr_cumsum, axis=1))
+
+# Test tile
+arr_tile = np.array([[1, 2], [3, 4]], dtype=np.float64)
+add_test("tile (2,3)", "tile",
+         {"data": arr_tile.flatten().tolist(), "shape": [2, 2], "reps": [2, 3]},
+         np.tile(arr_tile, (2, 3)))
+
+# Test repeat
+arr_repeat = np.array([1, 2, 3], dtype=np.float64)
+add_test("repeat 3 times", "repeat",
+         {"data": arr_repeat.flatten().tolist(), "shape": [3], "repeats": 3, "axis": None},
+         np.repeat(arr_repeat, 3))
+
+add_test("repeat axis=0", "repeat",
+         {"data": arr_tile.flatten().tolist(), "shape": [2, 2], "repeats": 2, "axis": 0},
+         np.repeat(arr_tile, 2, axis=0))
+
+# Test pad
+arr_pad = np.array([[1, 2], [3, 4]], dtype=np.float64)
+add_test("pad constant", "pad",
+         {"data": arr_pad.flatten().tolist(), "shape": [2, 2],
+          "pad_width": [1, 1, 2, 2], "constant_value": 0},
+         np.pad(arr_pad, ((1, 1), (2, 2)), mode='constant', constant_values=0))
+
+# Test log_softmax (using scipy.special.log_softmax equivalent)
+arr_logsoftmax = np.array([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]], dtype=np.float64)
+# Manual log_softmax for numpy
+def log_softmax_np(x, axis=-1):
+    max_x = np.max(x, axis=axis, keepdims=True)
+    return x - max_x - np.log(np.sum(np.exp(x - max_x), axis=axis, keepdims=True))
+
+add_test("log_softmax axis=1", "logSoftmax",
+         {"data": arr_logsoftmax.flatten().tolist(), "shape": [2, 3], "axis": 1},
+         log_softmax_np(arr_logsoftmax, axis=1))
+
+# Test diff
+arr_diff = np.array([1, 3, 6, 10, 15], dtype=np.float64)
+add_test("diff n=1", "diff",
+         {"data": arr_diff.flatten().tolist(), "shape": [5], "n": 1, "axis": 0},
+         np.diff(arr_diff, n=1))
+
+add_test("diff n=2", "diff",
+         {"data": arr_diff.flatten().tolist(), "shape": [5], "n": 2, "axis": 0},
+         np.diff(arr_diff, n=2))
+
+# Test indexCopy (scatter-like)
+arr_base = np.zeros((5, 3), dtype=np.float64)
+arr_src = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float64)
+indices = np.array([1, 3], dtype=np.float64)
+result_indexcopy = arr_base.copy()
+result_indexcopy[1] = arr_src[0]
+result_indexcopy[3] = arr_src[1]
+add_test("indexCopy axis=0", "indexCopy",
+         {"data": arr_base.flatten().tolist(), "shape": [5, 3],
+          "indices": indices.tolist(), "indices_shape": [2],
+          "src": arr_src.flatten().tolist(), "src_shape": [2, 3],
+          "axis": 0},
+         result_indexcopy)
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.floating):

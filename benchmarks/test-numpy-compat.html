@@ -287,6 +287,63 @@
                     result = rumpy.causalMask(inputs.size);
                     break;
                 }
+                // Sprint 5: Additional LLM ops
+                case 'split': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const splits = arr.split(inputs.num_splits, inputs.axis);
+                    // Return first split for testing
+                    result = splits[0];
+                    break;
+                }
+                case 'chunk': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const chunks = arr.chunk(inputs.chunk_size, inputs.axis);
+                    // Return first chunk for testing
+                    result = chunks[0];
+                    break;
+                }
+                case 'cumsum': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.cumsum(inputs.axis);
+                    break;
+                }
+                case 'cumprod': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.cumprod(inputs.axis);
+                    break;
+                }
+                case 'tile': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.tile(inputs.reps);
+                    break;
+                }
+                case 'repeat': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.repeat(inputs.repeats, inputs.axis);
+                    break;
+                }
+                case 'pad': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.pad(inputs.pad_width, inputs.constant_value);
+                    break;
+                }
+                case 'logSoftmax': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.logSoftmax(inputs.axis);
+                    break;
+                }
+                case 'diff': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.diff(inputs.n, inputs.axis);
+                    break;
+                }
+                case 'indexCopy': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const indices = createArray(inputs.indices, inputs.indices_shape);
+                    const src = createArray(inputs.src, inputs.src_shape);
+                    result = arr.indexCopy(inputs.axis, indices, src);
+                    break;
+                }
                 default:
                     throw new Error(`Unknown op: ${op}`);
             }

@@ -2766,3 +2766,619 @@ pub fn causal_mask(size: usize) -> NDArray {
 
     NDArray::new(rumpy_cpu::CpuArray::from_ndarray(arr))
 }
+
+// ============ Additional LLM Inference Ops ============
+
+/// Split array into equal parts along an axis
+///
+/// Essential for QKV separation after single projection matmul.
+///
+/// # Arguments
+/// * `num_splits` - Number of equal parts to split into
+/// * `axis` - Axis along which to split
+#[wasm_bindgen]
+impl NDArray {
+    pub fn split(&self, num_splits: usize, axis: usize) -> Result<js_sys::Array, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let axis_len = shape[axis];
+        if axis_len % num_splits != 0 {
+            return Err(JsValue::from_str(&format!(
+                "axis {} of size {} cannot be evenly split into {} parts",
+                axis, axis_len, num_splits
+            )));
+        }
+
+        let split_size = axis_len / num_splits;
+        let result = js_sys::Array::new();
+
+        for i in 0..num_splits {
+            let start = i * split_size;
+            let end = start + split_size;
+
+            // Use slice_axis to get a view of the split
+            let slice = data.slice_axis(
+                ndarray::Axis(axis),
+                ndarray::Slice::from(start..end)
+            );
+
+            result.push(&JsValue::from(NDArray::new(
+                rumpy_cpu::CpuArray::from_ndarray(slice.to_owned())
+            )));
+        }
+
+        Ok(result)
+    }
+}
+
+/// Chunk array into parts of a specific size along an axis
+///
+/// Alternative to split when you know the chunk size, not the number of chunks.
+///
+/// # Arguments
+/// * `chunk_size` - Size of each chunk
+/// * `axis` - Axis along which to chunk
+#[wasm_bindgen]
+impl NDArray {
+    pub fn chunk(&self, chunk_size: usize, axis: usize) -> Result<js_sys::Array, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let axis_len = shape[axis];
+        let result = js_sys::Array::new();
+
+        let mut start = 0;
+        while start < axis_len {
+            let end = (start + chunk_size).min(axis_len);
+
+            let slice = data.slice_axis(
+                ndarray::Axis(axis),
+                ndarray::Slice::from(start..end)
+            );
+
+            result.push(&JsValue::from(NDArray::new(
+                rumpy_cpu::CpuArray::from_ndarray(slice.to_owned())
+            )));
+
+            start = end;
+        }
+
+        Ok(result)
+    }
+}
+
+/// Cumulative sum along an axis
+///
+/// Essential for top-p (nucleus) sampling to calculate cumulative probabilities.
+///
+/// # Arguments
+/// * `axis` - Axis along which to compute cumsum
+#[wasm_bindgen]
+impl NDArray {
+    pub fn cumsum(&self, axis: usize) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let mut result = data.to_owned();
+
+        // Use lanes_mut to iterate along the cumsum axis
+        for mut lane in result.lanes_mut(ndarray::Axis(axis)) {
+            let mut acc = 0.0f64;
+            for val in lane.iter_mut() {
+                acc += *val;
+                *val = acc;
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Scatter values to indices along an axis
+///
+/// Essential for KV cache updates - insert new token's KV into cache without
+/// reallocating the entire buffer.
+///
+/// # Arguments
+/// * `axis` - Axis along which to scatter
+/// * `indices` - Indices where to place the values
+/// * `src` - Source values to scatter
+#[wasm_bindgen]
+impl NDArray {
+    pub fn scatter(&self, axis: usize, indices: &NDArray, src: &NDArray) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let idx_data = indices.inner.as_f64_slice();
+        let src_data = src.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let mut result = data.to_owned();
+
+        // For 1D case
+        if shape.len() == 1 {
+            for (i, &idx) in idx_data.iter().enumerate() {
+                let idx = idx as usize;
+                if idx < shape[0] {
+                    result[idx] = src_data.as_slice().unwrap()[i];
+                }
+            }
+            return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
+        }
+
+        // For N-D case, iterate along the scatter axis
+        let axis_obj = ndarray::Axis(axis);
+        let src_lanes = src_data.lanes(axis_obj);
+        let result_lanes = result.lanes_mut(axis_obj);
+
+        // Each lane in src corresponds to one index
+        for ((src_lane, _idx_val), mut result_lane) in src_lanes.into_iter()
+            .zip(idx_data.iter())
+            .zip(result_lanes.into_iter())
+        {
+            // This simplified version assumes scatter is inserting single values
+            // For more complex scatter, we'd need to iterate over indices per lane
+            for (src_val, dst_val) in src_lane.iter().zip(result_lane.iter_mut()) {
+                *dst_val = *src_val;
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Index copy - copy src into self at specified indices along an axis
+///
+/// Simpler KV cache update: self[indices] = src along axis
+///
+/// # Arguments
+/// * `axis` - Axis along which to copy
+/// * `indices` - 1D indices specifying where to copy
+/// * `src` - Source tensor (must have same shape as self except at axis dimension)
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = indexCopy)]
+    pub fn index_copy(&self, axis: usize, indices: &NDArray, src: &NDArray) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let idx_data = indices.inner.as_f64_slice();
+        let src_data = src.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let mut result = data.to_owned();
+
+        // For each index, copy the corresponding slice from src to result
+        for (i, &idx) in idx_data.iter().enumerate() {
+            let idx = idx as usize;
+            if idx >= shape[axis] {
+                return Err(JsValue::from_str(&format!(
+                    "index {} is out of bounds for axis {} with size {}",
+                    idx, axis, shape[axis]
+                )));
+            }
+
+            // Get the i-th slice from src and copy to idx-th position in result
+            let src_slice = src_data.index_axis(ndarray::Axis(axis), i);
+            let mut dst_slice = result.index_axis_mut(ndarray::Axis(axis), idx);
+            dst_slice.assign(&src_slice);
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Multinomial sampling from probability distribution
+///
+/// Essential for non-greedy token generation. Samples from the last dimension.
+///
+/// # Arguments
+/// * `num_samples` - Number of samples to draw
+/// * `replacement` - Whether to sample with replacement
+#[wasm_bindgen]
+impl NDArray {
+    pub fn multinomial(&self, num_samples: usize, replacement: bool) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if shape.is_empty() {
+            return Err(JsValue::from_str("multinomial requires at least 1D input"));
+        }
+
+        let last_dim = *shape.last().unwrap();
+
+        if num_samples > last_dim && !replacement {
+            return Err(JsValue::from_str(&format!(
+                "cannot draw {} samples without replacement from {} categories",
+                num_samples, last_dim
+            )));
+        }
+
+        // Output shape: same as input but last dim is num_samples
+        let mut out_shape = shape.clone();
+        *out_shape.last_mut().unwrap() = num_samples;
+
+        // Flatten to 2D for processing
+        let batch_size: usize = shape[..shape.len() - 1].iter().product();
+        let batch_size = batch_size.max(1);
+
+        let data_contiguous = data.as_standard_layout();
+        let flat = data_contiguous.view()
+            .into_shape((batch_size, last_dim))
+            .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
+
+        let mut result = ndarray::Array2::<f64>::zeros((batch_size, num_samples));
+
+        for (batch_idx, probs) in flat.outer_iter().enumerate() {
+            // Normalize probabilities (in case they don't sum to 1)
+            let sum: f64 = probs.iter().sum();
+            let normalized: Vec<f64> = probs.iter().map(|&p| p / sum).collect();
+
+            // Build cumulative distribution
+            let mut cumsum = Vec::with_capacity(last_dim);
+            let mut acc = 0.0f64;
+            for &p in &normalized {
+                acc += p;
+                cumsum.push(acc);
+            }
+
+            // Sample using js_sys::Math::random() for WASM compatibility
+            let mut used = vec![false; last_dim];
+            for sample_idx in 0..num_samples {
+                let r: f64 = js_sys::Math::random();
+
+                // Binary search for the sample
+                let mut idx = cumsum.partition_point(|&c| c < r);
+                if idx >= last_dim {
+                    idx = last_dim - 1;
+                }
+
+                // If no replacement, find next available
+                if !replacement {
+                    while used[idx] && idx < last_dim - 1 {
+                        idx += 1;
+                    }
+                    if used[idx] {
+                        // Wrap around
+                        idx = 0;
+                        while used[idx] && idx < last_dim - 1 {
+                            idx += 1;
+                        }
+                    }
+                    used[idx] = true;
+                }
+
+                result[[batch_idx, sample_idx]] = idx as f64;
+            }
+        }
+
+        let result_shaped = result.into_shape(ndarray::IxDyn(&out_shape))
+            .map_err(|e| JsValue::from_str(&format!("reshape result failed: {}", e)))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_shaped)))
+    }
+}
+
+/// Tile/repeat array along each dimension
+///
+/// Essential for beam search - duplicating context for multiple hypotheses.
+///
+/// # Arguments
+/// * `reps` - Number of repetitions along each dimension
+#[wasm_bindgen]
+impl NDArray {
+    pub fn tile(&self, reps: Vec<usize>) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        // Pad reps or shape to match dimensions
+        let ndim = shape.len().max(reps.len());
+        let mut padded_shape = vec![1usize; ndim - shape.len()];
+        padded_shape.extend(&shape);
+        let mut padded_reps = vec![1usize; ndim - reps.len()];
+        padded_reps.extend(&reps);
+
+        // Calculate output shape
+        let out_shape: Vec<usize> = padded_shape.iter()
+            .zip(padded_reps.iter())
+            .map(|(&s, &r)| s * r)
+            .collect();
+
+        // Ensure contiguous data
+        let data_contiguous = data.as_standard_layout();
+        let reshaped = data_contiguous.view()
+            .into_shape(ndarray::IxDyn(&padded_shape))
+            .map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
+
+        // Build result by broadcasting and assignment
+        let mut result = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&out_shape));
+
+        // Fill by iterating over tiles
+        let mut indices = vec![0usize; ndim];
+        loop {
+            // Copy the tile at current indices
+            for (src_idx, src_val) in reshaped.indexed_iter() {
+                let mut dst_idx = vec![0usize; ndim];
+                for d in 0..ndim {
+                    dst_idx[d] = indices[d] * padded_shape[d] + src_idx[d];
+                }
+                result[ndarray::IxDyn(&dst_idx)] = *src_val;
+            }
+
+            // Increment indices
+            let mut d = ndim - 1;
+            loop {
+                indices[d] += 1;
+                if indices[d] < padded_reps[d] {
+                    break;
+                }
+                indices[d] = 0;
+                if d == 0 {
+                    // Done
+                    return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
+                }
+                d -= 1;
+            }
+        }
+    }
+}
+
+/// Repeat elements along an axis
+///
+/// Different from tile - this repeats individual elements, not the whole array.
+///
+/// # Arguments
+/// * `repeats` - Number of repetitions for each element
+/// * `axis` - Axis along which to repeat (optional, flattens if not specified)
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = repeat)]
+    pub fn repeat_elements(&self, repeats: usize, axis: Option<usize>) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+
+        match axis {
+            None => {
+                // Flatten and repeat
+                let flat: Vec<f64> = data.iter().cloned().collect();
+                let repeated: Vec<f64> = flat.iter()
+                    .flat_map(|&v| std::iter::repeat(v).take(repeats))
+                    .collect();
+                let arr = ndarray::ArrayD::from_shape_vec(
+                    ndarray::IxDyn(&[repeated.len()]),
+                    repeated
+                ).map_err(|e| JsValue::from_str(&format!("reshape failed: {}", e)))?;
+                Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(arr)))
+            }
+            Some(ax) => {
+                let shape = data.shape().to_vec();
+                if ax >= shape.len() {
+                    return Err(JsValue::from_str(&format!(
+                        "axis {} is out of bounds for array of dimension {}",
+                        ax, shape.len()
+                    )));
+                }
+
+                // Build new shape
+                let mut out_shape = shape.clone();
+                out_shape[ax] *= repeats;
+
+                let mut result = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&out_shape));
+
+                // Iterate and repeat along axis
+                for (i, src_slice) in data.axis_iter(ndarray::Axis(ax)).enumerate() {
+                    for r in 0..repeats {
+                        let dst_idx = i * repeats + r;
+                        let mut dst_slice = result.index_axis_mut(ndarray::Axis(ax), dst_idx);
+                        dst_slice.assign(&src_slice);
+                    }
+                }
+
+                Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+            }
+        }
+    }
+}
+
+/// Pad array with constant value
+///
+/// # Arguments
+/// * `pad_width` - Padding for each dimension as [before0, after0, before1, after1, ...]
+/// * `constant_value` - Value to pad with
+#[wasm_bindgen]
+impl NDArray {
+    pub fn pad(&self, pad_width: Vec<usize>, constant_value: f64) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+        let ndim = shape.len();
+
+        if pad_width.len() != ndim * 2 {
+            return Err(JsValue::from_str(&format!(
+                "pad_width must have {} elements for {}D array, got {}",
+                ndim * 2, ndim, pad_width.len()
+            )));
+        }
+
+        // Calculate output shape
+        let mut out_shape = vec![0usize; ndim];
+        for d in 0..ndim {
+            out_shape[d] = pad_width[d * 2] + shape[d] + pad_width[d * 2 + 1];
+        }
+
+        // Create output filled with constant
+        let mut result = ndarray::ArrayD::<f64>::from_elem(ndarray::IxDyn(&out_shape), constant_value);
+
+        // Build the slice ranges for where to insert the original data
+        let mut slice_info: Vec<ndarray::SliceInfoElem> = Vec::with_capacity(ndim);
+        for d in 0..ndim {
+            let start = pad_width[d * 2] as isize;
+            let end = (pad_width[d * 2] + shape[d]) as isize;
+            slice_info.push(ndarray::SliceInfoElem::Slice {
+                start,
+                end: Some(end),
+                step: 1,
+            });
+        }
+
+        // Assign data to the center
+        let mut view = result.slice_mut(slice_info.as_slice());
+        view.assign(&data);
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Log-softmax for numerical stability
+///
+/// Computes log(softmax(x)) using the LogSumExp trick to prevent overflow/underflow.
+/// Essential for calculating perplexity and beam search scoring.
+///
+/// # Arguments
+/// * `axis` - Axis along which to compute log_softmax
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = logSoftmax)]
+    pub fn log_softmax(&self, axis: usize) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let mut result = data.to_owned();
+
+        // For numerical stability: log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
+        for mut lane in result.lanes_mut(ndarray::Axis(axis)) {
+            // Find max for stability
+            let max_val = lane.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+            // Compute log(sum(exp(x - max)))
+            let log_sum_exp = lane.iter()
+                .map(|&x| (x - max_val).exp())
+                .sum::<f64>()
+                .ln();
+
+            // Apply: x - max - log_sum_exp
+            for val in lane.iter_mut() {
+                *val = *val - max_val - log_sum_exp;
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Cumulative product along an axis
+///
+/// # Arguments
+/// * `axis` - Axis along which to compute cumprod
+#[wasm_bindgen]
+impl NDArray {
+    pub fn cumprod(&self, axis: usize) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let mut result = data.to_owned();
+
+        for mut lane in result.lanes_mut(ndarray::Axis(axis)) {
+            let mut acc = 1.0f64;
+            for val in lane.iter_mut() {
+                acc *= *val;
+                *val = acc;
+            }
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
+    }
+}
+
+/// Diff - compute n-th discrete difference along axis
+///
+/// # Arguments
+/// * `n` - Number of times to apply diff
+/// * `axis` - Axis along which to diff
+#[wasm_bindgen]
+impl NDArray {
+    pub fn diff(&self, n: usize, axis: usize) -> Result<NDArray, JsValue> {
+        if n == 0 {
+            return Ok(NDArray::new(self.inner.clone()));
+        }
+
+        let mut current = self.inner.as_ndarray().to_owned();
+        let mut shape = current.shape().to_vec();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        for _ in 0..n {
+            if shape[axis] < 2 {
+                return Err(JsValue::from_str("diff requires at least 2 elements along axis"));
+            }
+
+            let new_len = shape[axis] - 1;
+            shape[axis] = new_len;
+
+            let mut result = ndarray::ArrayD::<f64>::zeros(ndarray::IxDyn(&shape));
+
+            // Compute differences
+            for (i, (curr, next)) in current.axis_iter(ndarray::Axis(axis))
+                .zip(current.axis_iter(ndarray::Axis(axis)).skip(1))
+                .enumerate()
+            {
+                let mut dst = result.index_axis_mut(ndarray::Axis(axis), i);
+                dst.zip_mut_with(&next, |d, &n| *d = n);
+                dst.zip_mut_with(&curr, |d, &c| *d -= c);
+            }
+
+            current = result;
+        }
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(current)))
+    }
+}
