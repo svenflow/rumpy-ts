@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>rumpy-ts vs NumPy Compatibility Tests</title>
+    <style>
+        body { font-family: monospace; padding: 20px; max-width: 1200px; margin: 0 auto; }
+        .pass { color: green; }
+        .fail { color: red; }
+        .section { margin: 20px 0; border-top: 2px solid #333; padding-top: 15px; }
+        h1 { border-bottom: 3px solid #333; padding-bottom: 10px; }
+        .summary { font-size: 1.2em; padding: 15px; background: #f5f5f5; margin: 20px 0; }
+        .test-row { margin: 5px 0; padding: 5px; background: #fafafa; }
+        .test-row.fail { background: #fff0f0; }
+        pre { background: #f0f0f0; padding: 10px; overflow-x: auto; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h1>rumpy-ts vs NumPy Compatibility Tests</h1>
+    <div class="summary" id="summary">Loading...</div>
+    <div id="output"></div>
+
+    <script type="module">
+        import init, * as rumpy from './pkg-web/rumpy_wasm.js';
+
+        const output = document.getElementById('output');
+        const summaryDiv = document.getElementById('summary');
+        let passed = 0, failed = 0;
+
+        function log(msg, isPass = null) {
+            const div = document.createElement('div');
+            div.className = 'test-row' + (isPass === false ? ' fail' : '');
+            if (isPass === true) {
+                div.innerHTML = '<span class="pass">✓</span> ' + msg;
+                passed++;
+            } else if (isPass === false) {
+                div.innerHTML = '<span class="fail">✗</span> ' + msg;
+                failed++;
+            } else {
+                div.textContent = msg;
+            }
+            output.appendChild(div);
+        }
+
+        function section(name) {
+            const div = document.createElement('div');
+            div.className = 'section';
+            div.innerHTML = `<h2>${name}</h2>`;
+            output.appendChild(div);
+        }
+
+        function arraysClose(a, b, tol = 1e-6) {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+                if (Math.abs(a[i] - b[i]) > tol) {
+                    // Handle NaN comparison
+                    if (isNaN(a[i]) && isNaN(b[i])) continue;
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        function maxDiff(a, b) {
+            let max = 0;
+            for (let i = 0; i < Math.min(a.length, b.length); i++) {
+                if (!isNaN(a[i]) && !isNaN(b[i])) {
+                    max = Math.max(max, Math.abs(a[i] - b[i]));
+                }
+            }
+            return max;
+        }
+
+        function runOp(testCase) {
+            const { op, inputs } = testCase;
+            let result;
+
+            // Create array from inputs
+            const createArray = (data, shape) => {
+                return rumpy.arrayFromTyped(new Float64Array(data), shape);
+            };
+
+            switch (op) {
+                case 'permute': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.permute(inputs.axes);
+                    break;
+                }
+                case 'sumAxis': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.sumAxis(inputs.axis, inputs.keepdims);
+                    break;
+                }
+                case 'meanAxis': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.meanAxis(inputs.axis, inputs.keepdims);
+                    break;
+                }
+                case 'maxAxis': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.maxAxis(inputs.axis, inputs.keepdims);
+                    break;
+                }
+                case 'minAxis': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.minAxis(inputs.axis, inputs.keepdims);
+                    break;
+                }
+                case 'softmax': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.softmax(inputs.axis);
+                    break;
+                }
+                case 'relu': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.relu();
+                    break;
+                }
+                case 'gelu': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.gelu();
+                    break;
+                }
+                case 'argmax': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: Number(arr.argmax()) };
+                }
+                case 'argmin': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: Number(arr.argmin()) };
+                }
+                case 'slice': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.slice(inputs.starts, inputs.stops, inputs.steps);
+                    break;
+                }
+                case 'im2col': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.im2col(
+                        inputs.kernel_h, inputs.kernel_w,
+                        inputs.stride_h, inputs.stride_w,
+                        inputs.pad_h, inputs.pad_w
+                    );
+                    break;
+                }
+                case 'maxPool2d': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.maxPool2d(
+                        inputs.kernel_h, inputs.kernel_w,
+                        inputs.stride_h, inputs.stride_w,
+                        inputs.pad_h, inputs.pad_w
+                    );
+                    break;
+                }
+                case 'avgPool2d': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.avgPool2d(
+                        inputs.kernel_h, inputs.kernel_w,
+                        inputs.stride_h, inputs.stride_w,
+                        inputs.pad_h, inputs.pad_w
+                    );
+                    break;
+                }
+                case 'gtScalar': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.gtScalar(inputs.scalar);
+                    break;
+                }
+                case 'ltScalar': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.ltScalar(inputs.scalar);
+                    break;
+                }
+                case 'eqScalar': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.eqScalar(inputs.scalar);
+                    break;
+                }
+                case 'getByMask': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const mask = createArray(inputs.mask, inputs.shape);
+                    result = arr.getByMask(mask);
+                    break;
+                }
+                case 'setByMask': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const mask = createArray(inputs.mask, inputs.shape);
+                    result = arr.setByMask(mask, inputs.value);
+                    break;
+                }
+                case 'where_': {
+                    const cond = createArray(inputs.cond, inputs.shape);
+                    const x = createArray(inputs.x, inputs.shape);
+                    const y = createArray(inputs.y, inputs.shape);
+                    result = rumpy.where_(cond, x, y);
+                    break;
+                }
+                case 'clip': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.clip(inputs.min, inputs.max);
+                    break;
+                }
+                case 'isNan': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.isNan();
+                    break;
+                }
+                case 'isInf': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.isInf();
+                    break;
+                }
+                case 'isFinite': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.isFinite();
+                    break;
+                }
+                case 'countNonzero': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: Number(arr.countNonzero()) };
+                }
+                default:
+                    throw new Error(`Unknown op: ${op}`);
+            }
+
+            return {
+                data: Array.from(result.toTypedArray()),
+                shape: Array.from(result.shape)
+            };
+        }
+
+        async function runTests() {
+            await init();
+            log('WASM initialized');
+
+            // Load test cases and convert NaN/Inf strings
+            const response = await fetch('./numpy-test-cases.json');
+            let testData = await response.json();
+
+            // Convert "NaN", "Infinity", "-Infinity" strings to JS values
+            function convertSpecialValues(obj) {
+                if (Array.isArray(obj)) {
+                    return obj.map(convertSpecialValues);
+                } else if (typeof obj === 'object' && obj !== null) {
+                    const result = {};
+                    for (const [k, v] of Object.entries(obj)) {
+                        result[k] = convertSpecialValues(v);
+                    }
+                    return result;
+                } else if (obj === "NaN") {
+                    return NaN;
+                } else if (obj === "Infinity") {
+                    return Infinity;
+                } else if (obj === "-Infinity") {
+                    return -Infinity;
+                }
+                return obj;
+            }
+            testData = convertSpecialValues(testData);
+
+            log(`Loaded ${testData.test_count} test cases from NumPy ${testData.numpy_version}`);
+            section('Running Tests');
+
+            for (const testCase of testData.tests) {
+                try {
+                    const result = runOp(testCase);
+
+                    if ('scalar' in result) {
+                        // Scalar result
+                        const expected = testCase.expected;
+                        if (result.scalar === expected) {
+                            log(`${testCase.name}: ${result.scalar} === ${expected}`, true);
+                        } else {
+                            log(`${testCase.name}: got ${result.scalar}, expected ${expected}`, false);
+                        }
+                    } else {
+                        // Array result
+                        const expectedData = testCase.expected;
+                        const expectedShape = testCase.expected_shape;
+
+                        const shapeMatch = JSON.stringify(result.shape) === JSON.stringify(expectedShape);
+                        const dataMatch = arraysClose(result.data, expectedData, 1e-5);
+
+                        if (shapeMatch && dataMatch) {
+                            const diff = maxDiff(result.data, expectedData);
+                            log(`${testCase.name}: shape ${JSON.stringify(result.shape)}, maxDiff=${diff.toExponential(2)}`, true);
+                        } else {
+                            let msg = testCase.name + ': ';
+                            if (!shapeMatch) {
+                                msg += `shape mismatch: got ${JSON.stringify(result.shape)}, expected ${JSON.stringify(expectedShape)}. `;
+                            }
+                            if (!dataMatch) {
+                                const diff = maxDiff(result.data, expectedData);
+                                msg += `data mismatch (maxDiff=${diff.toExponential(2)})`;
+                            }
+                            log(msg, false);
+                            console.log('Test:', testCase.name);
+                            console.log('Got:', result.data.slice(0, 20));
+                            console.log('Expected:', expectedData.slice(0, 20));
+                        }
+                    }
+                } catch (e) {
+                    log(`${testCase.name}: ERROR - ${e.message}`, false);
+                    console.error(testCase.name, e);
+                }
+            }
+
+            // Summary
+            section('Summary');
+            const total = passed + failed;
+            const pct = ((passed / total) * 100).toFixed(1);
+            summaryDiv.innerHTML = `<strong>Passed: ${passed}/${total} (${pct}%)</strong>` +
+                (failed === 0 ? ' <span class="pass">All tests passed!</span>' :
+                 ` <span class="fail">${failed} tests failed</span>`);
+        }
+
+        runTests().catch(e => {
+            log('Fatal error: ' + e.message, false);
+            console.error(e);
+        });
+    </script>
+</body>
+</html>
