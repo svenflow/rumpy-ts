@@ -50,32 +50,41 @@ With the old rayon-based parallelization, we were consistently 1.5-5x slower tha
 
 3. **1D vs 2D tiling**: 1D row partitioning means all threads read the entire B matrix → cache thrashing. 2D tiling reduces shared memory access.
 
-### 🔴 THE BIG DISCOVERY: Cache Associativity Aliasing (Power-of-2 Curse)
+### 🔴 THE BIG DISCOVERY: 32-bit `usize` Overflow (NOT cache aliasing)
 
-**Symptom**: Parallelization worked PERFECTLY up to 1792x1792 (5-7x speedup), but dropped to exactly 1.0x at 2048x2048 and 4096x4096.
+**Symptom**: Parallelization worked perfectly up to 1792×1792 (5–7× speedup), but dropped to **exactly 1.0×** at 2048×2048 and 4096×4096.
 
-**Root Cause**: Cache set aliasing!
-- 2048 × 4 bytes = **8KB row stride** (perfect power-of-2)
-- Modern CPU caches are set-associative (e.g., 8-way)
-- Memory addresses map to cache "sets" using lower address bits
-- When stride is power-of-2, EVERY row maps to the SAME cache set
-- With 10 threads accessing simultaneously → catastrophic cache thrashing
+**Initial misdiagnosis** (preserved for posterity — 6 hours were spent on this):
+We first believed this was cache-set aliasing from power-of-2 row strides. Implemented stride padding, A-packing, 2D tiling, per-thread scratch jitter, buffer spacers. None of it helped. `probeV3Dispatch()` confirmed workers were running on 8 distinct rayon threads — so dispatch was fine, yet every worker took single-threaded time.
 
-**Evidence**:
-| Size | Parallel Speedup | Notes |
-|------|-----------------|-------|
-| 1792x1792 | **5.29x** | Works great |
-| 2047x2047 | **3.75x** | Off-by-one avoids aliasing |
-| 2048x2048 | **1.00x** | Perfect aliasing - no speedup! |
-| 2049x2049 | **4.21x** | Off-by-one avoids aliasing |
-| 2056x2056 | **4.79x** | +8 padding breaks aliasing |
-| 4096x4096 | **1.00x** | Also power-of-2 - same problem |
+**Actual root cause** (found via `probeV3Path()`):
 
-**The Fix**: Pad matrices to non-power-of-2 widths:
-- 2048 → 2056 (add 8 columns)
-- 4096 → 4104 (add 8 columns)
+```rust
+if m * n * k < 128 * 128 * 128 {  // ← THE BUG
+    return single_threaded();
+}
+```
 
-This is a well-known problem in HPC (High Performance Computing). BLAS libraries like OpenBLAS handle this with internal padding.
+WASM `usize` is **32-bit**. At `(2048, 2048, 2048)`, `m * n * k = 8,589,934,592` which **overflows to exactly 0**. `0 < threshold` → true → silent single-threaded fallback. At 2047, `m*n*k = 8,576,582,623 mod 2³² = 4,281,615,327` — non-zero, goes parallel. At 2056, similar. **The "any non-pow2 dim fixes it" pattern was coincidence**, not causation.
+
+**Evidence** (now correctly interpreted):
+| (M, N, K) | `m*n*k mod 2³²` | Path taken | Speedup |
+|---|---:|---|---:|
+| (2047, 2047, 2047) | 4,281,615,327 | parallel | 3.75× |
+| (2048, 2048, 2048) | **0** | **single-threaded** | **1.00×** |
+| (2049, 2049, 2049) | 12,614,337 | parallel | 4.21× |
+| (4096, 4096, 4096) | **0** | **single-threaded** | **1.00×** |
+
+**The fix** — cast to `u64` before multiplying:
+```rust
+if (m as u64) * (n as u64) * (k as u64) < (128u64 * 128 * 128) {
+```
+
+After the fix, 2048³ goes from 1.00× → **6.6× scaling** with no other changes.
+
+**Cache aliasing IS a real phenomenon** — a 6-row micro-kernel at stride 8192 B does create L1 set conflicts, costing ~10–20% per thread. But it doesn't cause a total collapse to 1.0×. That specific pattern (exactly 1.0×, cliff not slope, pow2-triggered) is the overflow fingerprint.
+
+**⚠️ This bug is currently BACK IN MAIN** — the PR #2 squash-merge dropped `simd_gemm.rs` changes in a conflict. See `docs/GEMM-NEXT-STEPS.md` for the re-fix.
 
 ### Current Multi-threaded Results (with fixes, 10 threads)
 

@@ -13,6 +13,56 @@
 #[cfg(target_arch = "wasm32")]
 use std::arch::wasm32::*;
 
+/// Shape-aware heuristic for parallel dispatch decision.
+///
+/// Estimates whether parallelization will be profitable based on:
+/// - Total FLOPs (2 * m * n * k)
+/// - Number of available threads
+/// - Estimated dispatch overhead (~50-100μs for rayon in WASM)
+/// - Measured single-thread GFLOPS (~8-12 on modern chips)
+///
+/// Returns true if parallel execution is expected to be faster.
+///
+/// This is similar to what XNNPACK's pthreadpool uses internally.
+#[inline]
+pub fn should_parallelize(m: usize, n: usize, k: usize, num_threads: usize) -> bool {
+    if num_threads <= 1 {
+        return false;
+    }
+
+    // Use u64 to avoid overflow on wasm32 (usize is 32-bit)
+    let flops = 2u64 * (m as u64) * (n as u64) * (k as u64);
+
+    // Empirical constants (tuned for WASM on Apple Silicon):
+    // - DISPATCH_OVERHEAD_NS: ~150μs for rayon dispatch + sync in WASM
+    // - GFLOPS_SINGLE_THREAD: ~75 GFLOPS sustained (from benchmarks on M4)
+    // - PARALLEL_EFFICIENCY: ~60% due to cache/memory contention + E-cores
+    const DISPATCH_OVERHEAD_NS: u64 = 150_000; // 150 microseconds
+    const GFLOPS_PER_THREAD: u64 = 75;
+    const PARALLEL_EFFICIENCY_PCT: u64 = 60;
+
+    // Single-threaded time estimate (nanoseconds)
+    // time_st = flops / (GFLOPS * 1e9) * 1e9 = flops / GFLOPS
+    let time_st_ns = flops / GFLOPS_PER_THREAD;
+
+    // Parallel time estimate
+    // time_mt = flops / (num_threads * GFLOPS * efficiency) + dispatch_overhead
+    let effective_threads = (num_threads as u64 * PARALLEL_EFFICIENCY_PCT) / 100;
+    let time_mt_ns = flops / (effective_threads.max(1) * GFLOPS_PER_THREAD) + DISPATCH_OVERHEAD_NS;
+
+    // Go parallel if it's expected to be faster
+    time_mt_ns < time_st_ns
+}
+
+/// Minimum work threshold - below this, don't even consider parallel.
+/// This is a fast-path to avoid the should_parallelize calculation overhead.
+/// 64³ = 262K FLOPs, takes ~30μs single-threaded, not worth parallelizing.
+#[inline]
+pub fn below_parallel_threshold(m: usize, n: usize, k: usize) -> bool {
+    // Use u64 to avoid overflow on wasm32
+    (m as u64) * (n as u64) * (k as u64) < (64u64 * 64 * 64)
+}
+
 /// XNNPACK-style 6x8 kernel with vectorized A loading
 /// Loads 4 A values at once per row, then shuffles to broadcast each lane.
 /// This processes 4 K iterations per loop, reducing memory operations.
@@ -2218,13 +2268,14 @@ pub fn matmul_gemm_f64(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Ve
 pub fn matmul_parallel_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use rayon::prelude::*;
 
-    // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    let num_threads = rayon::current_num_threads();
+
+    // Shape-aware parallel decision
+    if below_parallel_threshold(m, n, k) || !should_parallelize(m, n, k, num_threads) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
     // Split by rows - each thread gets a chunk of rows
-    let num_threads = rayon::current_num_threads();
     let rows_per_thread = (m + num_threads - 1) / num_threads;
 
     // Each thread produces its portion of C
@@ -2267,8 +2318,10 @@ pub fn matmul_parallel_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -
 pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use rayon::prelude::*;
 
-    // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    let num_threads = rayon::current_num_threads();
+
+    // Shape-aware parallel decision
+    if below_parallel_threshold(m, n, k) || !should_parallelize(m, n, k, num_threads) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
@@ -2276,7 +2329,6 @@ pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
     let mut c = vec![0.0f32; m * n];
 
     // Calculate chunk size (in elements, not rows)
-    let num_threads = rayon::current_num_threads();
     let rows_per_thread = (m + num_threads - 1) / num_threads;
     let chunk_size = rows_per_thread * n;  // elements per chunk
 
@@ -2317,17 +2369,17 @@ pub fn matmul_parallel_f32_v2(a: &[f32], b: &[f32], m: usize, n: usize, k: usize
 pub fn matmul_pthreadpool_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use pthreadpool_rs::ThreadPool;
 
-    // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    // Use default thread pool (uses available parallelism)
+    let pool = ThreadPool::default();
+    let num_threads = pool.threads_count();
+
+    // Shape-aware parallel decision
+    if below_parallel_threshold(m, n, k) || !should_parallelize(m, n, k, num_threads) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
     // Pre-allocate output
     let mut c = vec![0.0f32; m * n];
-
-    // Use default thread pool (uses available parallelism)
-    let pool = ThreadPool::default();
-    let num_threads = pool.threads_count();
 
     // Calculate rows per thread
     let rows_per_thread = (m + num_threads - 1) / num_threads;
@@ -2379,15 +2431,15 @@ pub fn matmul_pthreadpool_f32_with_pool(
     n: usize,
     k: usize,
 ) -> Vec<f32> {
-    // For small matrices, single-threaded is faster (no thread overhead)
-    if m * n * k < 64 * 64 * 64 {
+    let num_threads = pool.threads_count();
+
+    // Shape-aware parallel decision
+    if below_parallel_threshold(m, n, k) || !should_parallelize(m, n, k, num_threads) {
         return matmul_dispatch_f32(a, b, m, n, k);
     }
 
     // Pre-allocate output
     let mut c = vec![0.0f32; m * n];
-
-    let num_threads = pool.threads_count();
     let rows_per_thread = (m + num_threads - 1) / num_threads;
 
     // Convert pointers to usize for Send+Sync (usize is always Send+Sync)
@@ -2875,16 +2927,15 @@ pub fn matmul_optimized_f32(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) 
 pub fn matmul_optimized_f32_parallel(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     use rayon::prelude::*;
 
-    // For small matrices, single-threaded is faster
-    if m * n * k < 128 * 128 * 128 {
+    let num_threads = rayon::current_num_threads();
+
+    // Shape-aware parallel decision: estimate if parallelization is profitable
+    // based on FLOPs, thread count, and dispatch overhead.
+    if below_parallel_threshold(m, n, k) || !should_parallelize(m, n, k, num_threads) {
         return matmul_optimized_f32(a, b, m, n, k);
     }
 
     let c = vec![0.0f32; m * n];
-
-    // Simple 1D parallelization over M (rows) to debug rayon behavior
-    // This is simpler than 2D tiling - let's see if it parallelizes at 2048
-    let num_threads = rayon::current_num_threads();
     let rows_per_thread = (m + num_threads - 1) / num_threads;
 
     // Create a simple task list: just row starts
