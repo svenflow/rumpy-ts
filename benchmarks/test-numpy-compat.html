@@ -218,6 +218,75 @@
                     const arr = createArray(inputs.data, inputs.shape);
                     return { scalar: Number(arr.countNonzero()) };
                 }
+                // Sprint 4: ML Inference Ops
+                case 'layerNorm': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const gamma = inputs.gamma ? createArray(inputs.gamma, [inputs.gamma.length]) : null;
+                    const beta = inputs.beta ? createArray(inputs.beta, [inputs.beta.length]) : null;
+                    result = arr.layerNorm(inputs.normalized_shape, gamma, beta, inputs.eps);
+                    break;
+                }
+                case 'rmsNorm': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const gamma = createArray(inputs.gamma, [inputs.gamma.length]);
+                    result = arr.rmsNorm(gamma, inputs.eps);
+                    break;
+                }
+                case 'batchNorm': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const gamma = inputs.gamma ? createArray(inputs.gamma, [inputs.gamma.length]) : null;
+                    const beta = inputs.beta ? createArray(inputs.beta, [inputs.beta.length]) : null;
+                    const runningMean = createArray(inputs.running_mean, [inputs.running_mean.length]);
+                    const runningVar = createArray(inputs.running_var, [inputs.running_var.length]);
+                    result = arr.batchNorm(gamma, beta, runningMean, runningVar, inputs.eps);
+                    break;
+                }
+                case 'take': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const indices = createArray(inputs.indices, [inputs.indices.length]);
+                    result = arr.take(indices, inputs.axis);
+                    break;
+                }
+                case 'rsqrt': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.rsqrt();
+                    break;
+                }
+                case 'sigmoid': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.sigmoid();
+                    break;
+                }
+                case 'silu': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.silu();
+                    break;
+                }
+                case 'topk': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    const [values, indices] = arr.topk(inputs.k, inputs.axis, inputs.sorted);
+                    return {
+                        compound: {
+                            values: Array.from(values.toTypedArray()),
+                            indices: Array.from(indices.toTypedArray())
+                        },
+                        shape: Array.from(values.shape)
+                    };
+                }
+                case 'tril': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.tril(inputs.k);
+                    break;
+                }
+                case 'triu': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.triu(inputs.k);
+                    break;
+                }
+                case 'causalMask': {
+                    result = rumpy.causalMask(inputs.size);
+                    break;
+                }
                 default:
                     throw new Error(`Unknown op: ${op}`);
             }
@@ -271,6 +340,28 @@
                             log(`${testCase.name}: ${result.scalar} === ${expected}`, true);
                         } else {
                             log(`${testCase.name}: got ${result.scalar}, expected ${expected}`, false);
+                        }
+                    } else if ('compound' in result) {
+                        // Compound result (e.g., topk returns values and indices)
+                        const expectedVals = testCase.expected.values.flat();
+                        const expectedIdx = testCase.expected.indices.flat();
+                        const gotVals = result.compound.values;
+                        const gotIdx = result.compound.indices;
+
+                        const valsMatch = arraysClose(gotVals, expectedVals, 1e-5);
+                        const idxMatch = arraysClose(gotIdx, expectedIdx, 0.5); // indices are integers
+
+                        if (valsMatch && idxMatch) {
+                            log(`${testCase.name}: values and indices match`, true);
+                        } else {
+                            let msg = testCase.name + ': ';
+                            if (!valsMatch) msg += `values mismatch. `;
+                            if (!idxMatch) msg += `indices mismatch.`;
+                            log(msg, false);
+                            console.log('Got vals:', gotVals.slice(0, 10));
+                            console.log('Expected vals:', expectedVals.slice(0, 10));
+                            console.log('Got idx:', gotIdx.slice(0, 10));
+                            console.log('Expected idx:', expectedIdx.slice(0, 10));
                         }
                     } else {
                         // Array result

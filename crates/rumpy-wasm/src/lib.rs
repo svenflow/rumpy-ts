@@ -2089,3 +2089,515 @@ pub fn matmul_xnnpack_blocked(a: &Float32Array, b: &Float32Array, packed_b: &Flo
 
     Float32Array::from(c_vec.as_slice())
 }
+
+// ============ ML Inference Ops ============
+
+/// Layer normalization (matches torch.nn.functional.layer_norm)
+///
+/// Normalizes over the last N dimensions where N = normalized_shape.len()
+/// output = (input - mean) / sqrt(var + eps) * gamma + beta
+///
+/// # Arguments
+/// * `normalized_shape` - The shape over which to normalize (last N dims)
+/// * `gamma` - Optional scale parameter (weight), defaults to 1.0
+/// * `beta` - Optional shift parameter (bias), defaults to 0.0
+/// * `eps` - Small constant for numerical stability
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = layerNorm)]
+    pub fn layer_norm(
+        &self,
+        normalized_shape: Vec<usize>,
+        gamma: Option<NDArray>,
+        beta: Option<NDArray>,
+        eps: f64
+    ) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+        let norm_ndim = normalized_shape.len();
+
+        if norm_ndim > ndim {
+            return Err(JsValue::from_str("normalized_shape has more dimensions than input"));
+        }
+
+        // Verify normalized_shape matches the last N dimensions
+        for i in 0..norm_ndim {
+            if shape[ndim - norm_ndim + i] != normalized_shape[i] {
+                return Err(JsValue::from_str(&format!(
+                    "normalized_shape mismatch at dim {}: expected {}, got {}",
+                    i, shape[ndim - norm_ndim + i], normalized_shape[i]
+                )));
+            }
+        }
+
+        // Calculate the number of elements to normalize over
+        let norm_size: usize = normalized_shape.iter().product();
+        let batch_size: usize = shape[..ndim - norm_ndim].iter().product();
+
+        // Flatten to (batch, norm_features) for computation
+        let flat = data.view().into_shape((batch_size, norm_size)).unwrap();
+
+        // Compute mean and variance along last axis
+        let mut result = ndarray::Array2::<f64>::zeros((batch_size, norm_size));
+
+        for (i, row) in flat.outer_iter().enumerate() {
+            let mean = row.mean().unwrap_or(0.0);
+            let var = row.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / norm_size as f64;
+            let std = (var + eps).sqrt();
+
+            for (j, &val) in row.iter().enumerate() {
+                result[[i, j]] = (val - mean) / std;
+            }
+        }
+
+        // Apply gamma and beta if provided
+        if let Some(g) = gamma {
+            let g_data = g.inner.as_f64_slice();
+            for i in 0..batch_size {
+                for j in 0..norm_size {
+                    result[[i, j]] *= g_data[j];
+                }
+            }
+        }
+
+        if let Some(b) = beta {
+            let b_data = b.inner.as_f64_slice();
+            for i in 0..batch_size {
+                for j in 0..norm_size {
+                    result[[i, j]] += b_data[j];
+                }
+            }
+        }
+
+        // Reshape back to original shape
+        let result_flat: Vec<f64> = result.iter().cloned().collect();
+        let result_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(shape),
+            result_flat
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+    }
+}
+
+/// RMS normalization (used in LLaMA, T5)
+///
+/// Unlike layer norm, RMS norm doesn't subtract mean, only divides by RMS.
+/// output = input / sqrt(mean(input^2) + eps) * gamma
+///
+/// # Arguments
+/// * `gamma` - Scale parameter (required for RMS norm)
+/// * `eps` - Small constant for numerical stability
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = rmsNorm)]
+    pub fn rms_norm(&self, gamma: &NDArray, eps: f64) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+
+        if ndim == 0 {
+            return Err(JsValue::from_str("Cannot apply rms_norm to scalar"));
+        }
+
+        // Normalize over last dimension
+        let last_dim = *shape.last().unwrap();
+        let batch_size: usize = shape[..ndim - 1].iter().product();
+
+        let flat = data.view().into_shape((batch_size, last_dim)).unwrap();
+        let g_data = gamma.inner.as_f64_slice();
+
+        if g_data.len() != last_dim {
+            return Err(JsValue::from_str(&format!(
+                "gamma size {} doesn't match last dimension {}",
+                g_data.len(), last_dim
+            )));
+        }
+
+        let mut result = ndarray::Array2::<f64>::zeros((batch_size, last_dim));
+
+        for (i, row) in flat.outer_iter().enumerate() {
+            // Compute RMS = sqrt(mean(x^2))
+            let rms = (row.iter().map(|&x| x * x).sum::<f64>() / last_dim as f64 + eps).sqrt();
+
+            for (j, &val) in row.iter().enumerate() {
+                result[[i, j]] = (val / rms) * g_data[j];
+            }
+        }
+
+        // Reshape back
+        let result_flat: Vec<f64> = result.iter().cloned().collect();
+        let result_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(shape),
+            result_flat
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+    }
+}
+
+/// Batch normalization (inference only)
+///
+/// Normalizes using pre-computed running statistics.
+/// output = (input - running_mean) / sqrt(running_var + eps) * gamma + beta
+///
+/// # Arguments
+/// * `gamma` - Optional scale (weight), defaults to 1.0
+/// * `beta` - Optional shift (bias), defaults to 0.0
+/// * `running_mean` - Pre-computed mean per channel
+/// * `running_var` - Pre-computed variance per channel
+/// * `eps` - Numerical stability constant
+#[wasm_bindgen]
+impl NDArray {
+    #[wasm_bindgen(js_name = batchNorm)]
+    pub fn batch_norm(
+        &self,
+        gamma: Option<NDArray>,
+        beta: Option<NDArray>,
+        running_mean: &NDArray,
+        running_var: &NDArray,
+        eps: f64
+    ) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+
+        // Assume NCHW format (batch, channels, height, width)
+        if ndim < 2 {
+            return Err(JsValue::from_str("batchNorm requires at least 2D input (N, C, ...)"));
+        }
+
+        let num_channels = shape[1];
+        let mean_data = running_mean.inner.as_f64_slice();
+        let var_data = running_var.inner.as_f64_slice();
+
+        if mean_data.len() != num_channels || var_data.len() != num_channels {
+            return Err(JsValue::from_str("running_mean/var must match channel dimension"));
+        }
+
+        // Compute per-channel scale and shift
+        let mut scale = vec![1.0f64; num_channels];
+        let mut shift = vec![0.0f64; num_channels];
+
+        for c in 0..num_channels {
+            let std = (var_data[c] + eps).sqrt();
+            scale[c] = 1.0 / std;
+            shift[c] = -mean_data[c] / std;
+
+            if let Some(ref g) = gamma {
+                let g_data = g.inner.as_f64_slice();
+                scale[c] *= g_data[c];
+                shift[c] *= g_data[c];
+            }
+
+            if let Some(ref b) = beta {
+                let b_data = b.inner.as_f64_slice();
+                shift[c] += b_data[c];
+            }
+        }
+
+        // Apply normalization
+        let batch = shape[0];
+        let spatial: usize = shape[2..].iter().product();
+
+        let mut result_data = vec![0.0f64; data.len()];
+        let data_slice = self.inner.as_f64_slice();
+
+        for n in 0..batch {
+            for c in 0..num_channels {
+                for s in 0..spatial {
+                    let idx = n * (num_channels * spatial) + c * spatial + s;
+                    result_data[idx] = data_slice[idx] * scale[c] + shift[c];
+                }
+            }
+        }
+
+        let result_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(shape),
+            result_data
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+    }
+}
+
+/// Take elements along an axis (like numpy.take)
+///
+/// Used for embedding lookup: take(embedding_table, token_ids, axis=0)
+///
+/// # Arguments
+/// * `indices` - Array of indices to take (1D)
+/// * `axis` - Axis along which to take
+#[wasm_bindgen]
+impl NDArray {
+    pub fn take(&self, indices: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        let idx_data = indices.inner.as_f64_slice();
+        let indices_usize: Vec<usize> = idx_data.iter().map(|&x| x as usize).collect();
+
+        // Validate indices
+        let axis_len = shape[axis];
+        for &idx in &indices_usize {
+            if idx >= axis_len {
+                return Err(JsValue::from_str(&format!(
+                    "index {} is out of bounds for axis {} with size {}",
+                    idx, axis, axis_len
+                )));
+            }
+        }
+
+        // Build output shape
+        let mut out_shape = shape.to_vec();
+        out_shape[axis] = indices_usize.len();
+
+        // Use ndarray's select
+        let result = data.select(ndarray::Axis(axis), &indices_usize);
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result.to_owned())))
+    }
+}
+
+/// Gather elements along an axis (alias for take)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn gather(&self, indices: &NDArray, axis: usize) -> Result<NDArray, JsValue> {
+        self.take(indices, axis)
+    }
+}
+
+/// Reciprocal square root: 1/sqrt(x)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn rsqrt(&self) -> NDArray {
+        let data = self.inner.as_ndarray();
+        let result = data.mapv(|x| 1.0 / x.sqrt());
+        NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+    }
+}
+
+/// Sigmoid activation: 1 / (1 + exp(-x))
+#[wasm_bindgen]
+impl NDArray {
+    pub fn sigmoid(&self) -> NDArray {
+        let data = self.inner.as_ndarray();
+        let result = data.mapv(|x| 1.0 / (1.0 + (-x).exp()));
+        NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+    }
+}
+
+/// SiLU (Swish) activation: x * sigmoid(x)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn silu(&self) -> NDArray {
+        let data = self.inner.as_ndarray();
+        let result = data.mapv(|x| x / (1.0 + (-x).exp()));
+        NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+    }
+}
+
+/// Top-k values and indices along an axis
+///
+/// Returns (values, indices) where both have the axis dimension reduced to k.
+///
+/// # Arguments
+/// * `k` - Number of top elements to return
+/// * `axis` - Axis along which to find top-k
+/// * `sorted` - If true, results are sorted in descending order
+#[wasm_bindgen]
+impl NDArray {
+    pub fn topk(&self, k: usize, axis: usize, sorted: bool) -> Result<js_sys::Array, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if axis >= shape.len() {
+            return Err(JsValue::from_str(&format!(
+                "axis {} is out of bounds for array of dimension {}",
+                axis, shape.len()
+            )));
+        }
+
+        if k > shape[axis] {
+            return Err(JsValue::from_str(&format!(
+                "k={} is greater than axis size {}",
+                k, shape[axis]
+            )));
+        }
+
+        // Build output shape
+        let mut out_shape = shape.to_vec();
+        out_shape[axis] = k;
+
+        let axis_len = shape[axis];
+        let outer_size: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
+
+        let total_out = out_shape.iter().product();
+        let mut values_data = vec![0.0f64; total_out];
+        let mut indices_data = vec![0.0f64; total_out];
+
+        let data_slice = self.inner.as_f64_slice();
+
+        for outer in 0..outer_size.max(1) {
+            for inner in 0..inner_size.max(1) {
+                // Collect (value, index) pairs for this lane
+                let mut pairs: Vec<(f64, usize)> = Vec::with_capacity(axis_len);
+
+                for i in 0..axis_len {
+                    let idx = outer * axis_len * inner_size.max(1) + i * inner_size.max(1) + inner;
+                    pairs.push((data_slice[idx], i));
+                }
+
+                // Partial sort to get top k (descending)
+                pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.truncate(k);
+
+                if !sorted {
+                    // If not sorted, leave in arbitrary order (already partially sorted though)
+                }
+
+                // Write to output
+                for (i, &(val, orig_idx)) in pairs.iter().enumerate() {
+                    let out_idx = outer * k * inner_size.max(1) + i * inner_size.max(1) + inner;
+                    values_data[out_idx] = val;
+                    indices_data[out_idx] = orig_idx as f64;
+                }
+            }
+        }
+
+        let values_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(&out_shape),
+            values_data
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let indices_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(&out_shape),
+            indices_data
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let result = js_sys::Array::new();
+        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(values_arr))));
+        result.push(&JsValue::from(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(indices_arr))));
+
+        Ok(result)
+    }
+}
+
+/// Lower triangular matrix (zeros above k-th diagonal)
+///
+/// # Arguments
+/// * `k` - Diagonal offset (0 = main diagonal, positive = above, negative = below)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn tril(&self, k: i32) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if shape.len() < 2 {
+            return Err(JsValue::from_str("tril requires at least 2D input"));
+        }
+
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        let batch_size: usize = shape[..shape.len() - 2].iter().product();
+
+        let mut result_data = self.inner.as_f64_slice().to_vec();
+
+        for b in 0..batch_size.max(1) {
+            for i in 0..rows {
+                for j in 0..cols {
+                    // Keep element if j <= i + k (lower triangular)
+                    if (j as i32) > (i as i32) + k {
+                        let idx = b * rows * cols + i * cols + j;
+                        result_data[idx] = 0.0;
+                    }
+                }
+            }
+        }
+
+        let result_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(shape),
+            result_data
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+    }
+}
+
+/// Upper triangular matrix (zeros below k-th diagonal)
+///
+/// # Arguments
+/// * `k` - Diagonal offset (0 = main diagonal, positive = above, negative = below)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn triu(&self, k: i32) -> Result<NDArray, JsValue> {
+        let data = self.inner.as_ndarray();
+        let shape = data.shape();
+
+        if shape.len() < 2 {
+            return Err(JsValue::from_str("triu requires at least 2D input"));
+        }
+
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        let batch_size: usize = shape[..shape.len() - 2].iter().product();
+
+        let mut result_data = self.inner.as_f64_slice().to_vec();
+
+        for b in 0..batch_size.max(1) {
+            for i in 0..rows {
+                for j in 0..cols {
+                    // Keep element if j >= i + k (upper triangular)
+                    if (j as i32) < (i as i32) + k {
+                        let idx = b * rows * cols + i * cols + j;
+                        result_data[idx] = 0.0;
+                    }
+                }
+            }
+        }
+
+        let result_arr = ndarray::ArrayD::from_shape_vec(
+            ndarray::IxDyn(shape),
+            result_data
+        ).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result_arr)))
+    }
+}
+
+/// Create a causal attention mask (lower triangular matrix of -inf and 0)
+///
+/// Returns a mask where positions that can attend are 0, others are -inf.
+/// Useful for transformer causal (autoregressive) attention.
+///
+/// # Arguments
+/// * `size` - Sequence length (creates size x size mask)
+#[wasm_bindgen(js_name = causalMask)]
+pub fn causal_mask(size: usize) -> NDArray {
+    let mut data = vec![0.0f64; size * size];
+
+    for i in 0..size {
+        for j in 0..size {
+            // Set to -inf where j > i (can't attend to future)
+            if j > i {
+                data[i * size + j] = f64::NEG_INFINITY;
+            }
+        }
+    }
+
+    let arr = ndarray::ArrayD::from_shape_vec(
+        ndarray::IxDyn(&[size, size]),
+        data
+    ).unwrap();
+
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(arr))
+}

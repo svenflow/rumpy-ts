@@ -300,6 +300,205 @@ add_test("countNonzero", "countNonzero",
          {"data": arr_nz.tolist(), "shape": [6]},
          int(np.count_nonzero(arr_nz)), shape=[])
 
+# ==================== SPRINT 4: ML Inference Ops ====================
+
+# Test layerNorm
+def layer_norm_numpy(x, normalized_shape, gamma=None, beta=None, eps=1e-5):
+    """NumPy reference implementation of layer normalization."""
+    shape = x.shape
+    ndim = len(shape)
+    norm_ndim = len(normalized_shape)
+
+    norm_size = np.prod(normalized_shape)
+    batch_size = np.prod(shape[:ndim - norm_ndim])
+
+    flat = x.reshape(batch_size, norm_size)
+    mean = flat.mean(axis=1, keepdims=True)
+    var = flat.var(axis=1, keepdims=True)
+
+    normalized = (flat - mean) / np.sqrt(var + eps)
+
+    if gamma is not None:
+        normalized = normalized * gamma.flatten()
+    if beta is not None:
+        normalized = normalized + beta.flatten()
+
+    return normalized.reshape(shape)
+
+arr_ln = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float64)
+add_test("layerNorm 2x4 no affine", "layerNorm",
+         {"data": arr_ln.flatten().tolist(), "shape": [2, 4],
+          "normalized_shape": [4], "gamma": None, "beta": None, "eps": 1e-5},
+         layer_norm_numpy(arr_ln, [4], eps=1e-5))
+
+gamma_ln = np.array([1, 2, 1, 2], dtype=np.float64)
+beta_ln = np.array([0, 1, 0, 1], dtype=np.float64)
+add_test("layerNorm 2x4 with gamma/beta", "layerNorm",
+         {"data": arr_ln.flatten().tolist(), "shape": [2, 4],
+          "normalized_shape": [4],
+          "gamma": gamma_ln.tolist(), "beta": beta_ln.tolist(), "eps": 1e-5},
+         layer_norm_numpy(arr_ln, [4], gamma_ln, beta_ln, eps=1e-5))
+
+# Test rmsNorm
+def rms_norm_numpy(x, gamma, eps=1e-5):
+    """NumPy reference implementation of RMS normalization."""
+    shape = x.shape
+    last_dim = shape[-1]
+    batch_size = np.prod(shape[:-1])
+
+    flat = x.reshape(batch_size, last_dim)
+    rms = np.sqrt(np.mean(flat ** 2, axis=1, keepdims=True) + eps)
+    normalized = flat / rms
+
+    return (normalized * gamma.flatten()).reshape(shape)
+
+arr_rms = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float64)
+gamma_rms = np.array([1, 2, 3], dtype=np.float64)
+add_test("rmsNorm 2x3", "rmsNorm",
+         {"data": arr_rms.flatten().tolist(), "shape": [2, 3],
+          "gamma": gamma_rms.tolist(), "eps": 1e-5},
+         rms_norm_numpy(arr_rms, gamma_rms, eps=1e-5))
+
+# Test batchNorm (inference mode)
+def batch_norm_numpy(x, gamma, beta, running_mean, running_var, eps=1e-5):
+    """NumPy reference implementation of batch normalization (inference)."""
+    # x shape: NCHW
+    n, c = x.shape[0], x.shape[1]
+    spatial = np.prod(x.shape[2:])
+
+    x_flat = x.reshape(n, c, spatial)
+    result = np.zeros_like(x_flat)
+
+    for ch in range(c):
+        scale = 1.0 / np.sqrt(running_var[ch] + eps)
+        if gamma is not None:
+            scale *= gamma[ch]
+
+        shift = -running_mean[ch] * scale
+        if gamma is not None and beta is not None:
+            # Corrected formula: shift = gamma * (-mean/std) + beta
+            shift = gamma[ch] * (-running_mean[ch] / np.sqrt(running_var[ch] + eps)) + beta[ch]
+        elif beta is not None:
+            shift += beta[ch]
+
+        result[:, ch, :] = x_flat[:, ch, :] * scale + shift
+
+    return result.reshape(x.shape)
+
+arr_bn = np.arange(24, dtype=np.float64).reshape(2, 3, 2, 2)  # N=2, C=3, H=2, W=2
+running_mean_bn = np.array([1, 2, 3], dtype=np.float64)
+running_var_bn = np.array([0.5, 1.0, 1.5], dtype=np.float64)
+gamma_bn = np.array([1, 1, 1], dtype=np.float64)
+beta_bn = np.array([0, 0, 0], dtype=np.float64)
+
+add_test("batchNorm NCHW", "batchNorm",
+         {"data": arr_bn.flatten().tolist(), "shape": [2, 3, 2, 2],
+          "gamma": gamma_bn.tolist(), "beta": beta_bn.tolist(),
+          "running_mean": running_mean_bn.tolist(), "running_var": running_var_bn.tolist(),
+          "eps": 1e-5},
+         batch_norm_numpy(arr_bn, gamma_bn, beta_bn, running_mean_bn, running_var_bn, eps=1e-5))
+
+# Test take (embedding lookup)
+embedding_table = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]], dtype=np.float64)
+indices_take = np.array([0, 2, 1], dtype=np.float64)
+
+add_test("take axis=0 (embedding lookup)", "take",
+         {"data": embedding_table.flatten().tolist(), "shape": [4, 3],
+          "indices": indices_take.tolist(), "axis": 0},
+         np.take(embedding_table, [0, 2, 1], axis=0))
+
+arr_2d = np.arange(12, dtype=np.float64).reshape(3, 4)
+add_test("take axis=1", "take",
+         {"data": arr_2d.flatten().tolist(), "shape": [3, 4],
+          "indices": [0, 2].tolist() if isinstance([0, 2], np.ndarray) else [0.0, 2.0], "axis": 1},
+         np.take(arr_2d, [0, 2], axis=1))
+
+# Test rsqrt
+arr_rsqrt = np.array([1, 4, 9, 16, 25], dtype=np.float64)
+add_test("rsqrt", "rsqrt",
+         {"data": arr_rsqrt.tolist(), "shape": [5]},
+         1.0 / np.sqrt(arr_rsqrt))
+
+# Test sigmoid
+def sigmoid_numpy(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+arr_sigmoid = np.array([-2, -1, 0, 1, 2], dtype=np.float64)
+add_test("sigmoid", "sigmoid",
+         {"data": arr_sigmoid.tolist(), "shape": [5]},
+         sigmoid_numpy(arr_sigmoid))
+
+# Test silu (swish)
+def silu_numpy(x):
+    return x / (1.0 + np.exp(-x))
+
+arr_silu = np.array([-2, -1, 0, 1, 2], dtype=np.float64)
+add_test("silu", "silu",
+         {"data": arr_silu.tolist(), "shape": [5]},
+         silu_numpy(arr_silu))
+
+# Test topk
+arr_topk = np.array([3, 1, 4, 1, 5, 9, 2, 6], dtype=np.float64)
+sorted_idx = np.argsort(arr_topk)[::-1][:3]  # Top 3 indices
+sorted_vals = arr_topk[sorted_idx]
+
+add_test("topk k=3", "topk",
+         {"data": arr_topk.tolist(), "shape": [8], "k": 3, "axis": 0, "sorted": True},
+         {"values": sorted_vals.tolist(), "indices": sorted_idx.tolist()}, shape=[3])
+
+# 2D topk
+arr_topk_2d = np.array([[3, 1, 4], [1, 5, 9]], dtype=np.float64)
+# topk along axis=1
+vals_0 = np.sort(arr_topk_2d[0])[::-1][:2]
+vals_1 = np.sort(arr_topk_2d[1])[::-1][:2]
+idx_0 = np.argsort(arr_topk_2d[0])[::-1][:2]
+idx_1 = np.argsort(arr_topk_2d[1])[::-1][:2]
+
+add_test("topk 2D k=2 axis=1", "topk",
+         {"data": arr_topk_2d.flatten().tolist(), "shape": [2, 3], "k": 2, "axis": 1, "sorted": True},
+         {"values": np.array([vals_0, vals_1]).tolist(),
+          "indices": np.array([idx_0, idx_1]).tolist()}, shape=[2, 2])
+
+# Test tril
+arr_tril = np.arange(9, dtype=np.float64).reshape(3, 3)
+add_test("tril k=0", "tril",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": 0},
+         np.tril(arr_tril, k=0))
+
+add_test("tril k=1", "tril",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": 1},
+         np.tril(arr_tril, k=1))
+
+add_test("tril k=-1", "tril",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": -1},
+         np.tril(arr_tril, k=-1))
+
+# Test triu
+add_test("triu k=0", "triu",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": 0},
+         np.triu(arr_tril, k=0))
+
+add_test("triu k=1", "triu",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": 1},
+         np.triu(arr_tril, k=1))
+
+add_test("triu k=-1", "triu",
+         {"data": arr_tril.flatten().tolist(), "shape": [3, 3], "k": -1},
+         np.triu(arr_tril, k=-1))
+
+# Test causalMask
+def causal_mask_numpy(size):
+    mask = np.zeros((size, size), dtype=np.float64)
+    for i in range(size):
+        for j in range(size):
+            if j > i:
+                mask[i, j] = float('-inf')
+    return mask
+
+add_test("causalMask size=4", "causalMask",
+         {"size": 4},
+         causal_mask_numpy(4))
+
 # Custom JSON encoder to handle NaN/Inf
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
