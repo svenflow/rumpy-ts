@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Auto-Pack Benchmark</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <h1>Auto-Pack API Benchmark</h1>
+  <p>Tests the tfjs-like API where B is automatically packed on first use</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+
+      try {
+        // Init tfjs WASM
+        log('Loading TensorFlow.js WASM backend...');
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log('tfjs WASM ready');
+
+        // Load rumpy with auto-pack wrapper
+        log('Loading rumpy...');
+        const wasm = await import('./pkg-web/rumpy_wasm.js');
+        await wasm.default();
+
+        // Import our wrapper
+        const rumpy = await import('./pkg-web/rumpy.js');
+        log('rumpy loaded with auto-pack API');
+
+        // Init futex pool for parallel execution
+        const threads = navigator.hardwareConcurrency || 4;
+        if (wasm.initFutexPool) {
+          log('Initializing futex pool with ' + threads + ' threads...');
+          wasm.initFutexPool(threads);
+          while (!wasm.futexWorkersReady()) {
+            await new Promise(r => setTimeout(r, 10));
+          }
+          log('Futex pool ready');
+        }
+
+        const sizes = [2048, 4096, 6144, 8192];
+        const iters = 5;
+
+        log('\n=== BENCHMARK: Auto-Pack (tfjs-like API) ===\n');
+        log('Testing: rumpy.matmul() with automatic B-packing cache\n');
+        log('Size | 1st call | 2nd+ call | tfjs-Inf | vs-tfjs (2nd+)');
+        log('-----|----------|-----------|----------|---------------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random()); // "weights"
+
+          // tfjs setup
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+
+          // Warmup both
+          rumpy.matmul(a, b, n, n, n);
+          tf.matMul(tA, tB).dataSync();
+
+          // Clear our cache to measure first call
+          rumpy.clearPackedCache(b);
+
+          // Measure FIRST call (includes packing)
+          const firstStart = performance.now();
+          rumpy.matmul(a, b, n, n, n);
+          const firstTime = performance.now() - firstStart;
+
+          // Measure SECOND+ calls (uses cached pack)
+          let cachedTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            rumpy.matmul(a, b, n, n, n);
+            cachedTime = Math.min(cachedTime, performance.now() - start);
+          }
+
+          // Measure tfjs inference mode
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            res.dataSync();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+
+          tA.dispose();
+          tB.dispose();
+
+          const vsTfjs = (tfjsTime / cachedTime).toFixed(2);
+
+          log(
+            n.toString().padStart(4) + ' | ' +
+            firstTime.toFixed(1).padStart(6) + 'ms | ' +
+            cachedTime.toFixed(1).padStart(7) + 'ms | ' +
+            tfjsTime.toFixed(1).padStart(6) + 'ms | ' +
+            vsTfjs.padStart(10) + 'x'
+          );
+        }
+
+        log('\n=== ANALYSIS ===');
+        log('1st call = includes packing cost (amortized over many inferences)');
+        log('2nd+ call = uses cached pack (fast path)');
+        log('vs-tfjs > 1.0 = we beat tfjs inference mode\n');
+        log('DONE');
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>

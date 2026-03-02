@@ -76,8 +76,12 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::OnceLock;
 
 /// Number of spin iterations before a worker falls back to `atomic.wait`.
-/// ~100 μs at 1 GHz equivalent; tuned so that back-to-back dispatches
-/// never park.
+///
+/// Tuned for WASM GEMM workloads:
+/// - 100K iterations at ~1ns/iter = 100μs spin time
+/// - Typical GEMM dispatch interval: 10-100μs
+/// - Workers rarely hit futex wait for continuous dispatches
+/// - Lower than pthreadpool's 1M to reduce CPU usage during idle
 const SPIN_ITERS_WORKER: u32 = 100_000;
 
 /// Main thread uses spin-only (cannot `atomic.wait` in a browser context).
@@ -111,11 +115,11 @@ impl Slot {
 
     #[inline]
     fn init(&self, start: usize, end: usize) {
+        // All Relaxed stores here - the Release on generation ensures
+        // workers see these before starting work (they Acquire on generation).
         self.range_start.store(start, Relaxed);
         self.range_end.store(end, Relaxed);
-        // Release here so that once a worker Acquires via range_len, it sees
-        // the start/end stores.
-        self.range_len.store((end - start) as isize, Release);
+        self.range_len.store((end - start) as isize, Relaxed);
     }
 
     /// Claim one item from our own range (from the front). pthreadpool
@@ -170,6 +174,11 @@ pub struct FutexPool {
     /// 0 → everyone's done.
     active: AtomicU32,
 
+    /// Number of workers that have started their main loop.
+    /// Incremented by each worker (threads 1..n) when they enter `worker_main`.
+    /// When this equals `threads - 1`, all workers are ready.
+    workers_ready: AtomicU32,
+
     /// Per-thread work ranges.
     slots: Box<[Slot]>,
 
@@ -194,6 +203,7 @@ impl FutexPool {
             threads: n,
             generation: AtomicI32::new(0),
             active: AtomicU32::new(0),
+            workers_ready: AtomicU32::new(0),
             slots,
             task: UnsafeCell::new(None),
         }
@@ -278,13 +288,26 @@ impl FutexPool {
             *self.task.get() = Some(tp);
         }
 
-        // 3. Arm completion counter, bump generation, wake workers.
-        self.active.store(n as u32, Release);
+        // 3. Arm completion counter, bump generation.
+        // Use Relaxed for active - the Release on generation provides the
+        // necessary synchronization (workers Acquire on generation).
+        self.active.store(n as u32, Relaxed);
 
         // Wrapping add, but avoid the shutdown bit.
+        // This single Release barrier synchronizes all prior Relaxed stores.
         let gen = self.generation.fetch_add(1, Release) + 1;
         debug_assert_eq!(gen & GEN_SHUTDOWN as i32, 0, "generation overflowed into shutdown bit");
 
+        // Note: we skip wake_workers() since workers spin with 1M iterations
+        // and will see the generation change immediately. The notify syscall
+        // has ~5μs overhead and is unnecessary for rapid dispatches.
+        // For long idle periods, workers will eventually futex_wait and
+        // the next dispatch will wake them via the generation change.
+        //
+        // HOWEVER: if workers ARE in futex wait, they need to be woken.
+        // With 1M spin iterations at ~1ns/iter = 1ms, workers only hit wait
+        // if there's >1ms between dispatches. For GEMM benchmarking this is
+        // unlikely, but for safety let's keep the wake.
         self.wake_workers();
 
         // 4. Caller is thread 0: do its share of the work, then steal.
@@ -324,6 +347,15 @@ impl FutexPool {
 /// next generation bump arrives before the spin runs out, so we *never* hit
 /// `atomic.wait` and the wakeup latency is ~zero.
 fn worker_main(pool: &'static FutexPool, tid: usize) {
+    // Signal that this worker is ready. The main thread can poll `workers_ready`
+    // to know when all workers have started.
+    pool.workers_ready.fetch_add(1, Release);
+
+    // Also wake the main thread's readiness wait (if any).
+    unsafe {
+        memory_atomic_notify(pool.workers_ready.as_ptr() as *mut i32, 1);
+    }
+
     let mut seen_gen = 0i32;
 
     loop {
@@ -441,4 +473,22 @@ pub fn parallelize<F: Fn(usize) + Sync>(pool: &FutexPool, range: usize, task: F)
 /// For benchmark exposure: how many threads (including thread 0) we have.
 pub fn threads_count() -> usize {
     POOL.get().map(|p| p.threads).unwrap_or(1)
+}
+
+/// Check if all workers are ready.
+/// Returns true if all `n-1` workers (where n is the thread count) have started.
+/// Returns false if the pool isn't initialized or not all workers are ready.
+pub fn workers_ready() -> bool {
+    match POOL.get() {
+        Some(p) => {
+            let expected = (p.threads as u32).saturating_sub(1);
+            p.workers_ready.load(Acquire) >= expected
+        }
+        None => false,
+    }
+}
+
+/// Get the number of workers that have started (for debugging).
+pub fn workers_ready_count() -> u32 {
+    POOL.get().map(|p| p.workers_ready.load(Acquire)).unwrap_or(0)
 }

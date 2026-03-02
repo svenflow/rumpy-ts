@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Futex Pool Benchmark</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <h1>Futex Pool Benchmark</h1>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+
+      try {
+        // Init tfjs WASM
+        log('Loading TensorFlow.js WASM backend...');
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log('tfjs WASM ready');
+
+        // Load rumpy
+        log('Loading rumpy...');
+        const mod = await import('./pkg-web/rumpy_wasm.js');
+        await mod.default();
+        log('rumpy loaded');
+
+        const threads = navigator.hardwareConcurrency || 4;
+
+        // Init futex pool
+        log('Initializing futex pool with ' + threads + ' threads...');
+        mod.initFutexPool(threads);
+        while (!mod.futexWorkersReady()) {
+          await new Promise(r => setTimeout(r, 10));
+        }
+        log('Futex pool ready');
+
+        // Measure dispatch overhead
+        if (mod.measureDispatchOverhead) {
+          const dispatchUs = mod.measureDispatchOverhead(1000);
+          log('Dispatch overhead (with atomic inc): ' + dispatchUs.toFixed(2) + 'μs per call');
+        }
+        if (mod.measurePureDispatchOverhead) {
+          const pureUs = mod.measurePureDispatchOverhead(1000);
+          log('Dispatch overhead (pure sync): ' + pureUs.toFixed(2) + 'μs per call');
+        }
+
+        // Skip rayon for now - it hangs when futex pool is also initialized
+        // (they may conflict on SharedArrayBuffer/threading infrastructure)
+
+        const sizes = [64, 128, 256, 512, 1024, 2048];
+        const iters = 5;
+        const results = [];
+
+        log('\n=== BENCHMARK: Rumpy vs TensorFlow.js WASM ===\n');
+        log('INFERENCE MODE: both pre-pack B (fair apples-to-apples)');
+        log('AD-HOC MODE: we pack each call, tfjs creates fresh tensors\n');
+        log('Size | Packed | tfjs-Inf | ratio | Ad-hoc |  tfjs-Adhoc');
+        log('-----|--------|----------|-------|--------|------------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+
+          // Warmup
+          mod.matmulF32Futex(a, b, n, n, n);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          tf.matMul(tA, tB).dataSync();
+
+          // Benchmark single-threaded (our kernel)
+          let stTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            mod.matmulF32Optimized(a, b, n, n, n);
+            stTime = Math.min(stTime, performance.now() - start);
+          }
+
+          // Benchmark futex (our default path - packs B each call)
+          let futexTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            mod.matmulF32Futex(a, b, n, n, n);
+            futexTime = Math.min(futexTime, performance.now() - start);
+          }
+
+          // Benchmark with pre-packed B (matches tfjs inference model)
+          let packedTime = Infinity;
+          if (mod.packBForGemm && mod.matmulWithPackedB && n >= 128) {
+            // Pre-pack B once (not timed - this is "compile time")
+            const packedB = mod.packBForGemm(b, n, n);
+            // Time the matmul with pre-packed B
+            for (let i = 0; i < iters; i++) {
+              const start = performance.now();
+              mod.matmulWithPackedB(a, packedB, n, n, n);
+              packedTime = Math.min(packedTime, performance.now() - start);
+            }
+          }
+
+          // Also benchmark forced-parallel (skip threshold check)
+          let forcedParallelTime = Infinity;
+          if (mod.matmulF32FutexForced) {
+            for (let i = 0; i < iters; i++) {
+              const start = performance.now();
+              mod.matmulF32FutexForced(a, b, n, n, n);
+              forcedParallelTime = Math.min(forcedParallelTime, performance.now() - start);
+            }
+          }
+
+          // Benchmark tfjs - two scenarios:
+          // 1. "Inference" mode: reuse tensors (tfjs pre-packs)
+          // 2. "Ad-hoc" mode: fresh tensors each time (both pay creation cost)
+
+          // INFERENCE MODE: tfjs reuses pre-packed tensors
+          let tfjsInferenceTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            res.dataSync();
+            res.dispose();
+            tfjsInferenceTime = Math.min(tfjsInferenceTime, performance.now() - start);
+          }
+
+          // AD-HOC MODE: tfjs creates fresh tensors (pays creation cost)
+          let tfjsAdhocTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const tA_fresh = tf.tensor2d(Array.from(a), [n, n]);
+            const tB_fresh = tf.tensor2d(Array.from(b), [n, n]);
+            const res = tf.matMul(tA_fresh, tB_fresh);
+            res.dataSync();
+            res.dispose();
+            tA_fresh.dispose();
+            tB_fresh.dispose();
+            tfjsAdhocTime = Math.min(tfjsAdhocTime, performance.now() - start);
+          }
+
+          // Measure warmup time (tensor creation + first matmul)
+          const warmupStart = performance.now();
+          const tA_warmup = tf.tensor2d(Array.from(a), [n, n]);
+          const tB_warmup = tf.tensor2d(Array.from(b), [n, n]);
+          const resWarmup = tf.matMul(tA_warmup, tB_warmup);
+          resWarmup.dataSync();
+          resWarmup.dispose();
+          tA_warmup.dispose();
+          tB_warmup.dispose();
+          const tfjsWarmupTime = performance.now() - warmupStart;
+
+          // Our warmup (first call with fresh data)
+          const ourWarmupStart = performance.now();
+          mod.matmulF32Futex(a, b, n, n, n);
+          const ourWarmupTime = performance.now() - ourWarmupStart;
+
+          tA.dispose();
+          tB.dispose();
+
+          // Compare: our packed vs tfjs inference (both pre-pack B)
+          const packedVsTfjsInf = packedTime !== Infinity
+            ? (tfjsInferenceTime / packedTime).toFixed(2)
+            : 'N/A';
+
+          const row = {
+            size: n,
+            packed: packedTime,
+            auto: futexTime,
+            tfjsInference: tfjsInferenceTime,
+            tfjsAdhoc: tfjsAdhocTime,
+            ourWarmup: ourWarmupTime,
+            tfjsWarmup: tfjsWarmupTime
+          };
+          results.push(row);
+
+          // Log: Size | OurPacked | tfjs-Inf | ratio | OurAdhoc | tfjs-Adhoc | ratio
+          const packStr = packedTime !== Infinity ? packedTime.toFixed(1) + 'ms' : '  N/A';
+          log(
+            n.toString().padStart(4) + ' | ' +
+            packStr.padStart(7) + ' | ' +
+            tfjsInferenceTime.toFixed(1).padStart(6) + 'ms | ' +
+            packedVsTfjsInf.padStart(5) + 'x | ' +
+            futexTime.toFixed(1).padStart(6) + 'ms | ' +
+            tfjsAdhocTime.toFixed(1).padStart(8) + 'ms'
+          );
+        }
+
+        log('\n=== ANALYSIS ===');
+        log('vs-Inf > 1.00 = we beat tfjs inference mode');
+        log('vs-Adhoc > 1.00 = we beat tfjs ad-hoc mode');
+        log('Warmup = first call time (us / tfjs)\n');
+
+        window.BENCHMARK_RESULTS = results;
+        log('\nDONE - results in window.BENCHMARK_RESULTS');
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>

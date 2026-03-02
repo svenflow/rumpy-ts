@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Futex Pool Simple Test</title>
+</head>
+<body>
+  <h1>Futex Pool Test</h1>
+  <pre id="output">Click the button to run test</pre>
+  <button id="run">Run Test</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    window.rumpy = null;
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting test...\n';
+
+      try {
+        if (!window.rumpy) {
+          log('Loading rumpy...');
+          const mod = await import('./pkg-web/rumpy_wasm.js');
+          await mod.default();
+          window.rumpy = mod;
+          log('rumpy loaded');
+        }
+
+        const r = window.rumpy;
+        const threads = navigator.hardwareConcurrency || 4;
+
+        // Init both pools
+        log('Initializing futex pool with ' + threads + ' threads...');
+        r.initFutexPool(threads);
+        log('Futex threads: ' + r.getFutexThreads());
+
+        // Test 64x64 first - just futex
+        log('\n--- Testing 64x64 ---');
+        const n = 64;
+        const a = new Float32Array(n*n).fill(1);
+        const b = new Float32Array(n*n).fill(1);
+
+        const start1 = performance.now();
+        const c = r.matmulF32Futex(a, b, n, n, n);
+        const time1 = performance.now() - start1;
+        log('Futex: ' + time1.toFixed(2) + 'ms, result[0]=' + c[0]);
+
+        // Test single-threaded for comparison
+        const start2 = performance.now();
+        const d = r.matmulF32Optimized(a, b, n, n, n);
+        const time2 = performance.now() - start2;
+        log('Single-threaded: ' + time2.toFixed(2) + 'ms, result[0]=' + d[0]);
+
+        // Test 512x512 directly (definitely parallel)
+        log('\n--- Testing 512x512 ---');
+        const n2 = 512;
+        const a2 = new Float32Array(n2*n2).fill(1);
+        const b2 = new Float32Array(n2*n2).fill(1);
+
+        log('512 call (first real parallel call)...');
+        const c5 = r.matmulF32Futex(a2, b2, n2, n2, n2);
+        log('512 done, result[0]=' + c5[0] + ' (expected ' + n2 + ')');
+
+        log('\nDONE');
+        window.DONE = true;
+      } catch (e) {
+        log('ERROR: ' + e.message + '\n' + e.stack);
+        window.DONE = true;
+      }
+    };
+  </script>
+</body>
+</html>

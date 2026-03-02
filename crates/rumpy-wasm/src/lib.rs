@@ -1959,6 +1959,70 @@ pub fn matmul_f32_optimized(a: &Float32Array, b: &Float32Array, m: usize, n: usi
     }
 }
 
+/// Pre-pack B matrix for repeated matmuls with the same weights.
+///
+/// This amortizes packing cost across multiple matmuls (like tfjs inference mode).
+/// Returns a Float32Array containing the packed B data.
+///
+/// Example:
+/// ```javascript
+/// const packedB = packBForGemm(weights, k, n);
+/// // Later, for each input:
+/// const result = matmulWithPackedB(input, packedB, m, n, k);
+/// ```
+#[wasm_bindgen(js_name = packBForGemm)]
+pub fn pack_b_for_gemm(b: &Float32Array, k: usize, n: usize) -> Float32Array {
+    let b_vec = b.to_vec();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let packed = simd_gemm::pack_b_for_gemm(&b_vec, k, n);
+        Float32Array::from(packed.as_slice())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM: just return the original (no packing needed for native)
+        Float32Array::from(b_vec.as_slice())
+    }
+}
+
+/// GEMM with pre-packed B matrix (inference mode).
+///
+/// Use packBForGemm to create packedB once, then call this for each matmul.
+/// This matches how tfjs/XNNPACK works for inference.
+/// Uses parallel execution via futex pool when available.
+#[wasm_bindgen(js_name = matmulWithPackedB)]
+pub fn matmul_with_packed_b(a: &Float32Array, packed_b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let packed_b_vec = packed_b.to_vec();
+
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "atomics",
+        feature = "futex-pool"
+    ))]
+    {
+        // Use parallel version when futex pool is available
+        let c_vec = simd_gemm::matmul_with_packed_b_parallel_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(all(target_feature = "atomics", feature = "futex-pool"))))]
+    {
+        // Fallback to ST when no futex pool
+        let c_vec = simd_gemm::matmul_with_packed_b_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Non-WASM: packed_b is just regular B, use normal matmul
+        let c_vec = simd_gemm::matmul_dispatch_f32(&a_vec, &packed_b_vec, m, n, k);
+        Float32Array::from(c_vec.as_slice())
+    }
+}
+
 /// Parallel version of optimized 6x8 GEMM using rayon (LEGACY)
 ///
 /// Kept for A/B benchmarking. Has known problems — see v3 below.
@@ -2059,6 +2123,186 @@ pub fn matmul_f32_optimized_parallel_v4(a: &Float32Array, b: &Float32Array, m: u
         Float32Array::from(c_vec.as_slice())
     }
 }
+
+// ============================================================================
+// FUTEX POOL - Low-latency parallel dispatch (experimental)
+// ============================================================================
+
+/// Initialize the futex thread pool with n threads.
+///
+/// This creates a separate thread pool that bypasses Rayon entirely, using
+/// raw memory.atomic.wait32/notify for ~10μs dispatch overhead (vs ~150μs for Rayon).
+///
+/// Call this INSTEAD OF initThreadPool if you want to use matmulF32Futex.
+/// If you call both, you'll have two thread pools (works but wastes cores).
+///
+/// Requires the `futex-pool` feature:
+/// ```
+/// wasm-pack build --features futex-pool
+/// ```
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = initFutexPool)]
+pub fn init_futex_pool(n: usize) {
+    simd_gemm::init_futex_pool(n);
+}
+
+/// Get the number of threads in the futex pool.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = getFutexThreads)]
+pub fn get_futex_threads() -> usize {
+    simd_gemm::futex_threads_count()
+}
+
+/// Check if all futex workers are ready.
+///
+/// Web Workers are spawned asynchronously when `initFutexPool` is called.
+/// This function returns true once all workers have started and are waiting
+/// for work. You should poll this before calling `matmulF32Futex` to avoid
+/// crashes.
+///
+/// Example:
+/// ```javascript
+/// initFutexPool(navigator.hardwareConcurrency);
+/// while (!futexWorkersReady()) {
+///   await new Promise(r => setTimeout(r, 10));
+/// }
+/// // Now safe to use matmulF32Futex
+/// ```
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = futexWorkersReady)]
+pub fn futex_workers_ready() -> bool {
+    pthreadpool_rs::wasm_futex::workers_ready()
+}
+
+/// Get the number of futex workers that have started (for debugging).
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = futexWorkersReadyCount)]
+pub fn futex_workers_ready_count() -> u32 {
+    pthreadpool_rs::wasm_futex::workers_ready_count()
+}
+
+/// Measure dispatch overhead by calling parallelize with minimal work.
+/// Returns average dispatch time in microseconds.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = measureDispatchOverhead)]
+pub fn measure_dispatch_overhead(iterations: u32) -> f64 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let pool = match pthreadpool_rs::wasm_futex::get_pool() {
+        Some(p) => p,
+        None => return -1.0, // Pool not initialized
+    };
+
+    // Minimal work function - just increment a counter
+    let counter = AtomicU32::new(0);
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    let start = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    for _ in 0..iterations {
+        pool.parallelize(num_threads, |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    let end = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    let total_ms = end - start;
+    let avg_us = (total_ms * 1000.0) / (iterations as f64);
+    avg_us
+}
+
+/// Measure pure dispatch overhead with no actual work (just coordination).
+/// Returns average dispatch time in microseconds.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = measurePureDispatchOverhead)]
+pub fn measure_pure_dispatch_overhead(iterations: u32) -> f64 {
+    let pool = match pthreadpool_rs::wasm_futex::get_pool() {
+        Some(p) => p,
+        None => return -1.0,
+    };
+
+    let num_threads = pthreadpool_rs::wasm_futex::threads_count();
+
+    let start = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    for _ in 0..iterations {
+        // Dispatch with minimal work - each thread runs once with no-op
+        pool.parallelize(num_threads, |_| {
+            // No-op - just sync overhead
+        });
+    }
+
+    let end = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+
+    let total_ms = end - start;
+    let avg_us = (total_ms * 1000.0) / (iterations as f64);
+    avg_us
+}
+
+/// Parallel GEMM using the raw futex pool.
+///
+/// This achieves much lower dispatch overhead (~5-10μs) compared to Rayon (~150μs).
+/// Best for small-to-medium matrices (128-512) where Rayon's overhead dominates.
+///
+/// Requires:
+/// 1. Build with `--features futex-pool`
+/// 2. Call `initFutexPool(n)` from JS before using this
+///
+/// Falls back to single-threaded if futex pool isn't initialized.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "atomics",
+    feature = "futex-pool"
+))]
+#[wasm_bindgen(js_name = matmulF32Futex)]
+pub fn matmul_f32_futex(a: &Float32Array, b: &Float32Array, m: usize, n: usize, k: usize) -> Float32Array {
+    let a_vec = a.to_vec();
+    let b_vec = b.to_vec();
+    // Use tiled version for better parallel efficiency (shared B packing)
+    let c_vec = simd_gemm::matmul_futex_f32_tiled(&a_vec, &b_vec, m, n, k);
+    Float32Array::from(c_vec.as_slice())
+}
+
+// ============================================================================
+// BLOCKED/SPECIAL MATMUL VARIANTS
+// ============================================================================
 
 /// Cache-blocked XNNPACK-style matmul with pre-packed B
 ///

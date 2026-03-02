@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Futex Pool Minimal Test</title>
+</head>
+<body>
+  <h1>Futex Pool Minimal Test</h1>
+  <pre id="output">Click the button to run test</pre>
+  <button id="run">Run Test</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting...\n';
+
+      try {
+        const mod = await import('./pkg-web/rumpy_wasm.js');
+        await mod.default();
+        log('Loaded');
+
+        const threads = navigator.hardwareConcurrency || 4;
+        log('Init futex pool with ' + threads + ' threads...');
+        mod.initFutexPool(threads);
+        log('Futex threads: ' + mod.getFutexThreads());
+
+        // Wait for workers to be ready using the new API
+        log('Waiting for workers to be ready...');
+        while (!mod.futexWorkersReady()) {
+          log('  Workers ready: ' + mod.futexWorkersReadyCount() + '/' + (threads - 1));
+          await new Promise(r => setTimeout(r, 50));
+        }
+        log('All workers ready: ' + mod.futexWorkersReadyCount() + '/' + (threads - 1));
+
+        // Test 1: Small matmul that goes single-threaded
+        log('\n--- ST path (64x64) ---');
+        const n1 = 64;
+        const a1 = new Float32Array(n1*n1).fill(1);
+        const b1 = new Float32Array(n1*n1).fill(1);
+        const c1 = mod.matmulF32Futex(a1, b1, n1, n1, n1);
+        log('64x64 done: ' + c1[0]);
+
+        // Test 2: Larger matmul that should go parallel
+        log('\n--- MT path (128x128) ---');
+        const n2 = 128;
+        const a2 = new Float32Array(n2*n2).fill(1);
+        const b2 = new Float32Array(n2*n2).fill(1);
+
+        log('Calling matmulF32Futex...');
+        const c2 = mod.matmulF32Futex(a2, b2, n2, n2, n2);
+        log('128x128 done: ' + c2[0]);
+
+        log('\nDONE');
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>

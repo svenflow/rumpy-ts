@@ -1,3 +1,10 @@
+// Enable the unstable stdarch_wasm_atomic_wait feature for memory.atomic.wait32/notify
+// intrinsics. These are the WASM equivalent of futex syscalls.
+#![cfg_attr(
+    all(target_arch = "wasm32", target_feature = "atomics", feature = "wasm-futex"),
+    feature(stdarch_wasm_atomic_wait)
+)]
+
 //! pthreadpool-rs: A Rust port of pthreadpool
 //!
 //! This library provides efficient parallel execution of computational workloads

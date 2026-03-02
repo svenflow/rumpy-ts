@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Pre-Pack Benchmark</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <h1>Pre-Pack API Benchmark</h1>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+
+      try {
+        // Init tfjs WASM
+        log('Loading TensorFlow.js WASM backend...');
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log('tfjs WASM ready');
+
+        // Load rumpy
+        log('Loading rumpy...');
+        const mod = await import('./pkg-web/rumpy_wasm.js');
+        await mod.default();
+        log('rumpy loaded');
+
+        // Check for pre-pack API
+        log('Pre-pack API: packBForGemm=' + (typeof mod.packBForGemm === 'function'));
+        log('Pre-pack API: matmulWithPackedB=' + (typeof mod.matmulWithPackedB === 'function'));
+
+        // Init futex pool for parallel execution
+        const threads = navigator.hardwareConcurrency || 4;
+        if (mod.initFutexPool) {
+          log('Initializing futex pool with ' + threads + ' threads...');
+          mod.initFutexPool(threads);
+          // Wait for workers to be ready
+          while (!mod.futexWorkersReady()) {
+            await new Promise(r => setTimeout(r, 10));
+          }
+          log('Futex pool ready');
+        } else {
+          log('No futex pool available (single-threaded mode)');
+        }
+
+        const sizes = [128, 256, 512, 1024, 2048];
+        const iters = 5;
+        const results = [];
+
+        log('\n=== BENCHMARK: Pre-Pack API ===\n');
+        log('INFERENCE MODE: both pre-pack B');
+        log('AD-HOC MODE: we pack each call, tfjs creates fresh tensors\n');
+        log('Size |  Packed  | tfjs-Inf | vs-Inf | Our-Adhoc | tfjs-Adhoc | vs-Adhoc');
+        log('-----|----------|----------|--------|-----------|------------|----------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+
+          // Warmup
+          mod.matmulF32Optimized(a, b, n, n, n);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          tf.matMul(tA, tB).dataSync();
+
+          // === INFERENCE MODE: Pre-packed B ===
+
+          // Pre-pack B (not timed - this is compile/graph-build time)
+          let packedB = null;
+          if (mod.packBForGemm && mod.matmulWithPackedB) {
+            packedB = mod.packBForGemm(b, n, n);
+          }
+
+          // Benchmark: our matmul with pre-packed B
+          let packedTime = Infinity;
+          if (packedB) {
+            for (let i = 0; i < iters; i++) {
+              const start = performance.now();
+              mod.matmulWithPackedB(a, packedB, n, n, n);
+              packedTime = Math.min(packedTime, performance.now() - start);
+            }
+          }
+
+          // Benchmark: tfjs inference mode (reuses tensors = pre-packed)
+          let tfjsInferenceTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            res.dataSync();
+            res.dispose();
+            tfjsInferenceTime = Math.min(tfjsInferenceTime, performance.now() - start);
+          }
+
+          // === AD-HOC MODE: Pack fresh each call ===
+
+          // Benchmark: our standard matmul (packs B each call)
+          let adhocTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            mod.matmulF32Optimized(a, b, n, n, n);
+            adhocTime = Math.min(adhocTime, performance.now() - start);
+          }
+
+          // Benchmark: tfjs ad-hoc (creates fresh tensors each call)
+          let tfjsAdhocTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const tA_fresh = tf.tensor2d(Array.from(a), [n, n]);
+            const tB_fresh = tf.tensor2d(Array.from(b), [n, n]);
+            const res = tf.matMul(tA_fresh, tB_fresh);
+            res.dataSync();
+            res.dispose();
+            tA_fresh.dispose();
+            tB_fresh.dispose();
+            tfjsAdhocTime = Math.min(tfjsAdhocTime, performance.now() - start);
+          }
+
+          tA.dispose();
+          tB.dispose();
+
+          // Compute ratios
+          const vsInf = packedTime !== Infinity
+            ? (tfjsInferenceTime / packedTime).toFixed(2)
+            : 'N/A';
+          const vsAdhoc = (tfjsAdhocTime / adhocTime).toFixed(2);
+
+          const row = {
+            size: n,
+            packed: packedTime,
+            tfjsInference: tfjsInferenceTime,
+            adhoc: adhocTime,
+            tfjsAdhoc: tfjsAdhocTime
+          };
+          results.push(row);
+
+          // Log: Size | OurPacked | tfjs-Inf | ratio | OurAdhoc | tfjs-Adhoc | ratio
+          const packStr = packedTime !== Infinity ? packedTime.toFixed(1) + 'ms' : '  N/A';
+          log(
+            n.toString().padStart(4) + ' | ' +
+            packStr.padStart(8) + ' | ' +
+            tfjsInferenceTime.toFixed(1).padStart(6) + 'ms | ' +
+            vsInf.padStart(6) + ' | ' +
+            adhocTime.toFixed(1).padStart(7) + 'ms | ' +
+            tfjsAdhocTime.toFixed(1).padStart(8) + 'ms | ' +
+            vsAdhoc.padStart(6)
+          );
+        }
+
+        log('\n=== ANALYSIS ===');
+        log('vs-Inf = tfjsInference / ourPacked (>1 = we win)');
+        log('vs-Adhoc = tfjsAdhoc / ourAdhoc (>1 = we win)\n');
+
+        window.BENCHMARK_RESULTS = results;
+        log('\nDONE - results in window.BENCHMARK_RESULTS');
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>
