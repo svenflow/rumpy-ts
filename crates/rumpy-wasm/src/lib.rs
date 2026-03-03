@@ -179,6 +179,10 @@ impl NDArray {
         CpuBackend::sum(&self.inner)
     }
 
+    pub fn prod(&self) -> f64 {
+        CpuBackend::prod(&self.inner)
+    }
+
     pub fn mean(&self) -> f64 {
         CpuBackend::mean(&self.inner)
     }
@@ -200,9 +204,67 @@ impl NDArray {
         CpuBackend::var(&self.inner)
     }
 
+    /// Variance with degrees of freedom adjustment
+    /// ddof=0 for population variance (default), ddof=1 for sample variance
+    #[wasm_bindgen(js_name = varDdof)]
+    pub fn var_ddof(&self, ddof: usize) -> f64 {
+        CpuBackend::var_ddof(&self.inner, ddof)
+    }
+
+    /// Standard deviation with degrees of freedom adjustment
+    /// ddof=0 for population std (default), ddof=1 for sample std
+    #[wasm_bindgen(js_name = stdDdof)]
+    pub fn std_ddof(&self, ddof: usize) -> f64 {
+        CpuBackend::std_ddof(&self.inner, ddof)
+    }
+
     // Reshape
     pub fn reshape(&self, shape: Vec<usize>) -> Result<NDArray, JsValue> {
         CpuBackend::reshape(&self.inner, shape)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Reshape with support for -1 dimension inference (NumPy-style)
+    /// One dimension can be -1, which will be inferred from the total size
+    #[wasm_bindgen(js_name = reshapeInfer)]
+    pub fn reshape_infer(&self, shape: Vec<i64>) -> Result<NDArray, JsValue> {
+        let total_size = self.inner.size();
+
+        // Count -1s and compute known product
+        let neg_one_count = shape.iter().filter(|&&d| d == -1).count();
+        if neg_one_count > 1 {
+            return Err(JsValue::from_str("Can only specify one dimension as -1"));
+        }
+
+        let mut final_shape: Vec<usize> = Vec::with_capacity(shape.len());
+        let known_product: i64 = shape.iter().filter(|&&d| d != -1).product();
+
+        if known_product <= 0 && neg_one_count == 0 {
+            return Err(JsValue::from_str("Invalid shape: dimensions must be positive"));
+        }
+
+        for &dim in &shape {
+            if dim == -1 {
+                if known_product == 0 {
+                    return Err(JsValue::from_str("Cannot infer dimension with zero-size product"));
+                }
+                let inferred = total_size as i64 / known_product;
+                if inferred * known_product != total_size as i64 {
+                    return Err(JsValue::from_str(&format!(
+                        "Cannot reshape array of size {} into shape {:?}",
+                        total_size, shape
+                    )));
+                }
+                final_shape.push(inferred as usize);
+            } else if dim < 0 {
+                return Err(JsValue::from_str(&format!("Invalid dimension: {}", dim)));
+            } else {
+                final_shape.push(dim as usize);
+            }
+        }
+
+        CpuBackend::reshape(&self.inner, final_shape)
             .map(NDArray::new)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -322,9 +384,14 @@ impl NDArray {
     // ============ Activation functions ============
 
     /// ReLU activation: max(0, x)
+    /// NaN values are propagated (NumPy behavior)
     pub fn relu(&self) -> NDArray {
         let data = self.inner.as_ndarray();
-        let result = data.mapv(|x| if x > 0.0 { x } else { 0.0 });
+        let result = data.mapv(|x| {
+            if x.is_nan() { x }  // Propagate NaN
+            else if x > 0.0 { x }
+            else { 0.0 }
+        });
         NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
     }
 

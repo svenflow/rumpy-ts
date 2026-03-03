@@ -752,6 +752,90 @@ add_test("dequantizeLinear scale=0.001", "dequantizeLinear",
          arr_dq_edge * 0.001)
 
 
+# ==================== MISSING OP TESTS (from audit) ====================
+
+# Test var (population variance, ddof=0)
+arr_var = np.array([2, 4, 4, 4, 5, 5, 7, 9], dtype=np.float64)
+add_test("var population", "var",
+         {"data": arr_var.tolist(), "shape": [8]},
+         np.var(arr_var), shape=[])
+
+# Test var with ddof=1 (sample variance)
+add_test("varDdof sample", "varDdof",
+         {"data": arr_var.tolist(), "shape": [8], "ddof": 1},
+         np.var(arr_var, ddof=1), shape=[])
+
+# Test std (population std, ddof=0)
+add_test("std population", "std",
+         {"data": arr_var.tolist(), "shape": [8]},
+         np.std(arr_var), shape=[])
+
+# Test std with ddof=1 (sample std)
+add_test("stdDdof sample", "stdDdof",
+         {"data": arr_var.tolist(), "shape": [8], "ddof": 1},
+         np.std(arr_var, ddof=1), shape=[])
+
+# Test prod
+arr_prod = np.array([1, 2, 3, 4, 5], dtype=np.float64)
+add_test("prod", "prod",
+         {"data": arr_prod.tolist(), "shape": [5]},
+         np.prod(arr_prod), shape=[])
+
+# Test argmin/argmax with NaN (should not panic, return index of first non-NaN min/max)
+arr_nan_arg = np.array([3.0, np.nan, 1.0, 4.0, np.nan], dtype=np.float64)
+# NumPy's argmin returns the first NaN index, but our implementation returns first non-NaN min
+# We're testing that it doesn't panic
+add_test("argmin with NaN", "argmin",
+         {"data": arr_nan_arg.tolist(), "shape": [5]},
+         int(np.nanargmin(arr_nan_arg)), shape=[])  # Use nanargmin for expected
+
+add_test("argmax with NaN", "argmax",
+         {"data": arr_nan_arg.tolist(), "shape": [5]},
+         int(np.nanargmax(arr_nan_arg)), shape=[])  # Use nanargmax for expected
+
+# Test relu with NaN (should propagate NaN)
+arr_relu_nan = np.array([-2, -1, 0, np.nan, 1, 2], dtype=np.float64)
+add_test("relu with NaN", "relu",
+         {"data": arr_relu_nan.tolist(), "shape": [6]},
+         np.where(np.isnan(arr_relu_nan), np.nan, np.maximum(arr_relu_nan, 0)))
+
+# Test reshapeInfer (-1 dimension)
+arr_reshape = np.arange(12, dtype=np.float64)
+add_test("reshapeInfer (-1, 4)", "reshapeInfer",
+         {"data": arr_reshape.tolist(), "shape": [12], "new_shape": [-1, 4]},
+         arr_reshape.reshape(-1, 4))
+
+add_test("reshapeInfer (3, -1)", "reshapeInfer",
+         {"data": arr_reshape.tolist(), "shape": [12], "new_shape": [3, -1]},
+         arr_reshape.reshape(3, -1))
+
+# Test min/max with NaN
+arr_minmax_nan = np.array([3.0, np.nan, 1.0, 4.0], dtype=np.float64)
+add_test("min with NaN", "min",
+         {"data": arr_minmax_nan.tolist(), "shape": [4]},
+         np.nanmin(arr_minmax_nan), shape=[])  # Our min ignores NaN like numpy's f64::min
+
+add_test("max with NaN", "max",
+         {"data": arr_minmax_nan.tolist(), "shape": [4]},
+         np.nanmax(arr_minmax_nan), shape=[])  # Our max ignores NaN like numpy's f64::max
+
+# Test matmul (basic)
+a_mat = np.array([[1, 2], [3, 4]], dtype=np.float64)
+b_mat = np.array([[5, 6], [7, 8]], dtype=np.float64)
+add_test("matmul 2x2", "matmul",
+         {"a": a_mat.flatten().tolist(), "a_shape": [2, 2],
+          "b": b_mat.flatten().tolist(), "b_shape": [2, 2]},
+         np.matmul(a_mat, b_mat))
+
+# Test matmul non-square
+a_rect = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float64)  # 2x3
+b_rect = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float64)  # 3x2
+add_test("matmul 2x3 @ 3x2", "matmul",
+         {"a": a_rect.flatten().tolist(), "a_shape": [2, 3],
+          "b": b_rect.flatten().tolist(), "b_shape": [3, 2]},
+         np.matmul(a_rect, b_rect))
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.floating):

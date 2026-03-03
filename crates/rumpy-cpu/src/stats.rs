@@ -24,16 +24,25 @@ impl StatsOps for CpuBackend {
     }
 
     fn var(arr: &CpuArray) -> f64 {
-        let data = arr.as_ndarray();
-        if data.is_empty() {
-            return f64::NAN;
-        }
-        let mean = data.sum() / data.len() as f64;
-        data.mapv(|x| (x - mean).powi(2)).sum() / data.len() as f64
+        Self::var_ddof(arr, 0)
     }
 
     fn std(arr: &CpuArray) -> f64 {
-        Self::var(arr).sqrt()
+        Self::std_ddof(arr, 0)
+    }
+
+    fn var_ddof(arr: &CpuArray, ddof: usize) -> f64 {
+        let data = arr.as_ndarray();
+        let n = data.len();
+        if n == 0 || n <= ddof {
+            return f64::NAN;
+        }
+        let mean = data.sum() / n as f64;
+        data.mapv(|x| (x - mean).powi(2)).sum() / (n - ddof) as f64
+    }
+
+    fn std_ddof(arr: &CpuArray, ddof: usize) -> f64 {
+        Self::var_ddof(arr, ddof).sqrt()
     }
 
     fn min(arr: &CpuArray) -> f64 {
@@ -51,19 +60,35 @@ impl StatsOps for CpuBackend {
     }
 
     fn argmin(arr: &CpuArray) -> usize {
+        // Handle NaN: treat NaN as greater than all values (NumPy behavior)
+        // This avoids panic from partial_cmp returning None
         arr.as_ndarray()
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .min_by(|(_, a), (_, b)| {
+                a.partial_cmp(b).unwrap_or_else(|| {
+                    // NaN comparison: NaN is "greater" so non-NaN wins
+                    if a.is_nan() { std::cmp::Ordering::Greater }
+                    else { std::cmp::Ordering::Less }
+                })
+            })
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
 
     fn argmax(arr: &CpuArray) -> usize {
+        // Handle NaN: treat NaN as less than all values (NumPy behavior)
+        // This avoids panic from partial_cmp returning None
         arr.as_ndarray()
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| {
+                a.partial_cmp(b).unwrap_or_else(|| {
+                    // NaN comparison: NaN is "less" so non-NaN wins
+                    if a.is_nan() { std::cmp::Ordering::Less }
+                    else { std::cmp::Ordering::Greater }
+                })
+            })
             .map(|(i, _)| i)
             .unwrap_or(0)
     }

@@ -386,6 +386,46 @@
                     result = arr.take(indices, inputs.axis);  // gather is alias for take
                     break;
                 }
+                // Audit-driven additions: var, std, prod, matmul, etc.
+                case 'var': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.var() };
+                }
+                case 'varDdof': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.varDdof(inputs.ddof) };
+                }
+                case 'std': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.std() };
+                }
+                case 'stdDdof': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.stdDdof(inputs.ddof) };
+                }
+                case 'prod': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.prod() };
+                }
+                case 'min': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.min() };
+                }
+                case 'max': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    return { scalar: arr.max() };
+                }
+                case 'reshapeInfer': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.reshapeInfer(BigInt64Array.from(inputs.new_shape.map(x => BigInt(x))));
+                    break;
+                }
+                case 'matmul': {
+                    const a = createArray(inputs.a, inputs.a_shape);
+                    const b = createArray(inputs.b, inputs.b_shape);
+                    result = rumpy.matmul(a, b);
+                    break;
+                }
                 default:
                     throw new Error(`Unknown op: ${op}`);
             }
@@ -433,12 +473,15 @@
                     const result = runOp(testCase);
 
                     if ('scalar' in result) {
-                        // Scalar result
+                        // Scalar result - use relative tolerance for floating point
                         const expected = testCase.expected;
-                        if (result.scalar === expected) {
-                            log(`${testCase.name}: ${result.scalar} === ${expected}`, true);
+                        const got = result.scalar;
+                        const isClose = (Math.abs(got - expected) < 1e-10) ||
+                                       (Math.abs(got - expected) / Math.max(Math.abs(expected), 1e-10) < 1e-6);
+                        if (isClose) {
+                            log(`${testCase.name}: ${got} === ${expected}`, true);
                         } else {
-                            log(`${testCase.name}: got ${result.scalar}, expected ${expected}`, false);
+                            log(`${testCase.name}: got ${got}, expected ${expected}`, false);
                         }
                     } else if ('compound' in result) {
                         // Compound result (e.g., topk returns values and indices)

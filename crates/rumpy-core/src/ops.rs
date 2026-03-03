@@ -89,6 +89,12 @@ pub trait StatsOps {
     fn mean(arr: &Self::Array) -> f64;
     fn var(arr: &Self::Array) -> f64;
     fn std(arr: &Self::Array) -> f64;
+    /// Variance with degrees of freedom adjustment (ddof)
+    /// ddof=0 for population variance (default), ddof=1 for sample variance
+    fn var_ddof(arr: &Self::Array, ddof: usize) -> f64;
+    /// Standard deviation with degrees of freedom adjustment (ddof)
+    /// ddof=0 for population std (default), ddof=1 for sample std
+    fn std_ddof(arr: &Self::Array, ddof: usize) -> f64;
     fn min(arr: &Self::Array) -> f64;
     fn max(arr: &Self::Array) -> f64;
     fn argmin(arr: &Self::Array) -> usize;
