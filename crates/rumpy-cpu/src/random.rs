@@ -109,16 +109,19 @@ impl RandomOps for CpuBackend {
             if replace {
                 (0..size).map(|_| data[rng.random_range(0..n)]).collect()
             } else {
-                // Without replacement
+                // Without replacement using Fisher-Yates partial shuffle - O(size) instead of O(n)
+                // Only shuffle the first `size` elements we need
+                let k = size.min(n);
                 let mut indices: Vec<usize> = (0..n).collect();
-                let mut result = Vec::with_capacity(size.min(n));
 
-                for _ in 0..size.min(n) {
-                    let i = rng.random_range(0..indices.len());
-                    result.push(data[indices.remove(i)]);
+                for i in 0..k {
+                    // Swap element at i with a random element from [i, n)
+                    let j = rng.random_range(i..n);
+                    indices.swap(i, j);
                 }
 
-                result
+                // Take the first k elements
+                indices[..k].iter().map(|&i| data[i]).collect()
             }
         });
 

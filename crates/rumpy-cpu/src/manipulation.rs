@@ -280,7 +280,7 @@ impl ManipulationOps for CpuBackend {
         }
     }
 
-    fn flip(arr: &CpuArray, axis: Option<usize>) -> CpuArray {
+    fn flip(arr: &CpuArray, axis: Option<usize>) -> Result<CpuArray> {
         let data = arr.as_ndarray();
 
         match axis {
@@ -288,15 +288,18 @@ impl ManipulationOps for CpuBackend {
                 // Flip all elements (reverse flattened)
                 let flat: Vec<f64> = data.iter().cloned().collect();
                 let reversed: Vec<f64> = flat.into_iter().rev().collect();
-                CpuArray::from_ndarray(
+                Ok(CpuArray::from_ndarray(
                     ArrayD::from_shape_vec(IxDyn(arr.shape()), reversed).unwrap(),
-                )
+                ))
             }
             Some(ax) => {
                 // Flip along specific axis
                 let shape = data.shape();
                 if ax >= shape.len() {
-                    panic!("AxisError: axis {} is out of bounds for array of dimension {}", ax, shape.len());
+                    return Err(RumpyError::InvalidAxis {
+                        axis: ax,
+                        ndim: shape.len(),
+                    });
                 }
 
                 let mut result = data.clone();
@@ -329,17 +332,17 @@ impl ManipulationOps for CpuBackend {
                     }
                 }
 
-                CpuArray::from_ndarray(result)
+                Ok(CpuArray::from_ndarray(result))
             }
         }
     }
 
-    fn roll(arr: &CpuArray, shift: i64, axis: Option<usize>) -> CpuArray {
+    fn roll(arr: &CpuArray, shift: i64, axis: Option<usize>) -> Result<CpuArray> {
         let shape = arr.shape();
         let ndim = shape.len();
 
         if arr.as_ndarray().is_empty() {
-            return arr.clone();
+            return Ok(arr.clone());
         }
 
         match axis {
@@ -356,11 +359,14 @@ impl ManipulationOps for CpuBackend {
                     result[new_i] = val;
                 }
 
-                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), result).unwrap())
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), result).unwrap()))
             }
             Some(ax) => {
                 if ax >= ndim {
-                    return arr.clone(); // Invalid axis, return unchanged
+                    return Err(RumpyError::InvalidAxis {
+                        axis: ax,
+                        ndim,
+                    });
                 }
 
                 // Proper axis-aware rolling
@@ -369,7 +375,7 @@ impl ManipulationOps for CpuBackend {
                 let shift = shift as usize;
 
                 if shift == 0 {
-                    return arr.clone();
+                    return Ok(arr.clone());
                 }
 
                 let data = arr.as_ndarray();
@@ -377,8 +383,8 @@ impl ManipulationOps for CpuBackend {
 
                 // Calculate strides for iteration
                 let total_size: usize = shape.iter().product();
-                let axis_stride: usize = shape[ax + 1..].iter().product();
-                let outer_stride: usize = shape[ax..].iter().product();
+                let _axis_stride: usize = shape[ax + 1..].iter().product();
+                let _outer_stride: usize = shape[ax..].iter().product();
 
                 for flat_idx in 0..total_size {
                     // Decompose flat index into coordinates
@@ -405,7 +411,7 @@ impl ManipulationOps for CpuBackend {
                     result.as_slice_mut().unwrap()[new_flat_idx] = data.as_slice().unwrap()[flat_idx];
                 }
 
-                CpuArray::from_ndarray(result)
+                Ok(CpuArray::from_ndarray(result))
             }
         }
     }
@@ -424,7 +430,7 @@ impl ManipulationOps for CpuBackend {
         for _ in 0..k {
             // Rotate 90 degrees: transpose then flip horizontally
             result = crate::CpuBackend::transpose(&result);
-            result = Self::flip(&result, Some(1));
+            result = Self::flip(&result, Some(1))?;
         }
 
         Ok(result)
@@ -499,15 +505,29 @@ mod tests {
     #[test]
     fn test_flip() {
         let a = arr(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
-        let flipped = CpuBackend::flip(&a, None);
+        let flipped = CpuBackend::flip(&a, None).unwrap();
         assert_eq!(flipped.as_f64_slice(), vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_flip_invalid_axis() {
+        let a = arr(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let result = CpuBackend::flip(&a, Some(5));
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_roll() {
         let a = arr(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
-        let rolled = CpuBackend::roll(&a, 2, None);
+        let rolled = CpuBackend::roll(&a, 2, None).unwrap();
         assert_eq!(rolled.as_f64_slice(), vec![4.0, 5.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_roll_invalid_axis() {
+        let a = arr(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let result = CpuBackend::roll(&a, 1, Some(5));
+        assert!(result.is_err());
     }
 
     #[test]

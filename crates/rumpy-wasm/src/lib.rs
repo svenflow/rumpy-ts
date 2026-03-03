@@ -2947,12 +2947,30 @@ impl NDArray {
 /// Sort array elements (NaN values sort to end, NumPy behavior)
 #[wasm_bindgen]
 impl NDArray {
-    pub fn sort(&self) -> NDArray {
-        NDArray::new(CpuBackend::sort(&self.inner, None))
+    pub fn sort(&self) -> Result<NDArray, JsValue> {
+        CpuBackend::sort(&self.inner, None)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    pub fn argsort(&self) -> NDArray {
-        NDArray::new(CpuBackend::argsort(&self.inner, None))
+    #[wasm_bindgen(js_name = sortAxis)]
+    pub fn sort_axis(&self, axis: usize) -> Result<NDArray, JsValue> {
+        CpuBackend::sort(&self.inner, Some(axis))
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    pub fn argsort(&self) -> Result<NDArray, JsValue> {
+        CpuBackend::argsort(&self.inner, None)
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = argsortAxis)]
+    pub fn argsort_axis(&self, axis: usize) -> Result<NDArray, JsValue> {
+        CpuBackend::argsort(&self.inner, Some(axis))
+            .map(NDArray::new)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     pub fn unique(&self) -> NDArray {

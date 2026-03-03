@@ -2,7 +2,7 @@
 
 use crate::{CpuArray, CpuBackend};
 use ndarray::{ArrayD, IxDyn};
-use rumpy_core::{ops::SortOps, Array};
+use rumpy_core::{ops::SortOps, Array, Result, RumpyError};
 use std::cmp::Ordering;
 
 /// NaN-safe comparison for sorting: NaN values sort to the end (NumPy behavior)
@@ -21,7 +21,7 @@ fn nan_safe_cmp(a: &f64, b: &f64) -> Ordering {
 impl SortOps for CpuBackend {
     type Array = CpuArray;
 
-    fn sort(arr: &CpuArray, axis: Option<usize>) -> CpuArray {
+    fn sort(arr: &CpuArray, axis: Option<usize>) -> Result<CpuArray> {
         let shape = arr.shape();
         let ndim = shape.len();
 
@@ -30,12 +30,14 @@ impl SortOps for CpuBackend {
                 // Sort flattened array
                 let mut data = arr.as_f64_slice();
                 data.sort_by(nan_safe_cmp);
-                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), data).unwrap())
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), data).unwrap()))
             }
             Some(ax) => {
                 if ax >= ndim {
-                    // Invalid axis, return clone (NumPy would raise)
-                    return arr.clone();
+                    return Err(RumpyError::InvalidAxis {
+                        axis: ax,
+                        ndim,
+                    });
                 }
 
                 // Sort along specified axis
@@ -105,12 +107,12 @@ impl SortOps for CpuBackend {
                     }
                 }
 
-                CpuArray::from_ndarray(result)
+                Ok(CpuArray::from_ndarray(result))
             }
         }
     }
 
-    fn argsort(arr: &CpuArray, axis: Option<usize>) -> CpuArray {
+    fn argsort(arr: &CpuArray, axis: Option<usize>) -> Result<CpuArray> {
         let shape = arr.shape();
         let ndim = shape.len();
 
@@ -122,15 +124,14 @@ impl SortOps for CpuBackend {
                 indices.sort_by(|&a, &b| nan_safe_cmp(&data[a], &data[b]));
 
                 let result: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
-                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap())
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap()))
             }
             Some(ax) => {
                 if ax >= ndim {
-                    // Invalid axis, return indices 0..n for each lane
-                    let axis_len = if shape.is_empty() { 0 } else { shape[0] };
-                    let indices: Vec<f64> = (0..axis_len).map(|i| i as f64).collect();
-                    return CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape),
-                        (0..arr.as_ndarray().len()).map(|_| 0.0).collect()).unwrap());
+                    return Err(RumpyError::InvalidAxis {
+                        axis: ax,
+                        ndim,
+                    });
                 }
 
                 // Argsort along specified axis
@@ -197,22 +198,42 @@ impl SortOps for CpuBackend {
                     }
                 }
 
-                CpuArray::from_ndarray(result)
+                Ok(CpuArray::from_ndarray(result))
             }
         }
     }
 
-    fn searchsorted(arr: &CpuArray, values: &CpuArray) -> CpuArray {
+    fn searchsorted(arr: &CpuArray, values: &CpuArray, side: Option<&str>) -> CpuArray {
         let data = arr.as_f64_slice();
         let vals = values.as_f64_slice();
+        let use_right = side.map_or(false, |s| s == "right");
 
         let result: Vec<f64> = vals
             .iter()
             .map(|&v| {
                 // Binary search for insertion point with NaN-safe comparison
                 // NaN values in the search array sort to the end
-                data.binary_search_by(|probe| nan_safe_cmp(probe, &v))
-                    .unwrap_or_else(|i| i) as f64
+                let idx = data.binary_search_by(|probe| nan_safe_cmp(probe, &v));
+                match idx {
+                    Ok(i) => {
+                        if use_right {
+                            // For 'right', find rightmost position after all equal elements
+                            let mut pos = i;
+                            while pos < data.len() && nan_safe_cmp(&data[pos], &v) == Ordering::Equal {
+                                pos += 1;
+                            }
+                            pos as f64
+                        } else {
+                            // For 'left', find leftmost position before all equal elements
+                            let mut pos = i;
+                            while pos > 0 && nan_safe_cmp(&data[pos - 1], &v) == Ordering::Equal {
+                                pos -= 1;
+                            }
+                            pos as f64
+                        }
+                    }
+                    Err(i) => i as f64,
+                }
             })
             .collect();
 
@@ -280,7 +301,7 @@ mod tests {
     #[test]
     fn test_sort() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        let sorted = CpuBackend::sort(&a, None);
+        let sorted = CpuBackend::sort(&a, None).unwrap();
         assert_eq!(
             sorted.as_f64_slice(),
             vec![1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0]
@@ -288,20 +309,51 @@ mod tests {
     }
 
     #[test]
+    fn test_sort_invalid_axis() {
+        let a = CpuArray::from_f64_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let result = CpuBackend::sort(&a, Some(5));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_argsort() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0]);
-        let indices = CpuBackend::argsort(&a, None);
+        let indices = CpuBackend::argsort(&a, None).unwrap();
         // Values at indices 1, 3 are smallest (1.0), then 0 (3.0), then 2 (4.0), then 4 (5.0)
         assert_eq!(indices.as_f64_slice(), vec![1.0, 3.0, 0.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn test_argsort_invalid_axis() {
+        let a = CpuArray::from_f64_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let result = CpuBackend::argsort(&a, Some(5));
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_searchsorted() {
         let a = arr(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let values = arr(vec![2.5, 0.0, 5.0, 6.0]);
-        let indices = CpuBackend::searchsorted(&a, &values);
+        let indices = CpuBackend::searchsorted(&a, &values, None);
         // 2.5 -> index 2, 0.0 -> index 0, 5.0 -> index 4, 6.0 -> index 5
         assert_eq!(indices.as_f64_slice(), vec![2.0, 0.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_searchsorted_right() {
+        // Array: [1.0, 2.0, 2.0, 3.0, 4.0] (indices 0-4)
+        let a = arr(vec![1.0, 2.0, 2.0, 3.0, 4.0]);
+        let values = arr(vec![2.0]);
+
+        // Left side (default): returns first position where value could be inserted
+        // For 2.0, the first position is index 1 (before the first 2.0)
+        let left = CpuBackend::searchsorted(&a, &values, Some("left"));
+        assert_eq!(left.as_f64_slice(), vec![1.0]);
+
+        // Right side: returns position after last equal element
+        // For 2.0, after all 2.0s means index 3 (before 3.0)
+        let right = CpuBackend::searchsorted(&a, &values, Some("right"));
+        assert_eq!(right.as_f64_slice(), vec![3.0]);
     }
 
     #[test]

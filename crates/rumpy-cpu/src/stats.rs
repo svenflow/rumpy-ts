@@ -48,7 +48,7 @@ impl StatsOps for CpuBackend {
     fn min(arr: &CpuArray) -> f64 {
         let data = arr.as_ndarray();
         if data.is_empty() {
-            return f64::NAN; // NumPy raises ValueError, we return NaN
+            return f64::NAN;
         }
         data.iter()
             .cloned()
@@ -58,7 +58,7 @@ impl StatsOps for CpuBackend {
     fn max(arr: &CpuArray) -> f64 {
         let data = arr.as_ndarray();
         if data.is_empty() {
-            return f64::NAN; // NumPy raises ValueError, we return NaN
+            return f64::NAN;
         }
         data.iter()
             .cloned()
@@ -67,13 +67,11 @@ impl StatsOps for CpuBackend {
 
     fn argmin(arr: &CpuArray) -> usize {
         // Handle NaN: treat NaN as greater than all values (NumPy behavior)
-        // This avoids panic from partial_cmp returning None
         arr.as_ndarray()
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
                 a.partial_cmp(b).unwrap_or_else(|| {
-                    // NaN comparison: NaN is "greater" so non-NaN wins
                     if a.is_nan() { std::cmp::Ordering::Greater }
                     else { std::cmp::Ordering::Less }
                 })
@@ -84,13 +82,11 @@ impl StatsOps for CpuBackend {
 
     fn argmax(arr: &CpuArray) -> usize {
         // Handle NaN: treat NaN as less than all values (NumPy behavior)
-        // This avoids panic from partial_cmp returning None
         arr.as_ndarray()
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
                 a.partial_cmp(b).unwrap_or_else(|| {
-                    // NaN comparison: NaN is "less" so non-NaN wins
                     if a.is_nan() { std::cmp::Ordering::Less }
                     else { std::cmp::Ordering::Greater }
                 })
@@ -118,11 +114,9 @@ impl StatsOps for CpuBackend {
                 ndim: data.ndim(),
             });
         }
-        // Handle empty axis case - mean_axis returns None for empty arrays
         match data.mean_axis(Axis(axis)) {
             Some(result) => Ok(CpuArray::from_ndarray(result)),
             None => {
-                // For empty axis, return NaN-filled array with reduced shape
                 let mut new_shape = data.shape().to_vec();
                 new_shape.remove(axis);
                 if new_shape.is_empty() {
@@ -144,8 +138,8 @@ impl StatsOps for CpuBackend {
                 ndim: data.ndim(),
             });
         }
-        // ndarray doesn't have min_axis directly, we need to implement it
         let shape = data.shape();
+        let axis_len = shape[axis];
         let new_shape: Vec<usize> = shape
             .iter()
             .enumerate()
@@ -154,25 +148,38 @@ impl StatsOps for CpuBackend {
             .collect();
 
         let result_size: usize = new_shape.iter().product();
+        // Initialize with INFINITY and track if we've seen NaN
         let mut result = vec![f64::INFINITY; result_size];
+        let mut has_nan = vec![false; result_size];
 
-        for (i, &val) in data.iter().enumerate() {
-            // Calculate result index by removing the axis dimension
-            let mut idx = i;
-            let mut result_idx = 0;
-            let mut multiplier = 1;
+        // Calculate outer and inner loop sizes for the axis reduction
+        let outer_size: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
 
-            for d in (0..shape.len()).rev() {
-                let coord = idx % shape[d];
-                idx /= shape[d];
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let result_idx = outer * inner_size + inner;
 
-                if d != axis {
-                    result_idx += coord * multiplier;
-                    multiplier *= shape[d];
+                for ax_idx in 0..axis_len {
+                    // Compute flat index in original array
+                    let flat_idx = outer * (axis_len * inner_size) + ax_idx * inner_size + inner;
+                    let val = data.as_slice().unwrap()[flat_idx];
+
+                    // NaN propagation: if any value is NaN, result is NaN
+                    if val.is_nan() {
+                        has_nan[result_idx] = true;
+                    } else {
+                        result[result_idx] = result[result_idx].min(val);
+                    }
                 }
             }
+        }
 
-            result[result_idx] = result[result_idx].min(val);
+        // Apply NaN propagation
+        for i in 0..result_size {
+            if has_nan[i] {
+                result[i] = f64::NAN;
+            }
         }
 
         Ok(CpuArray::from_ndarray(
@@ -190,6 +197,7 @@ impl StatsOps for CpuBackend {
         }
 
         let shape = data.shape();
+        let axis_len = shape[axis];
         let new_shape: Vec<usize> = shape
             .iter()
             .enumerate()
@@ -198,7 +206,64 @@ impl StatsOps for CpuBackend {
             .collect();
 
         let result_size: usize = new_shape.iter().product();
+        // Initialize with NEG_INFINITY and track if we've seen NaN
         let mut result = vec![f64::NEG_INFINITY; result_size];
+        let mut has_nan = vec![false; result_size];
+
+        // Calculate outer and inner loop sizes for the axis reduction
+        let outer_size: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
+
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let result_idx = outer * inner_size + inner;
+
+                for ax_idx in 0..axis_len {
+                    // Compute flat index in original array
+                    let flat_idx = outer * (axis_len * inner_size) + ax_idx * inner_size + inner;
+                    let val = data.as_slice().unwrap()[flat_idx];
+
+                    // NaN propagation: if any value is NaN, result is NaN
+                    if val.is_nan() {
+                        has_nan[result_idx] = true;
+                    } else {
+                        result[result_idx] = result[result_idx].max(val);
+                    }
+                }
+            }
+        }
+
+        // Apply NaN propagation
+        for i in 0..result_size {
+            if has_nan[i] {
+                result[i] = f64::NAN;
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    fn prod_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let shape = data.shape();
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![1.0; result_size];
 
         for (i, &val) in data.iter().enumerate() {
             let mut idx = i;
@@ -215,7 +280,177 @@ impl StatsOps for CpuBackend {
                 }
             }
 
-            result[result_idx] = result[result_idx].max(val);
+            result[result_idx] *= val;
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    fn var_axis(arr: &CpuArray, axis: usize, ddof: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let mean_arr = Self::mean_axis(arr, axis)?;
+        let mean_data = mean_arr.as_ndarray();
+        let shape = data.shape();
+        let axis_len = shape[axis];
+
+        if axis_len <= ddof {
+            let nan_data = vec![f64::NAN; mean_data.len()];
+            return Ok(CpuArray::from_ndarray(
+                ArrayD::from_shape_vec(IxDyn(mean_data.shape()), nan_data).unwrap(),
+            ));
+        }
+
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![0.0; result_size];
+
+        for (i, &val) in data.iter().enumerate() {
+            let mut idx = i;
+            let mut result_idx = 0;
+            let mut multiplier = 1;
+
+            for d in (0..shape.len()).rev() {
+                let coord = idx % shape[d];
+                idx /= shape[d];
+
+                if d != axis {
+                    result_idx += coord * multiplier;
+                    multiplier *= shape[d];
+                }
+            }
+
+            let mean = mean_data.as_slice().unwrap()[result_idx];
+            result[result_idx] += (val - mean).powi(2);
+        }
+
+        // Divide by (n - ddof)
+        for r in &mut result {
+            *r /= (axis_len - ddof) as f64;
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    fn std_axis(arr: &CpuArray, axis: usize, ddof: usize) -> Result<CpuArray> {
+        let var_arr = Self::var_axis(arr, axis, ddof)?;
+        let data = var_arr.as_ndarray();
+        let result = data.mapv(|x| x.sqrt());
+        Ok(CpuArray::from_ndarray(result))
+    }
+
+    fn argmin_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let shape = data.shape();
+        let axis_len = shape[axis];
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![0.0; result_size];
+        let mut min_vals = vec![f64::INFINITY; result_size];
+
+        for (i, &val) in data.iter().enumerate() {
+            let mut idx = i;
+            let mut result_idx = 0;
+            let mut axis_coord = 0;
+            let mut multiplier = 1;
+
+            for d in (0..shape.len()).rev() {
+                let coord = idx % shape[d];
+                idx /= shape[d];
+
+                if d == axis {
+                    axis_coord = coord;
+                } else {
+                    result_idx += coord * multiplier;
+                    multiplier *= shape[d];
+                }
+            }
+
+            // NaN handling: NaN is treated as greater than all values
+            if !val.is_nan() && val < min_vals[result_idx] {
+                min_vals[result_idx] = val;
+                result[result_idx] = axis_coord as f64;
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    fn argmax_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let shape = data.shape();
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![0.0; result_size];
+        let mut max_vals = vec![f64::NEG_INFINITY; result_size];
+
+        for (i, &val) in data.iter().enumerate() {
+            let mut idx = i;
+            let mut result_idx = 0;
+            let mut axis_coord = 0;
+            let mut multiplier = 1;
+
+            for d in (0..shape.len()).rev() {
+                let coord = idx % shape[d];
+                idx /= shape[d];
+
+                if d == axis {
+                    axis_coord = coord;
+                } else {
+                    result_idx += coord * multiplier;
+                    multiplier *= shape[d];
+                }
+            }
+
+            // NaN handling: NaN is treated as less than all values
+            if !val.is_nan() && val > max_vals[result_idx] {
+                max_vals[result_idx] = val;
+                result[result_idx] = axis_coord as f64;
+            }
         }
 
         Ok(CpuArray::from_ndarray(
@@ -245,12 +480,248 @@ impl StatsOps for CpuBackend {
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[data.len()]), result).unwrap())
     }
 
+    fn cumsum_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+
+        if axis >= ndim {
+            return Err(RumpyError::InvalidAxis { axis, ndim });
+        }
+
+        let mut result = data.to_owned();
+        let axis_len = shape[axis];
+        let outer_size: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
+
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut acc = 0.0;
+                for ax_idx in 0..axis_len {
+                    let mut coords = vec![0usize; ndim];
+                    let mut tmp = outer;
+                    for d in (0..axis).rev() {
+                        coords[d] = tmp % shape[d];
+                        tmp /= shape[d];
+                    }
+                    coords[axis] = ax_idx;
+                    let mut tmp = inner;
+                    for d in (axis + 1..ndim).rev() {
+                        coords[d] = tmp % shape[d];
+                        tmp /= shape[d];
+                    }
+                    let mut flat = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        flat += coords[d] * mult;
+                        mult *= shape[d];
+                    }
+                    acc += data.as_slice().unwrap()[flat];
+                    result.as_slice_mut().unwrap()[flat] = acc;
+                }
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(result))
+    }
+
+    fn cumprod_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+
+        if axis >= ndim {
+            return Err(RumpyError::InvalidAxis { axis, ndim });
+        }
+
+        let mut result = data.to_owned();
+        let axis_len = shape[axis];
+        let outer_size: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
+
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut acc = 1.0;
+                for ax_idx in 0..axis_len {
+                    let mut coords = vec![0usize; ndim];
+                    let mut tmp = outer;
+                    for d in (0..axis).rev() {
+                        coords[d] = tmp % shape[d];
+                        tmp /= shape[d];
+                    }
+                    coords[axis] = ax_idx;
+                    let mut tmp = inner;
+                    for d in (axis + 1..ndim).rev() {
+                        coords[d] = tmp % shape[d];
+                        tmp /= shape[d];
+                    }
+                    let mut flat = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        flat += coords[d] * mult;
+                        mult *= shape[d];
+                    }
+                    acc *= data.as_slice().unwrap()[flat];
+                    result.as_slice_mut().unwrap()[flat] = acc;
+                }
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(result))
+    }
+
     fn all(arr: &CpuArray) -> bool {
         arr.as_ndarray().iter().all(|&x| x != 0.0)
     }
 
     fn any(arr: &CpuArray) -> bool {
         arr.as_ndarray().iter().any(|&x| x != 0.0)
+    }
+
+    fn all_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let shape = data.shape();
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![1.0; result_size]; // Start with "all true"
+
+        for (i, &val) in data.iter().enumerate() {
+            let mut idx = i;
+            let mut result_idx = 0;
+            let mut multiplier = 1;
+
+            for d in (0..shape.len()).rev() {
+                let coord = idx % shape[d];
+                idx /= shape[d];
+
+                if d != axis {
+                    result_idx += coord * multiplier;
+                    multiplier *= shape[d];
+                }
+            }
+
+            if val == 0.0 {
+                result[result_idx] = 0.0;
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    fn any_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let data = arr.as_ndarray();
+        if axis >= data.ndim() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: data.ndim(),
+            });
+        }
+
+        let shape = data.shape();
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+
+        let result_size: usize = new_shape.iter().product();
+        let mut result = vec![0.0; result_size]; // Start with "none true"
+
+        for (i, &val) in data.iter().enumerate() {
+            let mut idx = i;
+            let mut result_idx = 0;
+            let mut multiplier = 1;
+
+            for d in (0..shape.len()).rev() {
+                let coord = idx % shape[d];
+                idx /= shape[d];
+
+                if d != axis {
+                    result_idx += coord * multiplier;
+                    multiplier *= shape[d];
+                }
+            }
+
+            if val != 0.0 {
+                result[result_idx] = 1.0;
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(
+            ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+        ))
+    }
+
+    // NaN-ignoring functions
+    fn nansum(arr: &CpuArray) -> f64 {
+        arr.as_ndarray()
+            .iter()
+            .filter(|x| !x.is_nan())
+            .sum()
+    }
+
+    fn nanmean(arr: &CpuArray) -> f64 {
+        let data = arr.as_ndarray();
+        let (sum, count) = data.iter()
+            .filter(|x| !x.is_nan())
+            .fold((0.0, 0usize), |(s, c), &x| (s + x, c + 1));
+        if count == 0 {
+            f64::NAN
+        } else {
+            sum / count as f64
+        }
+    }
+
+    fn nanvar(arr: &CpuArray, ddof: usize) -> f64 {
+        let mean = Self::nanmean(arr);
+        if mean.is_nan() {
+            return f64::NAN;
+        }
+        let data = arr.as_ndarray();
+        let (sum_sq, count) = data.iter()
+            .filter(|x| !x.is_nan())
+            .fold((0.0, 0usize), |(s, c), &x| (s + (x - mean).powi(2), c + 1));
+        if count <= ddof {
+            f64::NAN
+        } else {
+            sum_sq / (count - ddof) as f64
+        }
+    }
+
+    fn nanstd(arr: &CpuArray, ddof: usize) -> f64 {
+        Self::nanvar(arr, ddof).sqrt()
+    }
+
+    fn nanmin(arr: &CpuArray) -> f64 {
+        arr.as_ndarray()
+            .iter()
+            .filter(|x| !x.is_nan())
+            .cloned()
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    fn nanmax(arr: &CpuArray) -> f64 {
+        arr.as_ndarray()
+            .iter()
+            .filter(|x| !x.is_nan())
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 }
 
@@ -267,6 +738,9 @@ mod tests {
     }
 
     fn approx_eq(a: f64, b: f64) -> bool {
+        if a.is_nan() && b.is_nan() {
+            return true;
+        }
         (a - b).abs() < 1e-10
     }
 
@@ -329,6 +803,69 @@ mod tests {
     }
 
     #[test]
+    fn test_min_axis_nan_propagation() {
+        // Test that NaN propagates in min_axis (NumPy behavior)
+        // Matrix: [[1, NaN, 3], [4, 5, 6]]
+        // Along axis 0 (reduce rows):
+        // - col 0: min(1, 4) = 1
+        // - col 1: min(NaN, 5) = NaN (NaN propagates)
+        // - col 2: min(3, 6) = 3
+        let m = mat(vec![1.0, f64::NAN, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let result = CpuBackend::min_axis(&m, 0).unwrap();
+        let data = result.as_f64_slice();
+        assert_eq!(data[0], 1.0);
+        assert!(data[1].is_nan()); // NaN propagates
+        assert_eq!(data[2], 3.0);
+    }
+
+    #[test]
+    fn test_max_axis_nan_propagation() {
+        // Matrix: [[1, NaN, 3], [4, 5, 6]]
+        // Along axis 0 (reduce rows):
+        // - col 0: max(1, 4) = 4
+        // - col 1: max(NaN, 5) = NaN (NaN propagates)
+        // - col 2: max(3, 6) = 6
+        let m = mat(vec![1.0, f64::NAN, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let result = CpuBackend::max_axis(&m, 0).unwrap();
+        let data = result.as_f64_slice();
+        assert_eq!(data[0], 4.0);
+        assert!(data[1].is_nan()); // NaN propagates
+        assert_eq!(data[2], 6.0);
+    }
+
+    #[test]
+    fn test_prod_axis() {
+        let m = mat(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let result = CpuBackend::prod_axis(&m, 0).unwrap();
+        assert_eq!(result.as_f64_slice(), vec![4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn test_var_axis() {
+        let m = mat(vec![1.0, 2.0, 3.0, 4.0], 2, 2);
+        let result = CpuBackend::var_axis(&m, 0, 0).unwrap();
+        // var([1,3]) = 1.0, var([2,4]) = 1.0
+        assert!(approx_eq(result.as_f64_slice()[0], 1.0));
+        assert!(approx_eq(result.as_f64_slice()[1], 1.0));
+    }
+
+    #[test]
+    fn test_argmin_axis() {
+        let m = mat(vec![3.0, 1.0, 2.0, 4.0], 2, 2);
+        let result = CpuBackend::argmin_axis(&m, 0).unwrap();
+        // argmin along axis 0: col 0 has [3,2], min at row 1; col 1 has [1,4], min at row 0
+        assert_eq!(result.as_f64_slice(), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_argmax_axis() {
+        let m = mat(vec![3.0, 1.0, 2.0, 4.0], 2, 2);
+        let result = CpuBackend::argmax_axis(&m, 0).unwrap();
+        // argmax along axis 0: col 0 has [3,2], max at row 0; col 1 has [1,4], max at row 1
+        assert_eq!(result.as_f64_slice(), vec![0.0, 1.0]);
+    }
+
+    #[test]
     fn test_cumsum() {
         let a = arr(vec![1.0, 2.0, 3.0, 4.0]);
         let result = CpuBackend::cumsum(&a);
@@ -340,6 +877,14 @@ mod tests {
         let a = arr(vec![1.0, 2.0, 3.0, 4.0]);
         let result = CpuBackend::cumprod(&a);
         assert_eq!(result.as_f64_slice(), vec![1.0, 2.0, 6.0, 24.0]);
+    }
+
+    #[test]
+    fn test_cumsum_axis() {
+        let m = mat(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+        let result = CpuBackend::cumsum_axis(&m, 1).unwrap();
+        // cumsum along axis 1 (cols): [[1,3,6], [4,9,15]]
+        assert_eq!(result.as_f64_slice(), vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
     }
 
     #[test]
@@ -355,5 +900,40 @@ mod tests {
         let c = arr(vec![1.0, 0.0, 1.0]);
         assert!(!CpuBackend::all(&c));
         assert!(CpuBackend::any(&c));
+    }
+
+    #[test]
+    fn test_all_axis() {
+        let m = mat(vec![1.0, 0.0, 1.0, 1.0], 2, 2);
+        let result = CpuBackend::all_axis(&m, 0).unwrap();
+        // all along axis 0: col 0 = [1,1] -> 1, col 1 = [0,1] -> 0
+        assert_eq!(result.as_f64_slice(), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_any_axis() {
+        let m = mat(vec![0.0, 0.0, 1.0, 0.0], 2, 2);
+        let result = CpuBackend::any_axis(&m, 0).unwrap();
+        // any along axis 0: col 0 = [0,1] -> 1, col 1 = [0,0] -> 0
+        assert_eq!(result.as_f64_slice(), vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_nansum() {
+        let a = arr(vec![1.0, f64::NAN, 3.0, 4.0]);
+        assert_eq!(CpuBackend::nansum(&a), 8.0);
+    }
+
+    #[test]
+    fn test_nanmean() {
+        let a = arr(vec![1.0, f64::NAN, 3.0, 4.0]);
+        assert!(approx_eq(CpuBackend::nanmean(&a), 8.0 / 3.0));
+    }
+
+    #[test]
+    fn test_nanmin_nanmax() {
+        let a = arr(vec![3.0, f64::NAN, 1.0, 5.0]);
+        assert_eq!(CpuBackend::nanmin(&a), 1.0);
+        assert_eq!(CpuBackend::nanmax(&a), 5.0);
     }
 }

@@ -105,14 +105,31 @@ pub trait StatsOps {
     fn mean_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
     fn min_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
     fn max_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+    fn prod_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+    fn var_axis(arr: &Self::Array, axis: usize, ddof: usize) -> Result<Self::Array>;
+    fn std_axis(arr: &Self::Array, axis: usize, ddof: usize) -> Result<Self::Array>;
+    fn argmin_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+    fn argmax_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
 
     // Cumulative
     fn cumsum(arr: &Self::Array) -> Self::Array;
     fn cumprod(arr: &Self::Array) -> Self::Array;
+    fn cumsum_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+    fn cumprod_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
 
     // Boolean
     fn all(arr: &Self::Array) -> bool;
     fn any(arr: &Self::Array) -> bool;
+    fn all_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+    fn any_axis(arr: &Self::Array, axis: usize) -> Result<Self::Array>;
+
+    // NaN-ignoring functions (NumPy nansum, nanmean, etc.)
+    fn nansum(arr: &Self::Array) -> f64;
+    fn nanmean(arr: &Self::Array) -> f64;
+    fn nanvar(arr: &Self::Array, ddof: usize) -> f64;
+    fn nanstd(arr: &Self::Array, ddof: usize) -> f64;
+    fn nanmin(arr: &Self::Array) -> f64;
+    fn nanmax(arr: &Self::Array) -> f64;
 }
 
 /// Linear algebra operations
@@ -218,10 +235,10 @@ pub trait ManipulationOps {
     fn repeat(arr: &Self::Array, repeats: usize, axis: Option<usize>) -> Result<Self::Array>;
 
     /// Flip array
-    fn flip(arr: &Self::Array, axis: Option<usize>) -> Self::Array;
+    fn flip(arr: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;
 
     /// Roll array
-    fn roll(arr: &Self::Array, shift: i64, axis: Option<usize>) -> Self::Array;
+    fn roll(arr: &Self::Array, shift: i64, axis: Option<usize>) -> Result<Self::Array>;
 
     /// Rotate 90 degrees
     fn rot90(arr: &Self::Array, k: i32) -> Result<Self::Array>;
@@ -264,13 +281,13 @@ pub trait SortOps {
     type Array: Array;
 
     /// Sort array
-    fn sort(arr: &Self::Array, axis: Option<usize>) -> Self::Array;
+    fn sort(arr: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;
 
     /// Argsort (indices that would sort)
-    fn argsort(arr: &Self::Array, axis: Option<usize>) -> Self::Array;
+    fn argsort(arr: &Self::Array, axis: Option<usize>) -> Result<Self::Array>;
 
-    /// Search sorted
-    fn searchsorted(arr: &Self::Array, values: &Self::Array) -> Self::Array;
+    /// Search sorted (with optional side parameter: 'left' or 'right')
+    fn searchsorted(arr: &Self::Array, values: &Self::Array, side: Option<&str>) -> Self::Array;
 
     /// Unique elements
     fn unique(arr: &Self::Array) -> Self::Array;

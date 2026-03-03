@@ -213,20 +213,50 @@ impl LinalgOps for CpuBackend {
     }
 
     fn pinv(arr: &CpuArray) -> Result<CpuArray> {
-        // Use SVD-based pseudoinverse
-        // For simplicity, use the formula: A+ = (A^T A)^-1 A^T for full column rank
-        // This is a simplified implementation
-        let mat = to_faer(arr)?;
-        let mt = mat.transpose();
-        let mta = mt * &mat;
+        // SVD-based pseudoinverse that handles rank-deficient matrices
+        // A+ = V S+ U^T where S+ has 1/sigma for non-zero singular values
+        let (u, s, vt) = Self::svd(arr)?;
 
-        // Solve (A^T A) X = A^T to get X = A+
-        let mta_inv = {
-            let arr_tmp = from_faer(&mta);
-            Self::inv(&arr_tmp)?
-        };
-        let mta_inv_mat = to_faer(&mta_inv)?;
-        let result = &mta_inv_mat * mt;
+        let u_mat = to_faer(&u)?;
+        let vt_mat = to_faer(&vt)?;
+        let s_data = s.as_f64_slice();
+
+        let m = u_mat.nrows();
+        let n = vt_mat.ncols();
+        let k = s_data.len();
+
+        // Compute tolerance based on machine epsilon and matrix size
+        let max_dim = m.max(n) as f64;
+        let max_s = s_data.iter().cloned().fold(0.0_f64, f64::max);
+        let tol = f64::EPSILON * max_dim * max_s;
+
+        // Build S+ (pseudoinverse of singular values)
+        let s_pinv: Vec<f64> = s_data.iter()
+            .map(|&sigma| if sigma > tol { 1.0 / sigma } else { 0.0 })
+            .collect();
+
+        // Compute V S+ (each column of V scaled by 1/sigma)
+        // Note: vt_mat is k x n, so V is n x k
+        let mut vs_pinv = Mat::zeros(n, k);
+        for i in 0..n {
+            for j in 0..k {
+                vs_pinv.write(i, j, vt_mat.read(j, i) * s_pinv[j]);
+            }
+        }
+
+        // Compute (V S+) U^T = A+
+        // Result is n x m
+        let mut result = Mat::zeros(n, m);
+        for i in 0..n {
+            for j in 0..m {
+                let mut sum = 0.0;
+                for l in 0..k {
+                    sum += vs_pinv.read(i, l) * u_mat.read(j, l);
+                }
+                result.write(i, j, sum);
+            }
+        }
+
         Ok(from_faer(&result))
     }
 
@@ -599,21 +629,36 @@ impl LinalgOps for CpuBackend {
     }
 
     fn svd(arr: &CpuArray) -> Result<(CpuArray, CpuArray, CpuArray)> {
-        // Simple power iteration SVD for the first singular value
-        // This is a placeholder - real SVD needs more sophisticated algorithm
+        // SIMPLIFIED SVD IMPLEMENTATION
+        // =================================
+        // This is a basic SVD computed via eigendecomposition of A^T A.
+        // For production use, consider using a proper algorithm like:
+        // - Golub-Kahan bidiagonalization with implicit QR shifts
+        // - Divide-and-conquer SVD
+        // - Jacobi SVD for small matrices
+        //
+        // Limitations of this implementation:
+        // - May have numerical issues for ill-conditioned matrices
+        // - Eigenvalue ordering may not be perfect for near-equal singular values
+        // - Not optimized for large matrices
+        //
+        // For better accuracy and performance, consider linking to LAPACK/BLAS
+        // via the faer crate's advanced features when available.
+
         let mat = to_faer(arr)?;
         let (m, n) = (mat.nrows(), mat.ncols());
         let k = m.min(n);
 
-        // For now, compute via eigendecomposition of A^T A
+        // Compute A^T A for eigendecomposition
         let mt = mat.transpose();
         let ata = mt * &mat;
 
-        // Simple eigenvalue computation for symmetric matrix
+        // Eigenvalue computation for symmetric matrix A^T A
         let ata_arr = from_faer(&ata);
         let (eigenvalues, v) = Self::eig(&ata_arr)?;
 
         // Singular values are sqrt of eigenvalues (take only first k)
+        // Clamp negative values to 0 (can occur due to numerical errors)
         let s_data: Vec<f64> = eigenvalues
             .as_f64_slice()
             .iter()
@@ -625,11 +670,15 @@ impl LinalgOps for CpuBackend {
         // V is n x n, we need only first k columns for V_k (n x k)
         let v_mat = to_faer(&v)?;
 
+        // Compute tolerance for small singular values
+        let max_s = s.as_f64_slice().iter().cloned().fold(0.0_f64, f64::max);
+        let tol = f64::EPSILON * (m.max(n) as f64) * max_s;
+
         // U = A V_k S^-1 (m x k)
         let mut u = Mat::zeros(m, k);
         for j in 0..k {
             let sigma = s.get_flat(j);
-            if sigma.abs() > 1e-14 {
+            if sigma > tol {
                 // Compute (A * v_j) / sigma
                 for i in 0..m {
                     let mut sum = 0.0;
@@ -654,16 +703,29 @@ impl LinalgOps for CpuBackend {
     }
 
     fn eig(arr: &CpuArray) -> Result<(CpuArray, CpuArray)> {
-        // Simple power iteration for dominant eigenvalue
-        // This is a placeholder - full eigendecomposition needs QR algorithm
+        // Power iteration with deflation for eigendecomposition
+        // Uses tolerance-based convergence instead of fixed iterations
+        // NOTE: This is a simplified implementation suitable for symmetric matrices.
+        // For non-symmetric matrices or better accuracy, consider QR iteration.
         let mat = to_faer(arr)?;
         let n = mat.nrows();
         if n != mat.ncols() {
             return Err(RumpyError::NotSquare(arr.shape().to_vec()));
         }
 
-        // For symmetric matrices, use simple iteration
-        // This is a very basic implementation
+        // Compute matrix Frobenius norm for relative tolerance
+        let mut frob_norm_sq = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                frob_norm_sq += mat.read(i, j).powi(2);
+            }
+        }
+        let mat_scale = frob_norm_sq.sqrt().max(1.0);
+
+        // Tolerance scaled to matrix magnitude and machine epsilon
+        let tol = f64::EPSILON.sqrt() * mat_scale;
+        let max_iterations = 1000; // Increased from 100
+
         let mut eigenvalues = Vec::with_capacity(n);
         let mut eigenvectors = Mat::zeros(n, n);
 
@@ -671,34 +733,56 @@ impl LinalgOps for CpuBackend {
 
         for k in 0..n {
             // Power iteration for dominant eigenvalue
-            let mut v: Vec<f64> = (0..n).map(|_| 1.0).collect();
-            let mut eigenvalue = 0.0;
+            // Initialize with a vector that has some variation
+            let mut v: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64) * 0.01).collect();
 
-            for _ in 0..100 {
-                // Multiply
+            // Normalize initial vector
+            let init_norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for elem in &mut v {
+                *elem /= init_norm;
+            }
+
+            let mut eigenvalue = 0.0;
+            let mut prev_eigenvalue = f64::INFINITY;
+
+            for _iter in 0..max_iterations {
+                // Multiply: new_v = A * v
                 let mut new_v = vec![0.0; n];
-                for (i, nv) in new_v.iter_mut().enumerate().take(n) {
-                    for (j, &vj) in v.iter().enumerate().take(n) {
-                        *nv += work.read(i, j) * vj;
+                for i in 0..n {
+                    for j in 0..n {
+                        new_v[i] += work.read(i, j) * v[j];
                     }
                 }
 
-                // Normalize
-                let norm: f64 = new_v.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if norm < 1e-14 {
+                // Compute Rayleigh quotient: λ = v^T A v / v^T v = v^T new_v / v^T v
+                let v_dot_v: f64 = v.iter().map(|x| x * x).sum();
+                let v_dot_new_v: f64 = v.iter().zip(new_v.iter()).map(|(a, b)| a * b).sum();
+
+                if v_dot_v < f64::EPSILON {
                     break;
                 }
 
-                eigenvalue = new_v.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f64>()
-                    / v.iter().map(|x| x * x).sum::<f64>();
+                eigenvalue = v_dot_new_v / v_dot_v;
 
-                for (v_elem, &nv) in v.iter_mut().zip(new_v.iter()).take(n) {
-                    *v_elem = nv / norm;
+                // Normalize
+                let norm: f64 = new_v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm < f64::EPSILON {
+                    break;
                 }
+
+                for i in 0..n {
+                    v[i] = new_v[i] / norm;
+                }
+
+                // Check convergence: |λ_new - λ_old| < tol
+                if (eigenvalue - prev_eigenvalue).abs() < tol {
+                    break;
+                }
+                prev_eigenvalue = eigenvalue;
             }
 
             eigenvalues.push(eigenvalue);
-            for (i, &v_elem) in v.iter().enumerate().take(n) {
+            for (i, &v_elem) in v.iter().enumerate() {
                 eigenvectors.write(i, k, v_elem);
             }
 
