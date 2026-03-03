@@ -3838,11 +3838,27 @@ impl NDArray {
 
 // ============ Element-wise maximum/minimum ============
 
+/// NumPy-style maximum: returns non-NaN value when one is NaN, NaN when both are NaN
+#[inline]
+fn np_maximum(a: f64, b: f64) -> f64 {
+    if a.is_nan() { b }
+    else if b.is_nan() { a }
+    else { a.max(b) }
+}
+
+/// NumPy-style minimum: returns non-NaN value when one is NaN, NaN when both are NaN
+#[inline]
+fn np_minimum(a: f64, b: f64) -> f64 {
+    if a.is_nan() { b }
+    else if b.is_nan() { a }
+    else { a.min(b) }
+}
+
 /// Element-wise maximum of two arrays
 ///
 /// Compares two arrays element-by-element and returns the maximum values.
 /// Equivalent to numpy.maximum(a, b).
-/// Supports broadcasting.
+/// Supports broadcasting. NaN-aware: returns non-NaN when one value is NaN.
 #[wasm_bindgen]
 pub fn maximum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
     let a_data = a.inner.as_ndarray();
@@ -3856,17 +3872,17 @@ pub fn maximum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
         // Same shape - simple element-wise max
         let result = ndarray::Zip::from(&*a_data)
             .and(&*b_data)
-            .map_collect(|&av, &bv| av.max(bv));
+            .map_collect(|&av, &bv| np_maximum(av, bv));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else if a_data.len() == 1 {
         // a is scalar
-        let scalar = a_data.iter().next().unwrap();
-        let result = b_data.mapv(|v| v.max(*scalar));
+        let scalar = *a_data.iter().next().unwrap();
+        let result = b_data.mapv(|v| np_maximum(v, scalar));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else if b_data.len() == 1 {
         // b is scalar
-        let scalar = b_data.iter().next().unwrap();
-        let result = a_data.mapv(|v| v.max(*scalar));
+        let scalar = *b_data.iter().next().unwrap();
+        let result = a_data.mapv(|v| np_maximum(v, scalar));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else {
         // Try numpy-style broadcasting
@@ -3874,7 +3890,7 @@ pub fn maximum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
         if let Some(a_broadcast) = a_data.broadcast(b_dim.clone()) {
             let result = ndarray::Zip::from(&a_broadcast)
                 .and(&*b_data)
-                .map_collect(|&av, &bv| av.max(bv));
+                .map_collect(|&av, &bv| np_maximum(av, bv));
             return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
         }
 
@@ -3882,7 +3898,7 @@ pub fn maximum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
         if let Some(b_broadcast) = b_data.broadcast(a_dim) {
             let result = ndarray::Zip::from(&*a_data)
                 .and(&b_broadcast)
-                .map_collect(|&av, &bv| av.max(bv));
+                .map_collect(|&av, &bv| np_maximum(av, bv));
             return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
         }
 
@@ -3897,7 +3913,7 @@ pub fn maximum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
 ///
 /// Compares two arrays element-by-element and returns the minimum values.
 /// Equivalent to numpy.minimum(a, b).
-/// Supports broadcasting.
+/// Supports broadcasting. NaN-aware: returns non-NaN when one value is NaN.
 #[wasm_bindgen]
 pub fn minimum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
     let a_data = a.inner.as_ndarray();
@@ -3909,22 +3925,22 @@ pub fn minimum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
     if a_shape == b_shape {
         let result = ndarray::Zip::from(&*a_data)
             .and(&*b_data)
-            .map_collect(|&av, &bv| av.min(bv));
+            .map_collect(|&av, &bv| np_minimum(av, bv));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else if a_data.len() == 1 {
-        let scalar = a_data.iter().next().unwrap();
-        let result = b_data.mapv(|v| v.min(*scalar));
+        let scalar = *a_data.iter().next().unwrap();
+        let result = b_data.mapv(|v| np_minimum(v, scalar));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else if b_data.len() == 1 {
-        let scalar = b_data.iter().next().unwrap();
-        let result = a_data.mapv(|v| v.min(*scalar));
+        let scalar = *b_data.iter().next().unwrap();
+        let result = a_data.mapv(|v| np_minimum(v, scalar));
         Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)))
     } else {
         let b_dim = ndarray::IxDyn(b_shape);
         if let Some(a_broadcast) = a_data.broadcast(b_dim.clone()) {
             let result = ndarray::Zip::from(&a_broadcast)
                 .and(&*b_data)
-                .map_collect(|&av, &bv| av.min(bv));
+                .map_collect(|&av, &bv| np_minimum(av, bv));
             return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
         }
 
@@ -3932,7 +3948,7 @@ pub fn minimum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
         if let Some(b_broadcast) = b_data.broadcast(a_dim) {
             let result = ndarray::Zip::from(&*a_data)
                 .and(&b_broadcast)
-                .map_collect(|&av, &bv| av.min(bv));
+                .map_collect(|&av, &bv| np_minimum(av, bv));
             return Ok(NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result)));
         }
 
@@ -3943,19 +3959,19 @@ pub fn minimum(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
     }
 }
 
-/// Element-wise maximum with a scalar
+/// Element-wise maximum with a scalar (NaN-aware)
 #[wasm_bindgen(js_name = maximumScalar)]
 pub fn maximum_scalar(arr: &NDArray, scalar: f64) -> NDArray {
     let data = arr.inner.as_ndarray();
-    let result = data.mapv(|v| v.max(scalar));
+    let result = data.mapv(|v| np_maximum(v, scalar));
     NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
 }
 
-/// Element-wise minimum with a scalar
+/// Element-wise minimum with a scalar (NaN-aware)
 #[wasm_bindgen(js_name = minimumScalar)]
 pub fn minimum_scalar(arr: &NDArray, scalar: f64) -> NDArray {
     let data = arr.inner.as_ndarray();
-    let result = data.mapv(|v| v.min(scalar));
+    let result = data.mapv(|v| np_minimum(v, scalar));
     NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
 }
 
@@ -4008,13 +4024,14 @@ pub fn expm1_arr(arr: &NDArray) -> NDArray {
 
 /// Element-wise sign function
 ///
-/// Returns -1 for negative, 0 for zero, 1 for positive values.
+/// Returns -1 for negative, 0 for zero, 1 for positive values, NaN for NaN.
 /// Equivalent to numpy.sign(x).
 #[wasm_bindgen(js_name = signArr)]
 pub fn sign_arr(arr: &NDArray) -> NDArray {
     let data = arr.inner.as_ndarray();
     let result = data.mapv(|v| {
-        if v > 0.0 { 1.0 }
+        if v.is_nan() { f64::NAN }
+        else if v > 0.0 { 1.0 }
         else if v < 0.0 { -1.0 }
         else { 0.0 }
     });

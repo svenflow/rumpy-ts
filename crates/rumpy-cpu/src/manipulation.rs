@@ -34,11 +34,8 @@ impl ManipulationOps for CpuBackend {
 
     fn squeeze(arr: &CpuArray) -> CpuArray {
         let shape: Vec<usize> = arr.shape().iter().filter(|&&s| s != 1).cloned().collect();
-        if shape.is_empty() {
-            return CpuArray::from_ndarray(
-                ArrayD::from_shape_vec(IxDyn(&[1]), arr.as_f64_slice()).unwrap(),
-            );
-        }
+        // NumPy squeeze can produce 0-dimensional arrays (true scalars)
+        // shape=[] with single element is valid
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&shape), arr.as_f64_slice()).unwrap())
     }
 
@@ -235,17 +232,50 @@ impl ManipulationOps for CpuBackend {
             }
             Some(ax) => {
                 let shape = arr.shape();
-                if ax >= shape.len() {
+                let ndim = shape.len();
+                if ax >= ndim {
                     return Err(RumpyError::InvalidAxis {
                         axis: ax,
-                        ndim: shape.len(),
+                        ndim,
                     });
                 }
 
-                // Repeat along axis
-                let repeated: Vec<CpuArray> = (0..repeats).map(|_| arr.clone()).collect();
-                let refs: Vec<&CpuArray> = repeated.iter().collect();
-                Self::concatenate(&refs, ax)
+                // NumPy repeat: repeat each element along axis
+                // [[1,2],[3,4]] with axis=0, repeats=2 -> [[1,2],[1,2],[3,4],[3,4]]
+                let data = arr.as_ndarray();
+                let mut new_shape = shape.to_vec();
+                new_shape[ax] *= repeats;
+                let mut result = Vec::with_capacity(new_shape.iter().product());
+
+                // Iterate through all positions in output
+                let total_size: usize = new_shape.iter().product();
+                for out_flat in 0..total_size {
+                    // Decompose output flat index to coords
+                    let mut idx = out_flat;
+                    let mut out_coords: Vec<usize> = vec![0; ndim];
+                    for d in (0..ndim).rev() {
+                        out_coords[d] = idx % new_shape[d];
+                        idx /= new_shape[d];
+                    }
+
+                    // Map output coord to input coord (divide axis coord by repeats)
+                    let mut in_coords = out_coords.clone();
+                    in_coords[ax] = out_coords[ax] / repeats;
+
+                    // Compute input flat index
+                    let mut in_flat = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        in_flat += in_coords[d] * mult;
+                        mult *= shape[d];
+                    }
+
+                    result.push(data.as_slice().unwrap()[in_flat]);
+                }
+
+                Ok(CpuArray::from_ndarray(
+                    ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap(),
+                ))
             }
         }
     }
@@ -266,7 +296,7 @@ impl ManipulationOps for CpuBackend {
                 // Flip along specific axis
                 let shape = data.shape();
                 if ax >= shape.len() {
-                    return arr.clone();
+                    panic!("AxisError: axis {} is out of bounds for array of dimension {}", ax, shape.len());
                 }
 
                 let mut result = data.clone();
@@ -305,16 +335,18 @@ impl ManipulationOps for CpuBackend {
     }
 
     fn roll(arr: &CpuArray, shift: i64, axis: Option<usize>) -> CpuArray {
-        let data = arr.as_f64_slice();
-        let n = data.len() as i64;
+        let shape = arr.shape();
+        let ndim = shape.len();
 
-        if n == 0 {
+        if arr.as_ndarray().is_empty() {
             return arr.clone();
         }
 
         match axis {
             None => {
                 // Roll flattened array
+                let data = arr.as_f64_slice();
+                let n = data.len() as i64;
                 let shift = ((shift % n) + n) % n;
                 let shift = shift as usize;
 
@@ -324,14 +356,56 @@ impl ManipulationOps for CpuBackend {
                     result[new_i] = val;
                 }
 
-                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), result).unwrap())
+                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), result).unwrap())
             }
-            Some(_ax) => {
-                // For simplicity, flatten, roll, reshape
-                // TODO: Proper axis-aware rolling
-                let flat = Self::flatten(arr);
-                let rolled = Self::roll(&flat, shift, None);
-                Self::reshape(&rolled, arr.shape().to_vec()).unwrap()
+            Some(ax) => {
+                if ax >= ndim {
+                    return arr.clone(); // Invalid axis, return unchanged
+                }
+
+                // Proper axis-aware rolling
+                let axis_len = shape[ax] as i64;
+                let shift = ((shift % axis_len) + axis_len) % axis_len;
+                let shift = shift as usize;
+
+                if shift == 0 {
+                    return arr.clone();
+                }
+
+                let data = arr.as_ndarray();
+                let mut result = ArrayD::<f64>::zeros(IxDyn(shape));
+
+                // Calculate strides for iteration
+                let total_size: usize = shape.iter().product();
+                let axis_stride: usize = shape[ax + 1..].iter().product();
+                let outer_stride: usize = shape[ax..].iter().product();
+
+                for flat_idx in 0..total_size {
+                    // Decompose flat index into coordinates
+                    let mut idx = flat_idx;
+                    let mut coords: Vec<usize> = vec![0; ndim];
+                    for d in (0..ndim).rev() {
+                        coords[d] = idx % shape[d];
+                        idx /= shape[d];
+                    }
+
+                    // Calculate new coordinate along roll axis
+                    let old_ax_coord = coords[ax];
+                    let new_ax_coord = (old_ax_coord + shift) % shape[ax];
+                    coords[ax] = new_ax_coord;
+
+                    // Calculate new flat index
+                    let mut new_flat_idx = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        new_flat_idx += coords[d] * mult;
+                        mult *= shape[d];
+                    }
+
+                    result.as_slice_mut().unwrap()[new_flat_idx] = data.as_slice().unwrap()[flat_idx];
+                }
+
+                CpuArray::from_ndarray(result)
             }
         }
     }

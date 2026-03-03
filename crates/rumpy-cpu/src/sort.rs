@@ -21,21 +21,185 @@ fn nan_safe_cmp(a: &f64, b: &f64) -> Ordering {
 impl SortOps for CpuBackend {
     type Array = CpuArray;
 
-    fn sort(arr: &CpuArray, _axis: Option<usize>) -> CpuArray {
-        // For simplicity, always sort flattened array
-        // TODO: Implement axis-aware sorting
-        let mut data = arr.as_f64_slice();
-        data.sort_by(nan_safe_cmp);
-        CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), data).unwrap())
+    fn sort(arr: &CpuArray, axis: Option<usize>) -> CpuArray {
+        let shape = arr.shape();
+        let ndim = shape.len();
+
+        match axis {
+            None => {
+                // Sort flattened array
+                let mut data = arr.as_f64_slice();
+                data.sort_by(nan_safe_cmp);
+                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape), data).unwrap())
+            }
+            Some(ax) => {
+                if ax >= ndim {
+                    // Invalid axis, return clone (NumPy would raise)
+                    return arr.clone();
+                }
+
+                // Sort along specified axis
+                let data = arr.as_ndarray();
+                let mut result = data.to_owned();
+                let axis_len = shape[ax];
+
+                // Calculate stride info
+                let outer_size: usize = shape[..ax].iter().product();
+                let inner_size: usize = shape[ax + 1..].iter().product();
+
+                // For each "lane" along the axis
+                for outer in 0..outer_size {
+                    for inner in 0..inner_size {
+                        // Extract values along this lane
+                        let mut lane: Vec<f64> = (0..axis_len)
+                            .map(|i| {
+                                let mut coords = vec![0usize; ndim];
+                                // Compute coordinates
+                                let mut tmp = outer;
+                                for d in (0..ax).rev() {
+                                    coords[d] = tmp % shape[d];
+                                    tmp /= shape[d];
+                                }
+                                coords[ax] = i;
+                                let mut tmp = inner;
+                                for d in (ax + 1..ndim).rev() {
+                                    coords[d] = tmp % shape[d];
+                                    tmp /= shape[d];
+                                }
+                                // Compute flat index
+                                let mut flat = 0;
+                                let mut mult = 1;
+                                for d in (0..ndim).rev() {
+                                    flat += coords[d] * mult;
+                                    mult *= shape[d];
+                                }
+                                data.as_slice().unwrap()[flat]
+                            })
+                            .collect();
+
+                        // Sort the lane
+                        lane.sort_by(nan_safe_cmp);
+
+                        // Write back
+                        for (i, &val) in lane.iter().enumerate() {
+                            let mut coords = vec![0usize; ndim];
+                            let mut tmp = outer;
+                            for d in (0..ax).rev() {
+                                coords[d] = tmp % shape[d];
+                                tmp /= shape[d];
+                            }
+                            coords[ax] = i;
+                            let mut tmp = inner;
+                            for d in (ax + 1..ndim).rev() {
+                                coords[d] = tmp % shape[d];
+                                tmp /= shape[d];
+                            }
+                            let mut flat = 0;
+                            let mut mult = 1;
+                            for d in (0..ndim).rev() {
+                                flat += coords[d] * mult;
+                                mult *= shape[d];
+                            }
+                            result.as_slice_mut().unwrap()[flat] = val;
+                        }
+                    }
+                }
+
+                CpuArray::from_ndarray(result)
+            }
+        }
     }
 
-    fn argsort(arr: &CpuArray, _axis: Option<usize>) -> CpuArray {
-        let data = arr.as_f64_slice();
-        let mut indices: Vec<usize> = (0..data.len()).collect();
-        indices.sort_by(|&a, &b| nan_safe_cmp(&data[a], &data[b]));
+    fn argsort(arr: &CpuArray, axis: Option<usize>) -> CpuArray {
+        let shape = arr.shape();
+        let ndim = shape.len();
 
-        let result: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
-        CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap())
+        match axis {
+            None => {
+                // Argsort flattened array
+                let data = arr.as_f64_slice();
+                let mut indices: Vec<usize> = (0..data.len()).collect();
+                indices.sort_by(|&a, &b| nan_safe_cmp(&data[a], &data[b]));
+
+                let result: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
+                CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap())
+            }
+            Some(ax) => {
+                if ax >= ndim {
+                    // Invalid axis, return indices 0..n for each lane
+                    let axis_len = if shape.is_empty() { 0 } else { shape[0] };
+                    let indices: Vec<f64> = (0..axis_len).map(|i| i as f64).collect();
+                    return CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(shape),
+                        (0..arr.as_ndarray().len()).map(|_| 0.0).collect()).unwrap());
+                }
+
+                // Argsort along specified axis
+                let data = arr.as_ndarray();
+                let mut result = ArrayD::<f64>::zeros(IxDyn(shape));
+                let axis_len = shape[ax];
+
+                let outer_size: usize = shape[..ax].iter().product();
+                let inner_size: usize = shape[ax + 1..].iter().product();
+
+                for outer in 0..outer_size {
+                    for inner in 0..inner_size {
+                        // Extract values along this lane
+                        let lane: Vec<f64> = (0..axis_len)
+                            .map(|i| {
+                                let mut coords = vec![0usize; ndim];
+                                let mut tmp = outer;
+                                for d in (0..ax).rev() {
+                                    coords[d] = tmp % shape[d];
+                                    tmp /= shape[d];
+                                }
+                                coords[ax] = i;
+                                let mut tmp = inner;
+                                for d in (ax + 1..ndim).rev() {
+                                    coords[d] = tmp % shape[d];
+                                    tmp /= shape[d];
+                                }
+                                let mut flat = 0;
+                                let mut mult = 1;
+                                for d in (0..ndim).rev() {
+                                    flat += coords[d] * mult;
+                                    mult *= shape[d];
+                                }
+                                data.as_slice().unwrap()[flat]
+                            })
+                            .collect();
+
+                        // Get sorted indices
+                        let mut indices: Vec<usize> = (0..axis_len).collect();
+                        indices.sort_by(|&a, &b| nan_safe_cmp(&lane[a], &lane[b]));
+
+                        // Write back indices
+                        for (i, &idx) in indices.iter().enumerate() {
+                            let mut coords = vec![0usize; ndim];
+                            let mut tmp = outer;
+                            for d in (0..ax).rev() {
+                                coords[d] = tmp % shape[d];
+                                tmp /= shape[d];
+                            }
+                            coords[ax] = i;
+                            let mut tmp = inner;
+                            for d in (ax + 1..ndim).rev() {
+                                coords[d] = tmp % shape[d];
+                                tmp /= shape[d];
+                            }
+                            let mut flat = 0;
+                            let mut mult = 1;
+                            for d in (0..ndim).rev() {
+                                flat += coords[d] * mult;
+                                mult *= shape[d];
+                            }
+                            result.as_slice_mut().unwrap()[flat] = idx as f64;
+                        }
+                    }
+                }
+
+                CpuArray::from_ndarray(result)
+            }
+        }
     }
 
     fn searchsorted(arr: &CpuArray, values: &CpuArray) -> CpuArray {

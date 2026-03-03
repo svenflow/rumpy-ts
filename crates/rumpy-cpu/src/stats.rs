@@ -46,15 +46,21 @@ impl StatsOps for CpuBackend {
     }
 
     fn min(arr: &CpuArray) -> f64 {
-        arr.as_ndarray()
-            .iter()
+        let data = arr.as_ndarray();
+        if data.is_empty() {
+            return f64::NAN; // NumPy raises ValueError, we return NaN
+        }
+        data.iter()
             .cloned()
             .fold(f64::INFINITY, f64::min)
     }
 
     fn max(arr: &CpuArray) -> f64 {
-        arr.as_ndarray()
-            .iter()
+        let data = arr.as_ndarray();
+        if data.is_empty() {
+            return f64::NAN; // NumPy raises ValueError, we return NaN
+        }
+        data.iter()
             .cloned()
             .fold(f64::NEG_INFINITY, f64::max)
     }

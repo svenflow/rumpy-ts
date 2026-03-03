@@ -30,8 +30,25 @@ impl CreationOps for CpuBackend {
             return Ok(CpuArray::from_ndarray(ArrayD::zeros(IxDyn(&[0]))));
         }
 
-        let n = ((stop - start) / step).ceil() as usize;
-        let values: Vec<f64> = (0..n).map(|i| start + (i as f64) * step).collect();
+        // Use floor instead of ceil for NumPy-compatible element count
+        // NumPy uses: n = ceil((stop - start) / step) but then excludes values >= stop
+        // We compute exact count to avoid floating-point edge cases
+        let n = {
+            let diff = stop - start;
+            let count = (diff / step).abs();
+            // Add small epsilon to handle floating-point precision
+            let count_floor = count.floor();
+            if (count - count_floor).abs() < 1e-10 {
+                count_floor as usize
+            } else {
+                count.ceil() as usize
+            }
+        };
+
+        let values: Vec<f64> = (0..n)
+            .map(|i| start + (i as f64) * step)
+            .take_while(|&v| if step > 0.0 { v < stop } else { v > stop })
+            .collect();
 
         Ok(CpuArray::from_ndarray(
             ArrayD::from_shape_vec(IxDyn(&[values.len()]), values).unwrap(),
@@ -49,7 +66,12 @@ impl CreationOps for CpuBackend {
         }
 
         let step = (stop - start) / (num - 1) as f64;
-        let values: Vec<f64> = (0..num).map(|i| start + (i as f64) * step).collect();
+        let mut values: Vec<f64> = (0..num).map(|i| start + (i as f64) * step).collect();
+
+        // Ensure last value is exactly stop (NumPy behavior)
+        if let Some(last) = values.last_mut() {
+            *last = stop;
+        }
 
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[num]), values).unwrap())
     }
