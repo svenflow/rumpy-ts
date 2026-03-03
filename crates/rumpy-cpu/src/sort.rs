@@ -3,6 +3,20 @@
 use crate::{CpuArray, CpuBackend};
 use ndarray::{ArrayD, IxDyn};
 use rumpy_core::{ops::SortOps, Array};
+use std::cmp::Ordering;
+
+/// NaN-safe comparison for sorting: NaN values sort to the end (NumPy behavior)
+fn nan_safe_cmp(a: &f64, b: &f64) -> Ordering {
+    a.partial_cmp(b).unwrap_or_else(|| {
+        // Handle NaN: NaN is "greater" than all values, so sorts to end
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => unreachable!(), // partial_cmp only returns None for NaN
+        }
+    })
+}
 
 impl SortOps for CpuBackend {
     type Array = CpuArray;
@@ -11,14 +25,14 @@ impl SortOps for CpuBackend {
         // For simplicity, always sort flattened array
         // TODO: Implement axis-aware sorting
         let mut data = arr.as_f64_slice();
-        data.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        data.sort_by(nan_safe_cmp);
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), data).unwrap())
     }
 
     fn argsort(arr: &CpuArray, _axis: Option<usize>) -> CpuArray {
         let data = arr.as_f64_slice();
         let mut indices: Vec<usize> = (0..data.len()).collect();
-        indices.sort_by(|&a, &b| data[a].partial_cmp(&data[b]).unwrap());
+        indices.sort_by(|&a, &b| nan_safe_cmp(&data[a], &data[b]));
 
         let result: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap())
@@ -31,8 +45,9 @@ impl SortOps for CpuBackend {
         let result: Vec<f64> = vals
             .iter()
             .map(|&v| {
-                // Binary search for insertion point
-                data.binary_search_by(|probe| probe.partial_cmp(&v).unwrap())
+                // Binary search for insertion point with NaN-safe comparison
+                // NaN values in the search array sort to the end
+                data.binary_search_by(|probe| nan_safe_cmp(probe, &v))
                     .unwrap_or_else(|i| i) as f64
             })
             .collect();
@@ -42,8 +57,15 @@ impl SortOps for CpuBackend {
 
     fn unique(arr: &CpuArray) -> CpuArray {
         let mut data = arr.as_f64_slice();
-        data.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        data.sort_by(nan_safe_cmp);
+        // dedup removes consecutive duplicates, but NaN != NaN so we need special handling
+        // Keep only one NaN at the end
+        let had_nan = data.iter().any(|x| x.is_nan());
+        data.retain(|x| !x.is_nan());
         data.dedup();
+        if had_nan {
+            data.push(f64::NAN);
+        }
 
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[data.len()]), data).unwrap())
     }

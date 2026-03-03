@@ -69,7 +69,9 @@ impl MathOps for CpuBackend {
 
     fn sign(arr: &CpuArray) -> CpuArray {
         CpuArray::from_ndarray(arr.as_ndarray().mapv(|x| {
-            if x > 0.0 {
+            if x.is_nan() {
+                f64::NAN  // Propagate NaN (NumPy behavior)
+            } else if x > 0.0 {
                 1.0
             } else if x < 0.0 {
                 -1.0
@@ -91,12 +93,22 @@ impl MathOps for CpuBackend {
     }
 
     fn maximum(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x.max(y))?;
+        // NumPy behavior: if one value is NaN, return the non-NaN value
+        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| {
+            if x.is_nan() { y }
+            else if y.is_nan() { x }
+            else { x.max(y) }
+        })?;
         Ok(CpuArray::from_ndarray(result))
     }
 
     fn minimum(a: &CpuArray, b: &CpuArray) -> Result<CpuArray> {
-        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| x.min(y))?;
+        // NumPy behavior: if one value is NaN, return the non-NaN value
+        let result = broadcast_binary_op(a.as_ndarray(), b.as_ndarray(), |x, y| {
+            if x.is_nan() { y }
+            else if y.is_nan() { x }
+            else { x.min(y) }
+        })?;
         Ok(CpuArray::from_ndarray(result))
     }
 

@@ -836,6 +836,46 @@ add_test("matmul 2x3 @ 3x2", "matmul",
          np.matmul(a_rect, b_rect))
 
 
+# ==================== AUDIT ROUND 2 TESTS ====================
+
+# Test sort with NaN (NaN should sort to end)
+arr_sort_nan = np.array([3.0, np.nan, 1.0, np.nan, 2.0], dtype=np.float64)
+add_test("sort with NaN", "sort",
+         {"data": arr_sort_nan.tolist(), "shape": [5]},
+         np.sort(arr_sort_nan))  # NumPy puts NaN at end
+
+# Test argsort with NaN
+add_test("argsort with NaN", "argsort",
+         {"data": arr_sort_nan.tolist(), "shape": [5]},
+         np.argsort(arr_sort_nan).astype(np.float64))
+
+# Test sign with NaN (should propagate NaN)
+arr_sign_nan = np.array([-2, -1, 0, np.nan, 1, 2], dtype=np.float64)
+add_test("sign with NaN", "signArr",
+         {"data": arr_sign_nan.tolist(), "shape": [6]},
+         np.sign(arr_sign_nan))
+
+# Test maximum with NaN (non-NaN wins)
+arr_max_a = np.array([1.0, np.nan, 3.0, np.nan], dtype=np.float64)
+arr_max_b = np.array([2.0, 2.0, np.nan, np.nan], dtype=np.float64)
+add_test("maximum with NaN", "maximum",
+         {"a": arr_max_a.tolist(), "a_shape": [4],
+          "b": arr_max_b.tolist(), "b_shape": [4]},
+         np.maximum(arr_max_a, arr_max_b))
+
+# Test minimum with NaN (non-NaN wins)
+add_test("minimum with NaN", "minimum",
+         {"a": arr_max_a.tolist(), "a_shape": [4],
+          "b": arr_max_b.tolist(), "b_shape": [4]},
+         np.minimum(arr_max_a, arr_max_b))
+
+# Test unique with NaN (should have one NaN at end)
+arr_unique_nan = np.array([1.0, np.nan, 2.0, 1.0, np.nan, 3.0], dtype=np.float64)
+add_test("unique with NaN", "unique",
+         {"data": arr_unique_nan.tolist(), "shape": [6]},
+         np.unique(arr_unique_nan))  # NumPy puts one NaN at end
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.floating):

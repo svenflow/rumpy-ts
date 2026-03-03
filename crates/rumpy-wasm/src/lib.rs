@@ -2942,6 +2942,24 @@ impl NDArray {
 }
 
 /// Lower triangular matrix (zeros above k-th diagonal)
+// ============ Sort Operations ============
+
+/// Sort array elements (NaN values sort to end, NumPy behavior)
+#[wasm_bindgen]
+impl NDArray {
+    pub fn sort(&self) -> NDArray {
+        NDArray::new(CpuBackend::sort(&self.inner, None))
+    }
+
+    pub fn argsort(&self) -> NDArray {
+        NDArray::new(CpuBackend::argsort(&self.inner, None))
+    }
+
+    pub fn unique(&self) -> NDArray {
+        NDArray::new(CpuBackend::unique(&self.inner))
+    }
+}
+
 ///
 /// Handles batched inputs and non-contiguous arrays safely.
 /// Uses row-based iteration for performance (avoids indexed_iter overhead).

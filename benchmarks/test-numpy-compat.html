@@ -426,6 +426,39 @@
                     result = rumpy.matmul(a, b);
                     break;
                 }
+                // Audit round 2 tests
+                case 'sort': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.sort();
+                    break;
+                }
+                case 'argsort': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.argsort();
+                    break;
+                }
+                case 'signArr': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = rumpy.signArr(arr);
+                    break;
+                }
+                case 'maximum': {
+                    const a = createArray(inputs.a, inputs.a_shape);
+                    const b = createArray(inputs.b, inputs.b_shape);
+                    result = rumpy.maximum(a, b);
+                    break;
+                }
+                case 'minimum': {
+                    const a = createArray(inputs.a, inputs.a_shape);
+                    const b = createArray(inputs.b, inputs.b_shape);
+                    result = rumpy.minimum(a, b);
+                    break;
+                }
+                case 'unique': {
+                    const arr = createArray(inputs.data, inputs.shape);
+                    result = arr.unique();
+                    break;
+                }
                 default:
                     throw new Error(`Unknown op: ${op}`);
             }

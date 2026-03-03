@@ -112,7 +112,22 @@ impl StatsOps for CpuBackend {
                 ndim: data.ndim(),
             });
         }
-        Ok(CpuArray::from_ndarray(data.mean_axis(Axis(axis)).unwrap()))
+        // Handle empty axis case - mean_axis returns None for empty arrays
+        match data.mean_axis(Axis(axis)) {
+            Some(result) => Ok(CpuArray::from_ndarray(result)),
+            None => {
+                // For empty axis, return NaN-filled array with reduced shape
+                let mut new_shape = data.shape().to_vec();
+                new_shape.remove(axis);
+                if new_shape.is_empty() {
+                    new_shape.push(1);
+                }
+                let nan_data = vec![f64::NAN; new_shape.iter().product()];
+                Ok(CpuArray::from_ndarray(
+                    ArrayD::from_shape_vec(IxDyn(&new_shape), nan_data).unwrap(),
+                ))
+            }
+        }
     }
 
     fn min_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
