@@ -345,8 +345,20 @@
         ['square', 'x * x', [1, 2, 3, 4, 5, 6].map(x => x * x)],
         ['floor', 'floor(x)', [1.1, 2.5, 3.9, -1.1, -2.5, -3.9].map(Math.floor)],
         ['ceil', 'ceil(x)', [1.1, 2.5, 3.9, -1.1, -2.5, -3.9].map(Math.ceil)],
-        // Use floor(x + 0.5) to match JS Math.round behavior
-        ['round', 'floor(x + 0.5)', [1.4, 1.5, 2.5, 3.5, -1.5, -2.5].map(Math.round)],
+        // NumPy uses banker's rounding (round half to even), WGSL round() matches this
+        // Note: JS Math.round rounds 0.5 up, but NumPy rounds to even
+        ['round', 'round(x)', [1.4, 1.5, 2.5, 3.5, -1.5, -2.5].map(x => {
+          // Banker's rounding: round half to even
+          const floor = Math.floor(x);
+          const frac = x - floor;
+          if (frac === 0.5) {
+            return floor % 2 === 0 ? floor : floor + 1;
+          } else if (frac === -0.5) {
+            const ceil = Math.ceil(x);
+            return ceil % 2 === 0 ? ceil : ceil - 1;
+          }
+          return Math.round(x);
+        })],
       ];
 
       for (const [name, op, expected] of unaryTests) {
@@ -376,8 +388,10 @@
         ['mul', 'av * bv', a.map((x, i) => x * b[i])],
         ['div', 'av / bv', a.map((x, i) => x / b[i])],
         ['pow', 'pow(av, bv)', a.map((x, i) => Math.pow(x, b[i]))],
-        ['max', 'max(av, bv)', a.map((x, i) => Math.max(x, b[i]))],
-        ['min', 'min(av, bv)', a.map((x, i) => Math.min(x, b[i]))],
+        // max/min with NaN propagation (NumPy behavior)
+        // Use av != av to check for NaN
+        ['max', 'select(max(av, bv), av + bv, av != av || bv != bv)', a.map((x, i) => Math.max(x, b[i]))],
+        ['min', 'select(min(av, bv), av + bv, av != av || bv != bv)', a.map((x, i) => Math.min(x, b[i]))],
       ];
 
       for (const [name, op, expected] of binaryTests) {
@@ -419,6 +433,22 @@
         if (await testReduction(device, name, init, op, input, fns)) passed++;
         else failed++;
       }
+
+      // NumPy parity edge cases
+      log('\n--- NumPy Parity Tests ---');
+
+      // Test banker's rounding
+      const roundInput = [0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5];
+      // Banker's rounding: 0.5->0, 1.5->2, 2.5->2, 3.5->4, -0.5->0, -1.5->-2, -2.5->-2
+      const roundExpected = [0, 2, 2, 4, 0, -2, -2];
+      const roundResult = await testUnary(device, 'round (banker)', 'round(x)', roundInput, roundExpected);
+      if (roundResult) passed++; else failed++;
+
+      // Test cbrt with negative numbers
+      const cbrtInput = [-8, -1, 0, 1, 8, 27];
+      const cbrtExpected = [-2, -1, 0, 1, 2, 3];
+      const cbrtResult = await testUnary(device, 'cbrt (negatives)', 'sign(x) * pow(abs(x), 0.333333333333)', cbrtInput, cbrtExpected);
+      if (cbrtResult) passed++; else failed++;
 
       // Additional stats tests
       log('\n--- Additional Stats ---');

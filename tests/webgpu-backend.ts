@@ -176,9 +176,9 @@ const UNARY_SHADERS: Record<string, string> = {
   sign: makeUnaryShader('sign(x)'),
   floor: makeUnaryShader('floor(x)'),
   ceil: makeUnaryShader('ceil(x)'),
-  // Note: WGSL round() uses banker's rounding (round half to even)
-  // To match JS Math.round (round half up), we use floor(x + 0.5)
-  round: makeUnaryShader('floor(x + 0.5)'),
+  // NumPy uses banker's rounding (round half to even)
+  // WGSL round() also uses banker's rounding, so we use it directly
+  round: makeUnaryShader('round(x)'),
   neg: makeUnaryShader('-x'),
   reciprocal: makeUnaryShader('1.0 / x'),
   square: makeUnaryShader('x * x'),
@@ -193,9 +193,23 @@ const BINARY_SHADERS: Record<string, string> = {
   sub: makeBinaryShader('av - bv'),
   mul: makeBinaryShader('av * bv'),
   div: makeBinaryShader('av / bv'),
-  pow: makeBinaryShader('pow(av, bv)'),
-  maximum: makeBinaryShader('max(av, bv)'),
-  minimum: makeBinaryShader('min(av, bv)'),
+  // pow: handle negative bases with integer exponents like NumPy
+  // WGSL pow(negative, y) returns NaN even for integer y, but NumPy handles it
+  pow: makeBinaryShader(`
+    select(
+      pow(av, bv),
+      select(
+        -pow(-av, bv),
+        pow(-av, bv),
+        fract(bv) == 0.0 && (i32(bv) % 2) == 1
+      ),
+      av < 0.0 && fract(bv) == 0.0
+    )
+  `),
+  // maximum/minimum: NumPy propagates NaN, WGSL max/min ignores it
+  // Use av != av to check for NaN (NaN != NaN is true)
+  maximum: makeBinaryShader('select(max(av, bv), av + bv, av != av || bv != bv)'),  // NaN + anything = NaN
+  minimum: makeBinaryShader('select(min(av, bv), av + bv, av != av || bv != bv)'),
 };
 
 // Scalar shader definitions
@@ -204,15 +218,29 @@ const SCALAR_SHADERS: Record<string, string> = {
   subScalar: makeScalarShader('x - s'),
   mulScalar: makeScalarShader('x * s'),
   divScalar: makeScalarShader('x / s'),
-  powScalar: makeScalarShader('pow(x, s)'),
+  // powScalar: handle negative bases like NumPy
+  powScalar: makeScalarShader(`
+    select(
+      pow(x, s),
+      select(
+        -pow(-x, s),
+        pow(-x, s),
+        fract(s) == 0.0 && (i32(s) % 2) == 1
+      ),
+      x < 0.0 && fract(s) == 0.0
+    )
+  `),
 };
 
 // Reduction shader definitions
+// For min/max: NumPy propagates NaN, so we need custom reduce ops
 const REDUCTION_SHADERS: Record<string, string> = {
   sum: makeReductionShader('0.0f', '$a + $b'),
   prod: makeReductionShader('1.0f', '$a * $b'),
-  min: makeReductionShader('3.40282e+38f', 'min($a, $b)'),  // f32 max
-  max: makeReductionShader('-3.40282e+38f', 'max($a, $b)'), // f32 min
+  // min/max with NaN propagation like NumPy
+  // Use x != x to check for NaN
+  min: makeReductionShader('3.40282e+38f', 'select(min($a, $b), $a + $b, $a != $a || $b != $b)'),
+  max: makeReductionShader('-3.40282e+38f', 'select(max($a, $b), $a + $b, $a != $a || $b != $b)'),
 };
 
 // Cumulative sum/prod shader (Hillis-Steele scan)
