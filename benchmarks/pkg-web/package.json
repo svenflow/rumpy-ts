@@ -1,0 +1,20 @@
+{
+  "name": "rumpy-wasm",
+  "type": "module",
+  "collaborators": [
+    "Sven"
+  ],
+  "description": "WASM bindings for RumPy",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "rumpy_wasm_bg.wasm",
+    "rumpy_wasm.js",
+    "rumpy_wasm.d.ts"
+  ],
+  "main": "rumpy_wasm.js",
+  "types": "rumpy_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

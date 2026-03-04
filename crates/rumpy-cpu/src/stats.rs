@@ -45,29 +45,33 @@ impl StatsOps for CpuBackend {
         Self::var_ddof(arr, ddof).sqrt()
     }
 
-    fn min(arr: &CpuArray) -> f64 {
+    fn min(arr: &CpuArray) -> Result<f64> {
         let data = arr.as_ndarray();
         if data.is_empty() {
-            return f64::NAN;
+            return Err(RumpyError::EmptyArrayReduction("minimum"));
         }
-        data.iter()
+        Ok(data.iter()
             .cloned()
-            .fold(f64::INFINITY, f64::min)
+            .fold(f64::INFINITY, f64::min))
     }
 
-    fn max(arr: &CpuArray) -> f64 {
+    fn max(arr: &CpuArray) -> Result<f64> {
         let data = arr.as_ndarray();
         if data.is_empty() {
-            return f64::NAN;
+            return Err(RumpyError::EmptyArrayReduction("maximum"));
         }
-        data.iter()
+        Ok(data.iter()
             .cloned()
-            .fold(f64::NEG_INFINITY, f64::max)
+            .fold(f64::NEG_INFINITY, f64::max))
     }
 
-    fn argmin(arr: &CpuArray) -> usize {
+    fn argmin(arr: &CpuArray) -> Result<usize> {
+        let data = arr.as_ndarray();
+        if data.is_empty() {
+            return Err(RumpyError::EmptyArrayReduction("argmin"));
+        }
         // Handle NaN: treat NaN as greater than all values (NumPy behavior)
-        arr.as_ndarray()
+        Ok(data
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
@@ -77,12 +81,16 @@ impl StatsOps for CpuBackend {
                 })
             })
             .map(|(i, _)| i)
-            .unwrap_or(0)
+            .unwrap())
     }
 
-    fn argmax(arr: &CpuArray) -> usize {
+    fn argmax(arr: &CpuArray) -> Result<usize> {
+        let data = arr.as_ndarray();
+        if data.is_empty() {
+            return Err(RumpyError::EmptyArrayReduction("argmax"));
+        }
         // Handle NaN: treat NaN as less than all values (NumPy behavior)
-        arr.as_ndarray()
+        Ok(data
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
@@ -92,7 +100,7 @@ impl StatsOps for CpuBackend {
                 })
             })
             .map(|(i, _)| i)
-            .unwrap_or(0)
+            .unwrap())
     }
 
     fn sum_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
@@ -735,6 +743,110 @@ impl StatsOps for CpuBackend {
             filtered.into_iter().fold(f64::NEG_INFINITY, f64::max)
         }
     }
+
+    fn diff(arr: &CpuArray, n: usize, axis: Option<usize>) -> Result<CpuArray> {
+        if n == 0 {
+            return Ok(arr.clone());
+        }
+
+        let data = arr.as_ndarray();
+        let shape = data.shape();
+        let ndim = shape.len();
+
+        match axis {
+            None => {
+                // Flatten and compute diff
+                let flat: Vec<f64> = data.iter().cloned().collect();
+                if flat.len() <= n {
+                    return Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[0]), vec![]).unwrap()));
+                }
+                let mut result = flat;
+                for _ in 0..n {
+                    let new_len = result.len() - 1;
+                    result = (0..new_len).map(|i| result[i + 1] - result[i]).collect();
+                }
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[result.len()]), result).unwrap()))
+            }
+            Some(ax) => {
+                if ax >= ndim {
+                    return Err(RumpyError::InvalidAxis { axis: ax, ndim });
+                }
+
+                let axis_len = shape[ax];
+                if axis_len <= n {
+                    let mut new_shape = shape.to_vec();
+                    new_shape[ax] = 0;
+                    return Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), vec![]).unwrap()));
+                }
+
+                let mut current = data.to_owned();
+                for _ in 0..n {
+                    let cur_shape = current.shape().to_vec();
+                    let cur_axis_len = cur_shape[ax];
+                    let mut new_shape = cur_shape.clone();
+                    new_shape[ax] = cur_axis_len - 1;
+
+                    let outer_size: usize = cur_shape[..ax].iter().product();
+                    let inner_size: usize = cur_shape[ax + 1..].iter().product();
+                    let mut result_data = Vec::with_capacity(new_shape.iter().product());
+
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            for i in 0..(cur_axis_len - 1) {
+                                let flat_idx_cur = outer * (cur_axis_len * inner_size) + i * inner_size + inner;
+                                let flat_idx_next = outer * (cur_axis_len * inner_size) + (i + 1) * inner_size + inner;
+                                result_data.push(current.as_slice().unwrap()[flat_idx_next] - current.as_slice().unwrap()[flat_idx_cur]);
+                            }
+                        }
+                    }
+
+                    current = ArrayD::from_shape_vec(IxDyn(&new_shape), result_data).unwrap();
+                }
+
+                Ok(CpuArray::from_ndarray(current))
+            }
+        }
+    }
+
+    fn percentile(arr: &CpuArray, q: f64) -> Result<f64> {
+        // q is in range 0-100
+        Self::quantile(arr, q / 100.0)
+    }
+
+    fn quantile(arr: &CpuArray, q: f64) -> Result<f64> {
+        // q is in range 0-1
+        if !(0.0..=1.0).contains(&q) {
+            return Err(RumpyError::InvalidArgument(format!("Quantile must be between 0 and 1, got {}", q)));
+        }
+
+        let data = arr.as_ndarray();
+        if data.is_empty() {
+            return Err(RumpyError::EmptyArrayReduction("quantile"));
+        }
+
+        let mut sorted: Vec<f64> = data.iter().cloned().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let n = sorted.len();
+        if n == 1 {
+            return Ok(sorted[0]);
+        }
+
+        // Linear interpolation method (NumPy default)
+        let pos = q * (n - 1) as f64;
+        let idx = pos.floor() as usize;
+        let frac = pos - idx as f64;
+
+        if idx >= n - 1 {
+            Ok(sorted[n - 1])
+        } else {
+            Ok(sorted[idx] * (1.0 - frac) + sorted[idx + 1] * frac)
+        }
+    }
+
+    fn median(arr: &CpuArray) -> Result<f64> {
+        Self::quantile(arr, 0.5)
+    }
 }
 
 #[cfg(test)]
@@ -789,15 +901,31 @@ mod tests {
     #[test]
     fn test_min_max() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        assert_eq!(CpuBackend::min(&a), 1.0);
-        assert_eq!(CpuBackend::max(&a), 9.0);
+        assert_eq!(CpuBackend::min(&a).unwrap(), 1.0);
+        assert_eq!(CpuBackend::max(&a).unwrap(), 9.0);
+    }
+
+    #[test]
+    fn test_min_max_empty() {
+        // NumPy raises ValueError for empty arrays
+        let empty = CpuArray::from_f64_vec(vec![], vec![0]).unwrap();
+        assert!(CpuBackend::min(&empty).is_err());
+        assert!(CpuBackend::max(&empty).is_err());
     }
 
     #[test]
     fn test_argmin_argmax() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        assert_eq!(CpuBackend::argmin(&a), 1);
-        assert_eq!(CpuBackend::argmax(&a), 5);
+        assert_eq!(CpuBackend::argmin(&a).unwrap(), 1);
+        assert_eq!(CpuBackend::argmax(&a).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_argmin_argmax_empty() {
+        // NumPy raises ValueError for empty arrays
+        let empty = CpuArray::from_f64_vec(vec![], vec![0]).unwrap();
+        assert!(CpuBackend::argmin(&empty).is_err());
+        assert!(CpuBackend::argmax(&empty).is_err());
     }
 
     #[test]
@@ -963,5 +1091,59 @@ mod tests {
         let a = CpuArray::from_f64_vec(vec![], vec![0]).unwrap();
         assert!(CpuBackend::nanmin(&a).is_nan());
         assert!(CpuBackend::nanmax(&a).is_nan());
+    }
+
+    #[test]
+    fn test_diff_1d() {
+        let a = arr(vec![1.0, 2.0, 4.0, 7.0, 0.0]);
+        let result = CpuBackend::diff(&a, 1, None).unwrap();
+        assert_eq!(result.as_f64_slice(), vec![1.0, 2.0, 3.0, -7.0]);
+    }
+
+    #[test]
+    fn test_diff_n2() {
+        let a = arr(vec![1.0, 2.0, 4.0, 7.0, 0.0]);
+        let result = CpuBackend::diff(&a, 2, None).unwrap();
+        // First diff: [1, 2, 3, -7], second diff: [1, 1, -10]
+        assert_eq!(result.as_f64_slice(), vec![1.0, 1.0, -10.0]);
+    }
+
+    #[test]
+    fn test_percentile() {
+        let a = arr(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        // 50th percentile = median = 3.0
+        let p50 = CpuBackend::percentile(&a, 50.0).unwrap();
+        assert!(approx_eq(p50, 3.0));
+        // 0th percentile = min = 1.0
+        let p0 = CpuBackend::percentile(&a, 0.0).unwrap();
+        assert!(approx_eq(p0, 1.0));
+        // 100th percentile = max = 5.0
+        let p100 = CpuBackend::percentile(&a, 100.0).unwrap();
+        assert!(approx_eq(p100, 5.0));
+    }
+
+    #[test]
+    fn test_quantile() {
+        let a = arr(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let q50 = CpuBackend::quantile(&a, 0.5).unwrap();
+        assert!(approx_eq(q50, 3.0));
+    }
+
+    #[test]
+    fn test_median() {
+        let a = arr(vec![1.0, 3.0, 2.0, 5.0, 4.0]);
+        let m = CpuBackend::median(&a).unwrap();
+        assert!(approx_eq(m, 3.0));
+
+        // Even number of elements: interpolation
+        let b = arr(vec![1.0, 2.0, 3.0, 4.0]);
+        let m2 = CpuBackend::median(&b).unwrap();
+        assert!(approx_eq(m2, 2.5));
+    }
+
+    #[test]
+    fn test_median_empty() {
+        let a = CpuArray::from_f64_vec(vec![], vec![0]).unwrap();
+        assert!(CpuBackend::median(&a).is_err());
     }
 }

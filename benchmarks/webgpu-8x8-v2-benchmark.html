@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU GEMM 8x8 v2 - TSK=16 + Vectorized</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+</head>
+<body>
+  <h1>WebGPU GEMM - 8x8 v2 (TSK=16)</h1>
+  <p>64 outputs/thread, TSK=16, vec4 loads, transposed B in shared mem</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    // v2: TSK=16 (larger K tiles), transposed B loading for coalescing
+    const gemmShader8x8v2 = `
+      struct Uniforms {
+        M: u32,
+        N: u32,
+        K: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+      // Config: 64x64 tile, 8x8 threads, 8x8 outputs per thread
+      // TSK=16 for more compute per barrier
+      const TS: u32 = 64u;      // Tile size (output)
+      const TSK: u32 = 16u;     // Tile size K (doubled!)
+      const WG: u32 = 8u;       // Workgroup size per dim
+      const WPT: u32 = 8u;      // Work per thread
+
+      // Shared memory: 64x16 for A, 16x64 for B (but stored transposed as 64x16)
+      var<workgroup> Asub: array<array<f32, TSK>, TS>;
+      var<workgroup> Bsub: array<array<f32, TSK>, TS>; // Transposed: [col][k]
+
+      @compute @workgroup_size(8, 8)
+      fn main(
+        @builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(workgroup_id) workgroup_id: vec3<u32>
+      ) {
+        let M = uniforms.M;
+        let N = uniforms.N;
+        let K = uniforms.K;
+
+        let tidx = local_id.x;
+        let tidy = local_id.y;
+        let tid = tidy * WG + tidx; // Linear thread id 0..63
+
+        let row = workgroup_id.y * TS + tidy * WPT;
+        let col = workgroup_id.x * TS + tidx * WPT;
+
+        // 8x8 accumulators as 8 rows x 2 vec4s
+        var acc: array<array<vec4<f32>, 2>, 8>;
+        for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+          acc[i][0] = vec4<f32>(0.0);
+          acc[i][1] = vec4<f32>(0.0);
+        }
+
+        let numTiles = (K + TSK - 1u) / TSK;
+
+        for (var t: u32 = 0u; t < numTiles; t = t + 1u) {
+          // Load A: 64 rows x 16 cols = 1024 elements
+          // 64 threads, each loads 16 elements
+          // Thread tid loads row (tid), cols 0..15
+          for (var k: u32 = 0u; k < TSK; k = k + 1u) {
+            let aRow = workgroup_id.y * TS + tid;
+            let aCol = t * TSK + k;
+            if (aRow < M && aCol < K) {
+              Asub[tid][k] = A[aRow * K + aCol];
+            } else {
+              Asub[tid][k] = 0.0;
+            }
+          }
+
+          // Load B transposed: original is 16 rows x 64 cols
+          // Store as [col][k] for coalesced reads later
+          // 64 threads load 16 elements each = 1024 elements
+          for (var k: u32 = 0u; k < TSK; k = k + 1u) {
+            let bRow = t * TSK + k;
+            let bCol = workgroup_id.x * TS + tid;
+            if (bRow < K && bCol < N) {
+              Bsub[tid][k] = B[bRow * N + bCol];
+            } else {
+              Bsub[tid][k] = 0.0;
+            }
+          }
+
+          workgroupBarrier();
+
+          // Compute - unrolled k-loop by 2 for larger TSK
+          for (var k: u32 = 0u; k < TSK; k = k + 2u) {
+            // First k
+            {
+              let b0 = vec4<f32>(
+                Bsub[tidx * WPT + 0u][k],
+                Bsub[tidx * WPT + 1u][k],
+                Bsub[tidx * WPT + 2u][k],
+                Bsub[tidx * WPT + 3u][k]
+              );
+              let b1 = vec4<f32>(
+                Bsub[tidx * WPT + 4u][k],
+                Bsub[tidx * WPT + 5u][k],
+                Bsub[tidx * WPT + 6u][k],
+                Bsub[tidx * WPT + 7u][k]
+              );
+
+              let a0 = Asub[tidy * WPT + 0u][k];
+              let a1 = Asub[tidy * WPT + 1u][k];
+              let a2 = Asub[tidy * WPT + 2u][k];
+              let a3 = Asub[tidy * WPT + 3u][k];
+              let a4 = Asub[tidy * WPT + 4u][k];
+              let a5 = Asub[tidy * WPT + 5u][k];
+              let a6 = Asub[tidy * WPT + 6u][k];
+              let a7 = Asub[tidy * WPT + 7u][k];
+
+              acc[0][0] = fma(vec4<f32>(a0), b0, acc[0][0]);
+              acc[0][1] = fma(vec4<f32>(a0), b1, acc[0][1]);
+              acc[1][0] = fma(vec4<f32>(a1), b0, acc[1][0]);
+              acc[1][1] = fma(vec4<f32>(a1), b1, acc[1][1]);
+              acc[2][0] = fma(vec4<f32>(a2), b0, acc[2][0]);
+              acc[2][1] = fma(vec4<f32>(a2), b1, acc[2][1]);
+              acc[3][0] = fma(vec4<f32>(a3), b0, acc[3][0]);
+              acc[3][1] = fma(vec4<f32>(a3), b1, acc[3][1]);
+              acc[4][0] = fma(vec4<f32>(a4), b0, acc[4][0]);
+              acc[4][1] = fma(vec4<f32>(a4), b1, acc[4][1]);
+              acc[5][0] = fma(vec4<f32>(a5), b0, acc[5][0]);
+              acc[5][1] = fma(vec4<f32>(a5), b1, acc[5][1]);
+              acc[6][0] = fma(vec4<f32>(a6), b0, acc[6][0]);
+              acc[6][1] = fma(vec4<f32>(a6), b1, acc[6][1]);
+              acc[7][0] = fma(vec4<f32>(a7), b0, acc[7][0]);
+              acc[7][1] = fma(vec4<f32>(a7), b1, acc[7][1]);
+            }
+
+            // Second k+1
+            {
+              let k1 = k + 1u;
+              let b0 = vec4<f32>(
+                Bsub[tidx * WPT + 0u][k1],
+                Bsub[tidx * WPT + 1u][k1],
+                Bsub[tidx * WPT + 2u][k1],
+                Bsub[tidx * WPT + 3u][k1]
+              );
+              let b1 = vec4<f32>(
+                Bsub[tidx * WPT + 4u][k1],
+                Bsub[tidx * WPT + 5u][k1],
+                Bsub[tidx * WPT + 6u][k1],
+                Bsub[tidx * WPT + 7u][k1]
+              );
+
+              let a0 = Asub[tidy * WPT + 0u][k1];
+              let a1 = Asub[tidy * WPT + 1u][k1];
+              let a2 = Asub[tidy * WPT + 2u][k1];
+              let a3 = Asub[tidy * WPT + 3u][k1];
+              let a4 = Asub[tidy * WPT + 4u][k1];
+              let a5 = Asub[tidy * WPT + 5u][k1];
+              let a6 = Asub[tidy * WPT + 6u][k1];
+              let a7 = Asub[tidy * WPT + 7u][k1];
+
+              acc[0][0] = fma(vec4<f32>(a0), b0, acc[0][0]);
+              acc[0][1] = fma(vec4<f32>(a0), b1, acc[0][1]);
+              acc[1][0] = fma(vec4<f32>(a1), b0, acc[1][0]);
+              acc[1][1] = fma(vec4<f32>(a1), b1, acc[1][1]);
+              acc[2][0] = fma(vec4<f32>(a2), b0, acc[2][0]);
+              acc[2][1] = fma(vec4<f32>(a2), b1, acc[2][1]);
+              acc[3][0] = fma(vec4<f32>(a3), b0, acc[3][0]);
+              acc[3][1] = fma(vec4<f32>(a3), b1, acc[3][1]);
+              acc[4][0] = fma(vec4<f32>(a4), b0, acc[4][0]);
+              acc[4][1] = fma(vec4<f32>(a4), b1, acc[4][1]);
+              acc[5][0] = fma(vec4<f32>(a5), b0, acc[5][0]);
+              acc[5][1] = fma(vec4<f32>(a5), b1, acc[5][1]);
+              acc[6][0] = fma(vec4<f32>(a6), b0, acc[6][0]);
+              acc[6][1] = fma(vec4<f32>(a6), b1, acc[6][1]);
+              acc[7][0] = fma(vec4<f32>(a7), b0, acc[7][0]);
+              acc[7][1] = fma(vec4<f32>(a7), b1, acc[7][1]);
+            }
+          }
+
+          workgroupBarrier();
+        }
+
+        // Write results
+        for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+          let outRow = row + i;
+          if (outRow < M) {
+            if (col + 0u < N) { C[outRow * N + col + 0u] = acc[i][0].x; }
+            if (col + 1u < N) { C[outRow * N + col + 1u] = acc[i][0].y; }
+            if (col + 2u < N) { C[outRow * N + col + 2u] = acc[i][0].z; }
+            if (col + 3u < N) { C[outRow * N + col + 3u] = acc[i][0].w; }
+            if (col + 4u < N) { C[outRow * N + col + 4u] = acc[i][1].x; }
+            if (col + 5u < N) { C[outRow * N + col + 5u] = acc[i][1].y; }
+            if (col + 6u < N) { C[outRow * N + col + 6u] = acc[i][1].z; }
+            if (col + 7u < N) { C[outRow * N + col + 7u] = acc[i][1].w; }
+          }
+        }
+      }
+    `;
+
+    class WebGPUMatmul {
+      constructor(device) {
+        this.device = device;
+        this.pipeline = null;
+        this.bindGroupLayout = null;
+      }
+
+      async init() {
+        const shaderModule = this.device.createShaderModule({ code: gemmShader8x8v2 });
+
+        this.bindGroupLayout = this.device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          ]
+        });
+
+        this.pipeline = this.device.createComputePipeline({
+          layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+          compute: { module: shaderModule, entryPoint: 'main' }
+        });
+      }
+
+      createBuffers(M, N, K) {
+        const device = this.device;
+
+        const uniformBuffer = device.createBuffer({
+          size: 12,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+
+        const bufferA = device.createBuffer({
+          size: M * K * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+
+        const bufferB = device.createBuffer({
+          size: K * N * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+
+        const bufferC = device.createBuffer({
+          size: M * N * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+
+        const readBuffer = device.createBuffer({
+          size: M * N * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+
+        const bindGroup = device.createBindGroup({
+          layout: this.bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuffer } },
+            { binding: 1, resource: { buffer: bufferA } },
+            { binding: 2, resource: { buffer: bufferB } },
+            { binding: 3, resource: { buffer: bufferC } },
+          ]
+        });
+
+        return { uniformBuffer, bufferA, bufferB, bufferC, readBuffer, bindGroup };
+      }
+
+      async matmulReuse(a, b, M, N, K, buffers) {
+        const device = this.device;
+
+        device.queue.writeBuffer(buffers.uniformBuffer, 0, new Uint32Array([M, N, K]));
+        device.queue.writeBuffer(buffers.bufferA, 0, a);
+        device.queue.writeBuffer(buffers.bufferB, 0, b);
+
+        const TS = 64;
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, buffers.bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(N / TS), Math.ceil(M / TS));
+        passEncoder.end();
+
+        commandEncoder.copyBufferToBuffer(buffers.bufferC, 0, buffers.readBuffer, 0, M * N * 4);
+        device.queue.submit([commandEncoder.finish()]);
+
+        await buffers.readBuffer.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(buffers.readBuffer.getMappedRange().slice(0));
+        buffers.readBuffer.unmap();
+
+        return result;
+      }
+
+      destroyBuffers(buffers) {
+        buffers.uniformBuffer.destroy();
+        buffers.bufferA.destroy();
+        buffers.bufferB.destroy();
+        buffers.bufferC.destroy();
+        buffers.readBuffer.destroy();
+      }
+    }
+
+    function cpuMatmul(a, b, M, N, K) {
+      const c = new Float32Array(M * N);
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < N; j++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) {
+            sum += a[i * K + k] * b[k * N + j];
+          }
+          c[i * N + j] = sum;
+        }
+      }
+      return c;
+    }
+
+    function maxAbsDiff(a, b) {
+      let max = 0;
+      for (let i = 0; i < a.length; i++) {
+        max = Math.max(max, Math.abs(a[i] - b[i]));
+      }
+      return max;
+    }
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+
+      try {
+        if (!navigator.gpu) {
+          log('ERROR: WebGPU not supported');
+          return;
+        }
+
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          log('ERROR: No WebGPU adapter found');
+          return;
+        }
+
+        const device = await adapter.requestDevice();
+        log('WebGPU device ready');
+
+        const gpuMatmul = new WebGPUMatmul(device);
+        await gpuMatmul.init();
+        log('8x8 v2 GEMM kernel ready (TSK=16, transposed B, k-unroll by 2)');
+
+        log('\nVerifying correctness...');
+        const testN = 64;
+        const testA = new Float32Array(testN * testN).map(() => Math.random());
+        const testB = new Float32Array(testN * testN).map(() => Math.random());
+        const testBuffers = gpuMatmul.createBuffers(testN, testN, testN);
+        const gpuResult = await gpuMatmul.matmulReuse(testA, testB, testN, testN, testN, testBuffers);
+        const cpuResult = cpuMatmul(testA, testB, testN, testN, testN);
+        const diff = maxAbsDiff(gpuResult, cpuResult);
+        log('Max abs diff from CPU: ' + diff.toExponential(2) + (diff < 0.001 ? ' ✓' : ' ✗'));
+        gpuMatmul.destroyBuffers(testBuffers);
+
+        log('\nLoading TensorFlow.js WebGPU backend...');
+        await tf.setBackend('webgpu');
+        await tf.ready();
+        log('tfjs WebGPU ready');
+
+        const sizes = [512, 1024, 2048, 4096];
+        const iters = 5;
+
+        log('\n=== BENCHMARK: 8x8 v2 (TSK=16) ===\n');
+        log('Size | Our 8x8 v2  | tfjs WebGPU | Ratio');
+        log('-----|-------------|-------------|------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+
+          const buffers = gpuMatmul.createBuffers(n, n, n);
+          await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          await tf.matMul(tA, tB).data();
+
+          let ourTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+            ourTime = Math.min(ourTime, performance.now() - start);
+          }
+
+          gpuMatmul.destroyBuffers(buffers);
+
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            await res.data();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+
+          tA.dispose();
+          tB.dispose();
+
+          const ratio = (tfjsTime / ourTime).toFixed(2);
+          const win = parseFloat(ratio) >= 1.0 ? '✓' : '';
+          log(
+            n.toString().padStart(4) + ' | ' +
+            ourTime.toFixed(1).padStart(9) + 'ms | ' +
+            tfjsTime.toFixed(1).padStart(9) + 'ms | ' +
+            ratio.padStart(5) + 'x ' + win
+          );
+        }
+
+        log('\n=== ANALYSIS ===');
+        log('Ratio > 1.0 = we beat tfjs WebGPU');
+        log('\nDONE');
+
+      } catch (e) {
+        log('ERROR: ' + e.message);
+        log(e.stack);
+      }
+    };
+  </script>
+</body>
+</html>

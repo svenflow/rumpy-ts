@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Comprehensive GEMM Benchmark with Correctness</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    h1 { color: #6366f1; }
+    pre {
+      background: #141414;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 800px;
+      font-size: 13px;
+    }
+    button {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      margin: 0.25rem;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .win { color: #22c55e; font-weight: bold; }
+    .loss { color: #ef4444; font-weight: bold; }
+    .tie { color: #eab308; }
+    table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+    th, td { padding: 0.4rem 0.8rem; border: 1px solid #333; text-align: right; font-size: 12px; }
+    th { background: #222; }
+    .fastest { background: #166534; }
+  </style>
+</head>
+<body>
+  <h1>Comprehensive GEMM Benchmark</h1>
+  <p>Testing all kernels across all sizes with correctness verification</p>
+
+  <div>
+    <button onclick="runBenchmarks()">▶ Run Full Benchmark</button>
+    <button onclick="runQuickTest()">⚡ Quick Test (100x100 only)</button>
+  </div>
+
+  <pre id="log">Initializing...</pre>
+
+  <div id="results"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    let rumpy = null;
+    let tfjsReady = false;
+
+    // Initialize TensorFlow.js WASM
+    async function initTFJS() {
+      log('Initializing TensorFlow.js WASM...');
+      try {
+        await tf.setBackend('wasm');
+        await tf.ready();
+        log(`✅ TensorFlow.js ready (backend: ${tf.getBackend()})`);
+        tfjsReady = true;
+      } catch (e) {
+        log(`❌ TensorFlow.js failed: ${e.message}`);
+      }
+    }
+
+    // Initialize rumpy-ts
+    async function initRumpy() {
+      log('Initializing rumpy-ts WASM...');
+      try {
+        const module = await import('./pkg-web/rumpy_wasm.js');
+        await module.default();
+        rumpy = module;
+        log('✅ rumpy-ts ready');
+        log(`   Available kernels:`);
+        log(`   - matmulF32: ${typeof rumpy.matmulF32 === 'function'}`);
+        log(`   - matmulF32Packed: ${typeof rumpy.matmulF32Packed === 'function'}`);
+        log(`   - matmulF32FMA: ${typeof rumpy.matmulF32FMA === 'function'}`);
+        log(`   - matmulF32FMAPacked: ${typeof rumpy.matmulF32FMAPacked === 'function'}`);
+        log(`   - matmulF32Auto: ${typeof rumpy.matmulF32Auto === 'function'}`);
+        log(`   - matmulF325x8: ${typeof rumpy.matmulF325x8 === 'function'}`);
+        log(`   - maxAbsDiff: ${typeof rumpy.maxAbsDiff === 'function'}`);
+      } catch (e) {
+        log(`❌ rumpy-ts failed: ${e.message}`);
+      }
+    }
+
+    // Benchmark function
+    function benchmark(fn, iterations = 50) {
+      // Warmup
+      for (let i = 0; i < 10; i++) fn();
+
+      const times = [];
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        fn();
+        times.push(performance.now() - start);
+      }
+
+      times.sort((a, b) => a - b);
+      const trimStart = Math.floor(times.length * 0.1);
+      const trimEnd = Math.floor(times.length * 0.9);
+      const trimmed = times.slice(trimStart, trimEnd);
+      const mean = trimmed.reduce((a, b) => a + b, 0) / trimmed.length;
+      const min = times[0];
+      const median = times[Math.floor(times.length / 2)];
+
+      return { mean, min, median };
+    }
+
+    // Compute reference result using scalar (known correct)
+    function computeReference(a, b, n) {
+      const c = new Float32Array(n * n);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+          let sum = 0;
+          for (let k = 0; k < n; k++) {
+            sum += a[i * n + k] * b[k * n + j];
+          }
+          c[i * n + j] = sum;
+        }
+      }
+      return c;
+    }
+
+    async function runBenchmarks() {
+      const sizes = [16, 24, 32, 48, 64, 80, 96, 100, 112, 128, 160, 192, 200, 256, 384, 512, 768, 1024];
+      await runBenchmarkSuite(sizes);
+    }
+
+    async function runQuickTest() {
+      await runBenchmarkSuite([100]);
+    }
+
+    async function runBenchmarkSuite(sizes) {
+      logEl.textContent = 'Running benchmarks...\n';
+
+      const allResults = {};
+      let wins = 0, ties = 0, losses = 0;
+
+      for (const n of sizes) {
+        log(`\n${'='.repeat(60)}`);
+        log(`Matrix Size: ${n}x${n}`);
+        log(`${'='.repeat(60)}`);
+
+        const results = {};
+
+        // Create random data
+        const data1 = new Float32Array(n * n).map(() => Math.random());
+        const data2 = new Float32Array(n * n).map(() => Math.random());
+
+        // Compute reference for correctness
+        log(`Computing reference result...`);
+        const reference = computeReference(data1, data2, n);
+        const refSum = reference.reduce((a, b) => a + b, 0);
+        log(`  Reference checksum: ${refSum.toFixed(2)}`);
+
+        // Test each kernel
+        const kernels = [
+          { name: 'scalar (ref)', fn: () => computeReference(data1, data2, n) },
+          { name: 'f32 (4x8)', fn: () => rumpy.matmulF32(data1, data2, n, n, n), check: true },
+          { name: 'f32 packed', fn: () => rumpy.matmulF32Packed(data1, data2, n, n, n), check: true },
+          { name: 'f32 FMA', fn: () => rumpy.matmulF32FMA(data1, data2, n, n, n), check: true },
+          { name: 'f32 FMA+pack', fn: () => rumpy.matmulF32FMAPacked(data1, data2, n, n, n), check: true },
+          { name: 'f32 5x8', fn: () => rumpy.matmulF325x8(data1, data2, n, n, n), check: true },
+          { name: 'f32 auto', fn: () => rumpy.matmulF32Auto(data1, data2, n, n, n), check: true },
+        ];
+
+        log(`\nTiming kernels (50 iterations each)...`);
+
+        for (const kernel of kernels) {
+          try {
+            // First check correctness
+            if (kernel.check) {
+              const result = kernel.fn();
+              const maxDiff = rumpy.maxAbsDiff(result, reference);
+              const resultSum = result.reduce((a, b) => a + b, 0);
+
+              // f32 tolerance should be ~1e-3 to 1e-4 for matrix multiply
+              const tolerance = n * 1e-4;  // Scale with matrix size
+              if (maxDiff > tolerance) {
+                log(`  ❌ ${kernel.name}: INCORRECT! maxDiff=${maxDiff.toFixed(6)} > ${tolerance.toFixed(6)}`);
+                continue;
+              }
+            }
+
+            // Then benchmark
+            const result = benchmark(kernel.fn);
+            results[kernel.name] = result.mean;
+            log(`  ${kernel.name}: ${result.mean.toFixed(4)}ms (min: ${result.min.toFixed(4)})`);
+          } catch (e) {
+            log(`  ❌ ${kernel.name}: ${e.message}`);
+          }
+        }
+
+        // TensorFlow.js
+        if (tfjsReady) {
+          const t1 = tf.tensor2d(Array.from(data1), [n, n]);
+          const t2 = tf.tensor2d(Array.from(data2), [n, n]);
+
+          // Check correctness
+          const tfjsResult = tf.matMul(t1, t2);
+          const tfjsData = new Float32Array(tfjsResult.dataSync());
+          const maxDiff = rumpy.maxAbsDiff(tfjsData, reference);
+          const tolerance = n * 1e-4;
+
+          if (maxDiff > tolerance) {
+            log(`  ⚠️ tfjs: maxDiff=${maxDiff.toFixed(6)} (expected, different accumulation order)`);
+          }
+
+          const result = benchmark(() => {
+            const r = tf.matMul(t1, t2);
+            r.dataSync();
+            r.dispose();
+          });
+          results['tfjs WASM'] = result.mean;
+          log(`  tfjs WASM: ${result.mean.toFixed(4)}ms (min: ${result.min.toFixed(4)})`);
+
+          t1.dispose();
+          t2.dispose();
+          tfjsResult.dispose();
+        }
+
+        // Find best rumpy kernel
+        const rumpyKernels = Object.entries(results).filter(([k]) => k !== 'tfjs WASM' && k !== 'scalar (ref)');
+        const bestRumpy = rumpyKernels.sort((a, b) => a[1] - b[1])[0];
+        const tfjs = results['tfjs WASM'];
+
+        if (bestRumpy && tfjs) {
+          const ratio = bestRumpy[1] / tfjs;
+          let verdict;
+          if (ratio < 0.95) {
+            verdict = `✅ WIN: ${bestRumpy[0]} is ${(1/ratio).toFixed(2)}x FASTER`;
+            wins++;
+          } else if (ratio > 1.05) {
+            verdict = `❌ LOSS: tfjs is ${ratio.toFixed(2)}x faster (best: ${bestRumpy[0]})`;
+            losses++;
+          } else {
+            verdict = `🟡 TIE: ${bestRumpy[0]} vs tfjs (${ratio.toFixed(2)}x)`;
+            ties++;
+          }
+          log(`\n  ${verdict}`);
+        }
+
+        allResults[n] = results;
+      }
+
+      // Summary
+      log(`\n${'='.repeat(60)}`);
+      log(`FINAL SCORE: ${wins} WINS | ${ties} TIES | ${losses} LOSSES`);
+      log(`${'='.repeat(60)}`);
+
+      if (losses === 0) {
+        log(`\n🎉 PERFECT! We beat or match tfjs at every size!`);
+      } else {
+        log(`\n⚠️ ${losses} size(s) still slower than tfjs`);
+      }
+
+      window.benchmarkResults = allResults;
+      window.benchmarkComplete = true;
+
+      // Display summary table
+      displaySummaryTable(allResults, sizes);
+    }
+
+    function displaySummaryTable(results, sizes) {
+      let html = `
+        <h3>Summary Table (all times in ms)</h3>
+        <table>
+          <tr>
+            <th>Size</th>
+            <th>f32 FMA</th>
+            <th>f32 FMA+pack</th>
+            <th>f32 5x8</th>
+            <th>f32 auto</th>
+            <th>tfjs</th>
+            <th>Best vs tfjs</th>
+          </tr>
+      `;
+
+      for (const n of sizes) {
+        const r = results[n] || {};
+        const fma = r['f32 FMA'];
+        const fmaPack = r['f32 FMA+pack'];
+        const f5x8 = r['f32 5x8'];
+        const auto = r['f32 auto'];
+        const tfjs = r['tfjs WASM'];
+
+        const rumpyTimes = [fma, fmaPack, f5x8, auto].filter(x => x !== undefined);
+        const best = Math.min(...rumpyTimes);
+        const ratio = tfjs ? (best / tfjs) : null;
+
+        let verdictClass = '';
+        let verdictText = '—';
+        if (ratio !== null) {
+          if (ratio < 0.95) {
+            verdictClass = 'win';
+            verdictText = `${(1/ratio).toFixed(2)}x faster`;
+          } else if (ratio > 1.05) {
+            verdictClass = 'loss';
+            verdictText = `${ratio.toFixed(2)}x slower`;
+          } else {
+            verdictClass = 'tie';
+            verdictText = 'tie';
+          }
+        }
+
+        const format = (v, isBest) => {
+          if (v === undefined) return '—';
+          const cls = (v === best) ? 'fastest' : '';
+          return `<td class="${cls}">${v.toFixed(3)}</td>`;
+        };
+
+        html += `<tr>
+          <td>${n}x${n}</td>
+          ${format(fma, fma === best)}
+          ${format(fmaPack, fmaPack === best)}
+          ${format(f5x8, f5x8 === best)}
+          ${format(auto, auto === best)}
+          <td>${tfjs ? tfjs.toFixed(3) : '—'}</td>
+          <td class="${verdictClass}">${verdictText}</td>
+        </tr>`;
+      }
+
+      html += '</table>';
+      document.getElementById('results').innerHTML = html;
+    }
+
+    window.runBenchmarks = runBenchmarks;
+    window.runQuickTest = runQuickTest;
+
+    async function init() {
+      await initTFJS();
+      await initRumpy();
+      log('\nReady! Click a button to run benchmarks.');
+    }
+
+    init();
+  </script>
+</body>
+</html>

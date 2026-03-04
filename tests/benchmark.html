@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>rumpy-ts vs tfjs Benchmarks</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    pre {
+      background: #16213e;
+      padding: 20px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 14px;
+    }
+    .status {
+      padding: 10px 20px;
+      background: #0f3460;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    button {
+      background: #00d9ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    button:hover { background: #00b8d4; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+    th, td {
+      padding: 12px;
+      text-align: right;
+      border-bottom: 1px solid #333;
+    }
+    th { background: #0f3460; text-align: left; }
+    td:first-child { text-align: left; }
+    .fastest { color: #00ff88; font-weight: bold; }
+    .chart {
+      height: 300px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>rumpy-ts vs TensorFlow.js Benchmarks</h1>
+
+  <div class="status" id="status">Ready to run benchmarks</div>
+
+  <button id="runBtn" onclick="runBenchmarks()">Run Benchmarks</button>
+  <button id="copyBtn" onclick="copyResults()" disabled>Copy Results</button>
+
+  <div id="results"></div>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.17.0/dist/tf-backend-wasm.min.js"></script>
+
+  <script type="module">
+    // Configuration
+    const WARMUP_RUNS = 3;
+    const BENCHMARK_RUNS = 10;
+    const MATRIX_SIZES = [128, 256, 512, 1024, 2048, 4096];
+
+    let allResults = [];
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg;
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // rumpy-ts WASM benchmark
+    async function benchmarkRumpyWasm(size) {
+      const module = await import('./wasm-pkg/rumpy_wasm.js');
+      const wasmUrl = new URL('./wasm-pkg/rumpy_wasm_bg.wasm', import.meta.url);
+      const wasmResponse = await fetch(wasmUrl);
+      const wasmBytes = await wasmResponse.arrayBuffer();
+      await module.default(wasmBytes);
+      await module.initThreadPool(navigator.hardwareConcurrency || 4);
+
+      // Create random matrices
+      const aData = new Float64Array(size * size);
+      const bData = new Float64Array(size * size);
+      for (let i = 0; i < size * size; i++) {
+        aData[i] = Math.random();
+        bData[i] = Math.random();
+      }
+
+      const shape = new Uint32Array([size, size]);
+      const a = module.arrayFromTyped(aData, shape);
+      const b = module.arrayFromTyped(bData, shape);
+
+      // Warmup
+      for (let i = 0; i < WARMUP_RUNS; i++) {
+        const c = module.matmul(a, b);
+        c.free();
+      }
+
+      await sleep(10);
+
+      // Benchmark
+      const times = [];
+      for (let i = 0; i < BENCHMARK_RUNS; i++) {
+        const start = performance.now();
+        const c = module.matmul(a, b);
+        const end = performance.now();
+        times.push(end - start);
+        c.free();
+      }
+
+      a.free();
+      b.free();
+
+      const avgMs = times.reduce((a, b) => a + b) / times.length;
+      const minMs = Math.min(...times);
+      const maxMs = Math.max(...times);
+      const flops = 2 * size * size * size;
+      const gflops = (flops / (avgMs / 1000)) / 1e9;
+
+      return { backend: 'rumpy-wasm', size, avgMs, minMs, maxMs, gflops };
+    }
+
+    // TensorFlow.js benchmark
+    async function benchmarkTfjs(size, backendName) {
+      try {
+        if (backendName === 'wasm') {
+          await tf.setBackend('wasm');
+        } else {
+          await tf.setBackend(backendName);
+        }
+        await tf.ready();
+      } catch (e) {
+        console.log(`Backend ${backendName} unavailable:`, e);
+        return null;
+      }
+
+      const a = tf.randomUniform([size, size], 0, 1, 'float32');
+      const b = tf.randomUniform([size, size], 0, 1, 'float32');
+
+      // Warmup
+      for (let i = 0; i < WARMUP_RUNS; i++) {
+        const c = tf.matMul(a, b);
+        await c.data();
+        c.dispose();
+      }
+
+      await sleep(10);
+
+      // Benchmark
+      const times = [];
+      for (let i = 0; i < BENCHMARK_RUNS; i++) {
+        const start = performance.now();
+        const c = tf.matMul(a, b);
+        await c.data(); // Force execution
+        const end = performance.now();
+        times.push(end - start);
+        c.dispose();
+      }
+
+      a.dispose();
+      b.dispose();
+
+      const avgMs = times.reduce((a, b) => a + b) / times.length;
+      const minMs = Math.min(...times);
+      const maxMs = Math.max(...times);
+      const flops = 2 * size * size * size;
+      const gflops = (flops / (avgMs / 1000)) / 1e9;
+
+      return { backend: `tfjs-${backendName}`, size, avgMs, minMs, maxMs, gflops };
+    }
+
+    async function runBenchmarks() {
+      const btn = document.getElementById('runBtn');
+      btn.disabled = true;
+      allResults = [];
+
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '';
+
+      for (const size of MATRIX_SIZES) {
+        setStatus(`Benchmarking ${size}x${size} matrices...`);
+
+        const sizeResults = [];
+
+        // rumpy-ts WASM
+        try {
+          setStatus(`${size}x${size}: rumpy-wasm...`);
+          const r = await benchmarkRumpyWasm(size);
+          sizeResults.push(r);
+          allResults.push(r);
+        } catch (e) {
+          console.error('rumpy-wasm error:', e);
+        }
+
+        // tfjs backends
+        for (const backend of ['cpu', 'webgl', 'wasm']) {
+          try {
+            setStatus(`${size}x${size}: tfjs-${backend}...`);
+            const r = await benchmarkTfjs(size, backend);
+            if (r) {
+              sizeResults.push(r);
+              allResults.push(r);
+            }
+          } catch (e) {
+            console.error(`tfjs-${backend} error:`, e);
+          }
+        }
+
+        // Render table for this size
+        renderTable(size, sizeResults, resultsDiv);
+      }
+
+      setStatus('Benchmarks complete!');
+      btn.disabled = false;
+      document.getElementById('copyBtn').disabled = false;
+    }
+
+    function renderTable(size, results, container) {
+      // Sort by speed (fastest first)
+      results.sort((a, b) => a.avgMs - b.avgMs);
+      const fastest = results[0]?.backend;
+
+      let html = `<h2>${size}x${size} Matrix Multiplication</h2>`;
+      html += '<table>';
+      html += '<tr><th>Backend</th><th>Avg (ms)</th><th>Min</th><th>Max</th><th>GFLOPS</th></tr>';
+
+      for (const r of results) {
+        const isFastest = r.backend === fastest;
+        html += `<tr class="${isFastest ? 'fastest' : ''}">`;
+        html += `<td>${r.backend}${isFastest ? ' ⚡' : ''}</td>`;
+        html += `<td>${r.avgMs.toFixed(2)}</td>`;
+        html += `<td>${r.minMs.toFixed(2)}</td>`;
+        html += `<td>${r.maxMs.toFixed(2)}</td>`;
+        html += `<td>${r.gflops.toFixed(2)}</td>`;
+        html += '</tr>';
+      }
+
+      html += '</table>';
+      container.innerHTML += html;
+    }
+
+    function copyResults() {
+      const sizes = [...new Set(allResults.map(r => r.size))];
+      let text = 'MATMUL BENCHMARK RESULTS\n';
+      text += '========================\n\n';
+
+      for (const size of sizes) {
+        text += `${size}x${size}:\n`;
+        const sizeResults = allResults.filter(r => r.size === size).sort((a, b) => a.avgMs - b.avgMs);
+        for (const r of sizeResults) {
+          text += `  ${r.backend.padEnd(15)} ${r.avgMs.toFixed(2).padStart(8)}ms  ${r.gflops.toFixed(2).padStart(8)} GFLOPS\n`;
+        }
+        text += '\n';
+      }
+
+      navigator.clipboard.writeText(text);
+      setStatus('Results copied to clipboard!');
+    }
+
+    // Expose to window
+    window.runBenchmarks = runBenchmarks;
+    window.copyResults = copyResults;
+  </script>
+</body>
+</html>

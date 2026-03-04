@@ -1,0 +1,8 @@
+# Single-threaded WASM config (for Node.js/bun testing)
+# Copy this to config.toml to build without threads/relaxed-simd
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+simd128,+bulk-memory,+mutable-globals",
+  "--cfg", "getrandom_backend=\"wasm_js\""
+]

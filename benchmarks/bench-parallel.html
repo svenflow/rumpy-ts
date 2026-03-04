@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Parallel GEMM Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+    }
+    pre { background: #141414; padding: 1rem; border-radius: 8px; overflow: auto; }
+    .faster { color: #22c55e; font-weight: bold; }
+    .slower { color: #ef4444; }
+    table { border-collapse: collapse; margin: 1rem 0; }
+    th, td { padding: 8px 16px; border: 1px solid #333; text-align: right; }
+    th { background: #1a1a1a; }
+  </style>
+</head>
+<body>
+  <h1>Multi-Threaded GEMM Benchmark</h1>
+  <p>Comparing rumpy-ts parallel vs TensorFlow.js XNNPACK (both multi-threaded)</p>
+  <pre id="log">Loading...</pre>
+  <div id="results"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      console.log(msg);
+    }
+
+    let rumpy = null;
+
+    async function init() {
+      log('Initializing...');
+
+      // TensorFlow.js WASM with multi-threading (default)
+      log('Setting up TensorFlow.js WASM (multi-threaded)...');
+      // Let tfjs use its default thread count
+      await tf.setBackend('wasm');
+      await tf.ready();
+      const tfjsThreads = navigator.hardwareConcurrency || 'unknown';
+      log(`TensorFlow.js ready (backend: ${tf.getBackend()}, threads: ${tfjsThreads})`);
+
+      // rumpy-ts
+      log('Loading rumpy-ts...');
+      const module = await import('./pkg/rumpy_wasm.js');
+
+      // Pre-allocate larger memory to avoid memory.grow during parallel execution
+      // 2048^2 * 4 bytes * 3 matrices = 48MB minimum, let's allocate 128MB (2048 pages)
+      const memory = new WebAssembly.Memory({
+        initial: 2048,     // 2048 pages = 128MB initial
+        maximum: 16384,    // 1GB max
+        shared: true
+      });
+      log(`Pre-allocating ${memory.buffer.byteLength / (1024*1024)}MB WASM memory...`);
+
+      await module.default({ memory });
+      rumpy = module;
+
+      // Initialize thread pool for rayon parallel execution
+      const numCores = navigator.hardwareConcurrency || 4;
+      const numThreads = Math.min(numCores, 10);  // Cap at 10 for M4 Pro (perf cores only)
+      log(`initThreadPool available: ${typeof rumpy.initThreadPool}`);
+      if (rumpy.initThreadPool) {
+        log(`Initializing thread pool with ${numThreads} threads (hardwareConcurrency: ${numCores})...`);
+        try {
+          // Add timeout to detect hangs
+          const initPromise = rumpy.initThreadPool(numThreads);
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Thread pool init timeout after 10s')), 10000)
+          );
+          await Promise.race([initPromise, timeoutPromise]);
+          log(`Thread pool initialized successfully!`);
+        } catch (e) {
+          log(`ERROR initializing thread pool: ${e.message || e}`);
+          log(`Continuing without parallelization...`);
+        }
+      } else {
+        log(`WARNING: initThreadPool not available`);
+      }
+      // Check rayon thread count
+      log(`rayon.current_num_threads() = ${rumpy.getNumThreads?.() || 'N/A'}`);
+      log(`rumpy-ts ready`);
+      log(`  matmulF32Optimized: ${typeof rumpy.matmulF32Optimized === 'function'}`);
+      log(`  matmulF32OptimizedParallel: ${typeof rumpy.matmulF32OptimizedParallel === 'function'}`);
+
+      log('\nReady to benchmark!');
+    }
+
+    function benchmark(name, fn, iterations = 20) {
+      // Warmup
+      for (let i = 0; i < 3; i++) fn();
+
+      const times = [];
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        fn();
+        times.push(performance.now() - start);
+      }
+      times.sort((a, b) => a - b);
+      const median = times[Math.floor(times.length / 2)];
+      const mean = times.reduce((a, b) => a + b, 0) / times.length;
+      return { median, mean, min: times[0], max: times[times.length - 1] };
+    }
+
+    async function runBenchmark() {
+      const sizes = [256, 512, 1024, 1792, 2047, 2048, 2049, 2056, 4096];
+      const results = {};
+      const allResults = [];
+
+      for (const n of sizes) {
+        log(`\n=== Size ${n}x${n} ===`);
+        results[n] = {};
+
+        // Create test data
+        const data1 = new Float32Array(n * n);
+        const data2 = new Float32Array(n * n);
+        for (let i = 0; i < n * n; i++) {
+          data1[i] = Math.random();
+          data2[i] = Math.random();
+        }
+
+        // TensorFlow.js XNNPACK (multi-threaded default)
+        const tfA = tf.tensor2d(data1, [n, n]);
+        const tfB = tf.tensor2d(data2, [n, n]);
+
+        const tfjsResult = benchmark('tfjs', () => {
+          const c = tf.matMul(tfA, tfB);
+          c.dataSync();
+          c.dispose();
+        }, 20);
+        log(`  tfjs XNNPACK (multi):     ${tfjsResult.median.toFixed(2)} ms`);
+        results[n].tfjs_parallel = tfjsResult.median;
+
+        tfA.dispose();
+        tfB.dispose();
+
+        // rumpy-ts single-threaded optimized (baseline)
+        if (rumpy.matmulF32Optimized) {
+          const singleResult = benchmark('rumpy single', () => {
+            rumpy.matmulF32Optimized(data1, data2, n, n, n);
+          }, 20);
+          log(`  rumpy optimized (single): ${singleResult.median.toFixed(2)} ms`);
+          results[n].rumpy_single = singleResult.median;
+        }
+
+        // rumpy-ts parallel optimized
+        if (rumpy.matmulF32OptimizedParallel) {
+          // Check thread count before large matrix
+          if (n >= 2048) {
+            log(`  [DEBUG] Threads before ${n}x${n}: ${rumpy.getNumThreads?.() || 'N/A'}`);
+          }
+          const parallelResult = benchmark('rumpy parallel', () => {
+            rumpy.matmulF32OptimizedParallel(data1, data2, n, n, n);
+          }, 20);
+          log(`  rumpy optimized (parallel): ${parallelResult.median.toFixed(2)} ms`);
+          results[n].rumpy_parallel = parallelResult.median;
+
+          // Comparison
+          const vs_tfjs = parallelResult.median / tfjsResult.median;
+          const speedup = results[n].rumpy_single / parallelResult.median;
+          log(`    vs tfjs parallel: ${vs_tfjs.toFixed(2)}x ${vs_tfjs > 1 ? '(SLOWER)' : '(FASTER!)'}`);
+          log(`    parallel speedup: ${speedup.toFixed(2)}x over single-threaded`);
+        }
+
+        allResults.push({
+          size: n,
+          tfjs: results[n].tfjs_parallel,
+          rumpy_single: results[n].rumpy_single,
+          rumpy_parallel: results[n].rumpy_parallel,
+          ratio: results[n].rumpy_parallel / results[n].tfjs_parallel
+        });
+      }
+
+      // Generate results table
+      let html = '<table><tr><th>Size</th><th>tfjs (ms)</th><th>rumpy single (ms)</th><th>rumpy parallel (ms)</th><th>vs tfjs</th></tr>';
+      for (const r of allResults) {
+        const cls = r.ratio < 1 ? 'faster' : 'slower';
+        html += `<tr>
+          <td>${r.size}x${r.size}</td>
+          <td>${r.tfjs?.toFixed(2)}</td>
+          <td>${r.rumpy_single?.toFixed(2)}</td>
+          <td>${r.rumpy_parallel?.toFixed(2)}</td>
+          <td class="${cls}">${r.ratio?.toFixed(2)}x</td>
+        </tr>`;
+      }
+      html += '</table>';
+      document.getElementById('results').innerHTML = html;
+
+      log('\n=== SUMMARY ===');
+      for (const r of allResults) {
+        const status = r.ratio < 1 ? 'FASTER' : 'SLOWER';
+        log(`${r.size}x${r.size}: tfjs=${r.tfjs?.toFixed(2)}ms, rumpy_par=${r.rumpy_parallel?.toFixed(2)}ms (${r.ratio?.toFixed(2)}x ${status})`);
+      }
+
+      return results;
+    }
+
+    window.runBenchmark = runBenchmark;
+
+    // Initialize and store promise
+    window.initPromise = init();
+
+    // Auto-run if interactive browser (not headless)
+    window.initPromise.then(() => {
+      if (typeof window !== 'undefined' && !window.navigator.webdriver) {
+        runBenchmark();
+      }
+    });
+  </script>
+</body>
+</html>

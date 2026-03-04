@@ -42,6 +42,9 @@ pub enum RumpyError {
 
     #[error("Backend error: {0}")]
     BackendError(String),
+
+    #[error("zero-size array to reduction operation {0} which has no identity")]
+    EmptyArrayReduction(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, RumpyError>;

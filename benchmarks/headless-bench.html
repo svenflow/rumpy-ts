@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Headless Benchmark</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <script type="module">
+    async function runBenchmarks() {
+      // Initialize TensorFlow.js WASM
+      await tf.setBackend('wasm');
+      await tf.ready();
+
+      // Load rumpy-ts
+      const rumpy = await import('./pkg/rumpy_wasm.js');
+      await rumpy.default();
+
+      // Initialize thread pool
+      let numThreads = 1;
+      if (rumpy.initThreadPool) {
+        try {
+          await rumpy.initThreadPool(navigator.hardwareConcurrency || 4);
+          numThreads = rumpy.getNumThreads();
+        } catch (e) {
+          console.log('Thread init failed:', e);
+        }
+      }
+
+      function benchmark(fn, iterations = 30) {
+        // Warmup
+        for (let i = 0; i < 5; i++) fn();
+
+        const times = [];
+        for (let i = 0; i < iterations; i++) {
+          const start = performance.now();
+          fn();
+          times.push(performance.now() - start);
+        }
+
+        times.sort((a, b) => a - b);
+        const trimmed = times.slice(Math.floor(times.length * 0.1), Math.floor(times.length * 0.9));
+        return {
+          mean: trimmed.reduce((a, b) => a + b, 0) / trimmed.length,
+          min: times[0],
+          max: times[times.length - 1]
+        };
+      }
+
+      const results = {
+        hardware: {
+          cores: navigator.hardwareConcurrency,
+          rumpyThreads: numThreads
+        },
+        benchmarks: {}
+      };
+
+      const sizes = [32, 64, 100, 128, 256, 384, 512, 768, 1024];
+
+      for (const n of sizes) {
+        const data1 = new Float32Array(n * n).map(() => Math.random());
+        const data2 = new Float32Array(n * n).map(() => Math.random());
+
+        results.benchmarks[n] = {};
+
+        // rumpy FMA (single-threaded SIMD)
+        if (rumpy.matmulF32Auto) {
+          const r = benchmark(() => rumpy.matmulF32Auto(data1, data2, n, n, n));
+          results.benchmarks[n]['rumpy-fma'] = r.mean;
+        }
+
+        // rumpy gemm crate (BLIS-style optimizations)
+        if (rumpy.matmulGemm) {
+          const r = benchmark(() => rumpy.matmulGemm(data1, data2, n, n, n));
+          results.benchmarks[n]['rumpy-gemm'] = r.mean;
+        }
+
+        // rumpy FMA + packed
+        if (rumpy.matmulF32FMAPacked) {
+          const r = benchmark(() => rumpy.matmulF32FMAPacked(data1, data2, n, n, n));
+          results.benchmarks[n]['rumpy-fma-packed'] = r.mean;
+        }
+
+        // rumpy Parallel (multi-threaded SIMD)
+        if (rumpy.matmulF32Parallel && numThreads > 1) {
+          const r = benchmark(() => rumpy.matmulF32Parallel(data1, data2, n, n, n));
+          results.benchmarks[n]['rumpy-parallel'] = r.mean;
+        }
+
+        // rumpy XNNPACK-style (pre-packed B)
+        if (rumpy.packB && rumpy.matmulXnnpack && n % 8 === 0 && n >= 8) {
+          const packedB = rumpy.packB(data2, n, n);
+          const r = benchmark(() => rumpy.matmulXnnpack(data1, packedB, n, n, n));
+          results.benchmarks[n]['rumpy-xnnpack'] = r.mean;
+        }
+
+        // TensorFlow.js WASM
+        const t1 = tf.tensor2d(Array.from(data1), [n, n]);
+        const t2 = tf.tensor2d(Array.from(data2), [n, n]);
+        const r = benchmark(() => {
+          const res = tf.matMul(t1, t2);
+          res.dataSync();
+          res.dispose();
+        });
+        results.benchmarks[n]['tfjs-wasm'] = r.mean;
+        t1.dispose();
+        t2.dispose();
+      }
+
+      return results;
+    }
+
+    // Run and signal completion
+    runBenchmarks()
+      .then(results => {
+        window.benchmarkResults = results;
+        window.benchmarkComplete = true;
+        console.log('BENCHMARK_RESULT:' + JSON.stringify(results));
+      })
+      .catch(err => {
+        console.error('Benchmark error:', err);
+        window.benchmarkError = err.message;
+        window.benchmarkComplete = true;
+      });
+  </script>
+</body>
+</html>

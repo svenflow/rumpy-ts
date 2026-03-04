@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>2048 Overflow Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <pre id="output">Loading...</pre>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    try {
+      // Init tfjs WASM
+      await tf.setBackend('wasm');
+      await tf.ready();
+      log('tfjs WASM ready, threads: ' + tf.env().getNumber('WASM_HAS_MULTITHREAD_SUPPORT'));
+
+      const rumpy = await import('./pkg-web/rumpy_wasm.js');
+      await rumpy.default();
+
+      // Initialize threads
+      let numThreads = 1;
+      if (rumpy.initThreadPool) {
+        await rumpy.initThreadPool(navigator.hardwareConcurrency || 4);
+        numThreads = navigator.hardwareConcurrency;
+      }
+      log('rumpy threads: ' + numThreads);
+
+      const sizes = [64, 128, 192, 256, 384, 512, 768, 1024, 2048];
+
+      log('\n--- BENCHMARK RESULTS ---');
+      log('Size | rumpy-ST | rumpy-MT | speedup | tfjs | vs tfjs');
+      log('-----|----------|----------|---------|------|--------');
+
+      for (const n of sizes) {
+        const data1 = new Float32Array(n * n).map(() => Math.random());
+        const data2 = new Float32Array(n * n).map(() => Math.random());
+
+        // Single-threaded rumpy
+        let st = Infinity;
+        for (let i = 0; i < 3; i++) {
+          const start = performance.now();
+          rumpy.matmulF32Optimized(data1, data2, n, n, n);
+          st = Math.min(st, performance.now() - start);
+        }
+
+        // Multi-threaded rumpy
+        let mt = Infinity;
+        for (let i = 0; i < 3; i++) {
+          const start = performance.now();
+          rumpy.matmulF32OptimizedParallel(data1, data2, n, n, n);
+          mt = Math.min(mt, performance.now() - start);
+        }
+
+        // tfjs
+        const t1 = tf.tensor2d(Array.from(data1), [n, n]);
+        const t2 = tf.tensor2d(Array.from(data2), [n, n]);
+        let tfTime = Infinity;
+        for (let i = 0; i < 3; i++) {
+          const start = performance.now();
+          const res = tf.matMul(t1, t2);
+          res.dataSync();
+          res.dispose();
+          tfTime = Math.min(tfTime, performance.now() - start);
+        }
+        t1.dispose();
+        t2.dispose();
+
+        const speedup = (st / mt).toFixed(2);
+        const vsTfjs = (tfTime / mt).toFixed(2);
+        log(n + ' | ' + st.toFixed(1) + 'ms | ' + mt.toFixed(1) + 'ms | ' + speedup + 'x | ' + tfTime.toFixed(1) + 'ms | ' + vsTfjs + 'x');
+      }
+
+      log('\nDONE');
+      window.DONE = true;
+    } catch (e) {
+      log('ERROR: ' + e.message + '\n' + e.stack);
+      window.DONE = true;
+    }
+  </script>
+</body>
+</html>

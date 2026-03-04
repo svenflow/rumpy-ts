@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU GEMM - Double Buffering</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+</head>
+<body>
+  <h1>WebGPU GEMM - Double Buffering</h1>
+  <p>Overlapping load and compute with ping-pong buffers</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    // Double buffering: use two sets of shared memory, alternate between them
+    // While computing on buffer 0, load into buffer 1, then swap
+    const gemmShaderDoubleBuffer = `
+      struct Uniforms {
+        M: u32,
+        N: u32,
+        K: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+      const TILE_M: u32 = 32u;
+      const TILE_N: u32 = 32u;
+      const TILE_K: u32 = 16u;  // Smaller K tile for double buffering
+      const ROW_PER_THREAD: u32 = 4u;
+      const COL_PER_THREAD: u32 = 4u;
+
+      // Double buffers
+      var<workgroup> mm_Asub0: array<array<f32, TILE_K>, TILE_M>;
+      var<workgroup> mm_Bsub0: array<array<f32, TILE_N>, TILE_K>;
+      var<workgroup> mm_Asub1: array<array<f32, TILE_K>, TILE_M>;
+      var<workgroup> mm_Bsub1: array<array<f32, TILE_N>, TILE_K>;
+
+      @compute @workgroup_size(8, 8)
+      fn main(
+        @builtin(local_invocation_id) localId: vec3<u32>,
+        @builtin(workgroup_id) workgroupId: vec3<u32>
+      ) {
+        let M = uniforms.M;
+        let N = uniforms.N;
+        let K = uniforms.K;
+
+        let tileRow = workgroupId.y * TILE_M;
+        let tileCol = workgroupId.x * TILE_N;
+
+        let localRow = localId.y;
+        let localCol = localId.x;
+        let localIdx = localRow * 8u + localCol;
+
+        let globalRow = tileRow + localRow * ROW_PER_THREAD;
+        let globalCol = tileCol + localCol * COL_PER_THREAD;
+
+        var acc0: vec4<f32> = vec4<f32>(0.0);
+        var acc1: vec4<f32> = vec4<f32>(0.0);
+        var acc2: vec4<f32> = vec4<f32>(0.0);
+        var acc3: vec4<f32> = vec4<f32>(0.0);
+
+        let numTiles = (K + TILE_K - 1u) / TILE_K;
+
+        // Load first tile into buffer 0
+        {
+          let t = 0u;
+          // 32x16 = 512 elements, 64 threads, 8 each
+          for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+            let loadIdx = localIdx * 8u + i;
+            let loadRow = loadIdx / 16u;
+            let loadCol = loadIdx % 16u;
+            let aRow = tileRow + loadRow;
+            let aCol = t * TILE_K + loadCol;
+            if (aRow < M && aCol < K) {
+              mm_Asub0[loadRow][loadCol] = A[aRow * K + aCol];
+            } else {
+              mm_Asub0[loadRow][loadCol] = 0.0;
+            }
+          }
+          for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+            let loadIdx = localIdx * 8u + i;
+            let loadRow = loadIdx / 32u;
+            let loadCol = loadIdx % 32u;
+            let bRow = t * TILE_K + loadRow;
+            let bCol = tileCol + loadCol;
+            if (bRow < K && bCol < N) {
+              mm_Bsub0[loadRow][loadCol] = B[bRow * N + bCol];
+            } else {
+              mm_Bsub0[loadRow][loadCol] = 0.0;
+            }
+          }
+        }
+        workgroupBarrier();
+
+        // Main loop with double buffering
+        for (var t: u32 = 0u; t < numTiles; t = t + 1u) {
+          let useBuffer0 = (t % 2u) == 0u;
+          let nextT = t + 1u;
+          let hasNext = nextT < numTiles;
+
+          // Load next tile into the OTHER buffer while computing on current
+          if (hasNext) {
+            if (useBuffer0) {
+              // Load into buffer 1
+              for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+                let loadIdx = localIdx * 8u + i;
+                let loadRow = loadIdx / 16u;
+                let loadCol = loadIdx % 16u;
+                let aRow = tileRow + loadRow;
+                let aCol = nextT * TILE_K + loadCol;
+                if (aRow < M && aCol < K) {
+                  mm_Asub1[loadRow][loadCol] = A[aRow * K + aCol];
+                } else {
+                  mm_Asub1[loadRow][loadCol] = 0.0;
+                }
+              }
+              for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+                let loadIdx = localIdx * 8u + i;
+                let loadRow = loadIdx / 32u;
+                let loadCol = loadIdx % 32u;
+                let bRow = nextT * TILE_K + loadRow;
+                let bCol = tileCol + loadCol;
+                if (bRow < K && bCol < N) {
+                  mm_Bsub1[loadRow][loadCol] = B[bRow * N + bCol];
+                } else {
+                  mm_Bsub1[loadRow][loadCol] = 0.0;
+                }
+              }
+            } else {
+              // Load into buffer 0
+              for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+                let loadIdx = localIdx * 8u + i;
+                let loadRow = loadIdx / 16u;
+                let loadCol = loadIdx % 16u;
+                let aRow = tileRow + loadRow;
+                let aCol = nextT * TILE_K + loadCol;
+                if (aRow < M && aCol < K) {
+                  mm_Asub0[loadRow][loadCol] = A[aRow * K + aCol];
+                } else {
+                  mm_Asub0[loadRow][loadCol] = 0.0;
+                }
+              }
+              for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+                let loadIdx = localIdx * 8u + i;
+                let loadRow = loadIdx / 32u;
+                let loadCol = loadIdx % 32u;
+                let bRow = nextT * TILE_K + loadRow;
+                let bCol = tileCol + loadCol;
+                if (bRow < K && bCol < N) {
+                  mm_Bsub0[loadRow][loadCol] = B[bRow * N + bCol];
+                } else {
+                  mm_Bsub0[loadRow][loadCol] = 0.0;
+                }
+              }
+            }
+          }
+
+          // Compute on current buffer
+          if (useBuffer0) {
+            for (var k: u32 = 0u; k < TILE_K; k = k + 1u) {
+              let bVec = vec4<f32>(
+                mm_Bsub0[k][localCol * COL_PER_THREAD + 0u],
+                mm_Bsub0[k][localCol * COL_PER_THREAD + 1u],
+                mm_Bsub0[k][localCol * COL_PER_THREAD + 2u],
+                mm_Bsub0[k][localCol * COL_PER_THREAD + 3u]
+              );
+              acc0 = fma(vec4<f32>(mm_Asub0[localRow * ROW_PER_THREAD + 0u][k]), bVec, acc0);
+              acc1 = fma(vec4<f32>(mm_Asub0[localRow * ROW_PER_THREAD + 1u][k]), bVec, acc1);
+              acc2 = fma(vec4<f32>(mm_Asub0[localRow * ROW_PER_THREAD + 2u][k]), bVec, acc2);
+              acc3 = fma(vec4<f32>(mm_Asub0[localRow * ROW_PER_THREAD + 3u][k]), bVec, acc3);
+            }
+          } else {
+            for (var k: u32 = 0u; k < TILE_K; k = k + 1u) {
+              let bVec = vec4<f32>(
+                mm_Bsub1[k][localCol * COL_PER_THREAD + 0u],
+                mm_Bsub1[k][localCol * COL_PER_THREAD + 1u],
+                mm_Bsub1[k][localCol * COL_PER_THREAD + 2u],
+                mm_Bsub1[k][localCol * COL_PER_THREAD + 3u]
+              );
+              acc0 = fma(vec4<f32>(mm_Asub1[localRow * ROW_PER_THREAD + 0u][k]), bVec, acc0);
+              acc1 = fma(vec4<f32>(mm_Asub1[localRow * ROW_PER_THREAD + 1u][k]), bVec, acc1);
+              acc2 = fma(vec4<f32>(mm_Asub1[localRow * ROW_PER_THREAD + 2u][k]), bVec, acc2);
+              acc3 = fma(vec4<f32>(mm_Asub1[localRow * ROW_PER_THREAD + 3u][k]), bVec, acc3);
+            }
+          }
+
+          workgroupBarrier();
+        }
+
+        // Write results
+        if (globalRow + 0u < M && globalCol < N) {
+          C[(globalRow + 0u) * N + globalCol + 0u] = acc0.x;
+          C[(globalRow + 0u) * N + globalCol + 1u] = acc0.y;
+          C[(globalRow + 0u) * N + globalCol + 2u] = acc0.z;
+          C[(globalRow + 0u) * N + globalCol + 3u] = acc0.w;
+        }
+        if (globalRow + 1u < M && globalCol < N) {
+          C[(globalRow + 1u) * N + globalCol + 0u] = acc1.x;
+          C[(globalRow + 1u) * N + globalCol + 1u] = acc1.y;
+          C[(globalRow + 1u) * N + globalCol + 2u] = acc1.z;
+          C[(globalRow + 1u) * N + globalCol + 3u] = acc1.w;
+        }
+        if (globalRow + 2u < M && globalCol < N) {
+          C[(globalRow + 2u) * N + globalCol + 0u] = acc2.x;
+          C[(globalRow + 2u) * N + globalCol + 1u] = acc2.y;
+          C[(globalRow + 2u) * N + globalCol + 2u] = acc2.z;
+          C[(globalRow + 2u) * N + globalCol + 3u] = acc2.w;
+        }
+        if (globalRow + 3u < M && globalCol < N) {
+          C[(globalRow + 3u) * N + globalCol + 0u] = acc3.x;
+          C[(globalRow + 3u) * N + globalCol + 1u] = acc3.y;
+          C[(globalRow + 3u) * N + globalCol + 2u] = acc3.z;
+          C[(globalRow + 3u) * N + globalCol + 3u] = acc3.w;
+        }
+      }
+    `;
+
+    class WebGPUMatmul {
+      constructor(device) { this.device = device; }
+
+      async init() {
+        const shaderModule = this.device.createShaderModule({ code: gemmShaderDoubleBuffer });
+        this.bindGroupLayout = this.device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          ]
+        });
+        this.pipeline = this.device.createComputePipeline({
+          layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+          compute: { module: shaderModule, entryPoint: 'main' }
+        });
+      }
+
+      createBuffers(M, N, K) {
+        const device = this.device;
+        const uniformBuffer = device.createBuffer({ size: 12, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const bufferA = device.createBuffer({ size: M * K * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferB = device.createBuffer({ size: K * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferC = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readBuffer = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const bindGroup = device.createBindGroup({
+          layout: this.bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuffer } },
+            { binding: 1, resource: { buffer: bufferA } },
+            { binding: 2, resource: { buffer: bufferB } },
+            { binding: 3, resource: { buffer: bufferC } },
+          ]
+        });
+        return { uniformBuffer, bufferA, bufferB, bufferC, readBuffer, bindGroup };
+      }
+
+      async matmulReuse(a, b, M, N, K, buffers) {
+        const device = this.device;
+        device.queue.writeBuffer(buffers.uniformBuffer, 0, new Uint32Array([M, N, K]));
+        device.queue.writeBuffer(buffers.bufferA, 0, a);
+        device.queue.writeBuffer(buffers.bufferB, 0, b);
+        const TILE = 32;
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, buffers.bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(N / TILE), Math.ceil(M / TILE));
+        passEncoder.end();
+        commandEncoder.copyBufferToBuffer(buffers.bufferC, 0, buffers.readBuffer, 0, M * N * 4);
+        device.queue.submit([commandEncoder.finish()]);
+        await buffers.readBuffer.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(buffers.readBuffer.getMappedRange().slice(0));
+        buffers.readBuffer.unmap();
+        return result;
+      }
+
+      destroyBuffers(buffers) {
+        buffers.uniformBuffer.destroy();
+        buffers.bufferA.destroy();
+        buffers.bufferB.destroy();
+        buffers.bufferC.destroy();
+        buffers.readBuffer.destroy();
+      }
+    }
+
+    function cpuMatmul(a, b, M, N, K) {
+      const c = new Float32Array(M * N);
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < N; j++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) { sum += a[i * K + k] * b[k * N + j]; }
+          c[i * N + j] = sum;
+        }
+      }
+      return c;
+    }
+
+    function maxAbsDiff(a, b) {
+      let max = 0;
+      for (let i = 0; i < a.length; i++) { max = Math.max(max, Math.abs(a[i] - b[i])); }
+      return max;
+    }
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+      try {
+        if (!navigator.gpu) { log('ERROR: WebGPU not supported'); return; }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { log('ERROR: No WebGPU adapter found'); return; }
+        const device = await adapter.requestDevice();
+        log('WebGPU device ready');
+
+        const gpuMatmul = new WebGPUMatmul(device);
+        await gpuMatmul.init();
+        log('Double-buffer GEMM kernel ready');
+
+        log('\nVerifying correctness...');
+        const testN = 64;
+        const testA = new Float32Array(testN * testN).map(() => Math.random());
+        const testB = new Float32Array(testN * testN).map(() => Math.random());
+        const testBuffers = gpuMatmul.createBuffers(testN, testN, testN);
+        const gpuResult = await gpuMatmul.matmulReuse(testA, testB, testN, testN, testN, testBuffers);
+        const cpuResult = cpuMatmul(testA, testB, testN, testN, testN);
+        const diff = maxAbsDiff(gpuResult, cpuResult);
+        log('Max abs diff from CPU: ' + diff.toExponential(2) + (diff < 0.001 ? ' ✓' : ' ✗'));
+        gpuMatmul.destroyBuffers(testBuffers);
+
+        log('\nLoading TensorFlow.js WebGPU backend...');
+        await tf.setBackend('webgpu');
+        await tf.ready();
+        log('tfjs WebGPU ready');
+
+        const sizes = [512, 1024, 2048, 4096];
+        const iters = 5;
+
+        log('\n=== BENCHMARK: Double Buffering ===\n');
+        log('Size | Our DblBuf  | tfjs WebGPU | Ratio');
+        log('-----|-------------|-------------|------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+          const buffers = gpuMatmul.createBuffers(n, n, n);
+          await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          await tf.matMul(tA, tB).data();
+
+          let ourTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+            ourTime = Math.min(ourTime, performance.now() - start);
+          }
+          gpuMatmul.destroyBuffers(buffers);
+
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            await res.data();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+          tA.dispose(); tB.dispose();
+
+          const ratio = (tfjsTime / ourTime).toFixed(2);
+          const win = parseFloat(ratio) >= 1.0 ? '✓' : '';
+          log(n.toString().padStart(4) + ' | ' + ourTime.toFixed(1).padStart(9) + 'ms | ' + tfjsTime.toFixed(1).padStart(9) + 'ms | ' + ratio.padStart(5) + 'x ' + win);
+        }
+        log('\n=== ANALYSIS ===');
+        log('Ratio > 1.0 = we beat tfjs WebGPU');
+        log('\nDONE');
+      } catch (e) { log('ERROR: ' + e.message); log(e.stack); }
+    };
+  </script>
+</body>
+</html>

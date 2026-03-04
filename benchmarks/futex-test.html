@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Futex Pool Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+</head>
+<body>
+  <pre id="output">Loading...</pre>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    try {
+      // Init tfjs WASM
+      await tf.setBackend('wasm');
+      await tf.ready();
+      log('tfjs WASM ready');
+
+      const rumpy = await import('./pkg-web/rumpy_wasm.js');
+      await rumpy.default();
+      log('rumpy loaded');
+
+      // Check if futex pool is available
+      if (!rumpy.initFutexPool) {
+        log('ERROR: initFutexPool not found - did you build with --features futex-pool?');
+        window.DONE = true;
+        return;
+      }
+
+      // Initialize futex pool
+      const numThreads = navigator.hardwareConcurrency || 4;
+      log('Initializing futex pool with ' + numThreads + ' threads...');
+      rumpy.initFutexPool(numThreads);
+      log('Futex threads: ' + rumpy.getFutexThreads());
+
+      // Also init rayon pool for comparison
+      await rumpy.initThreadPool(numThreads);
+      log('Rayon threads: ' + numThreads);
+
+      const sizes = [64, 128, 256, 512, 1024, 2048];
+
+      log('\n--- BENCHMARK: Futex vs Rayon vs tfjs ---');
+      log('Size | Futex | Rayon | tfjs | Futex vs Rayon | Futex vs tfjs');
+      log('-----|-------|-------|------|----------------|---------------');
+
+      for (const n of sizes) {
+        const data1 = new Float32Array(n * n).map(() => Math.random());
+        const data2 = new Float32Array(n * n).map(() => Math.random());
+
+        // Warm up
+        rumpy.matmulF32Futex(data1, data2, n, n, n);
+        rumpy.matmulF32OptimizedParallel(data1, data2, n, n, n);
+
+        // Futex pool
+        let futexTime = Infinity;
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          rumpy.matmulF32Futex(data1, data2, n, n, n);
+          futexTime = Math.min(futexTime, performance.now() - start);
+        }
+
+        // Rayon
+        let rayonTime = Infinity;
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          rumpy.matmulF32OptimizedParallel(data1, data2, n, n, n);
+          rayonTime = Math.min(rayonTime, performance.now() - start);
+        }
+
+        // tfjs
+        const t1 = tf.tensor2d(Array.from(data1), [n, n]);
+        const t2 = tf.tensor2d(Array.from(data2), [n, n]);
+        let tfTime = Infinity;
+        for (let i = 0; i < 5; i++) {
+          const start = performance.now();
+          const res = tf.matMul(t1, t2);
+          res.dataSync();
+          res.dispose();
+          tfTime = Math.min(tfTime, performance.now() - start);
+        }
+        t1.dispose();
+        t2.dispose();
+
+        const vsRayon = (rayonTime / futexTime).toFixed(2);
+        const vsTfjs = (tfTime / futexTime).toFixed(2);
+        log(n + ' | ' + futexTime.toFixed(1) + 'ms | ' + rayonTime.toFixed(1) + 'ms | ' + tfTime.toFixed(1) + 'ms | ' + vsRayon + 'x | ' + vsTfjs + 'x');
+      }
+
+      log('\nDONE');
+      window.DONE = true;
+    } catch (e) {
+      log('ERROR: ' + e.message + '\n' + e.stack);
+      window.DONE = true;
+    }
+  </script>
+</body>
+</html>

@@ -288,6 +288,99 @@ impl SortOps for CpuBackend {
             })
             .collect()
     }
+
+    fn digitize(arr: &CpuArray, bins: &CpuArray, right: bool) -> CpuArray {
+        // Return indices of bins to which each value belongs
+        let data = arr.as_f64_slice();
+        let bin_edges = bins.as_f64_slice();
+
+        let result: Vec<f64> = data
+            .iter()
+            .map(|&val| {
+                // Binary search for bin index
+                let idx = if right {
+                    // right=True: bins[i-1] < x <= bins[i]
+                    bin_edges.partition_point(|&b| b < val)
+                } else {
+                    // right=False (default): bins[i-1] <= x < bins[i]
+                    bin_edges.partition_point(|&b| b <= val)
+                };
+                idx as f64
+            })
+            .collect();
+
+        CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), result).unwrap())
+    }
+
+    fn histogram(arr: &CpuArray, bins: usize) -> Result<(CpuArray, CpuArray)> {
+        let data = arr.as_f64_slice();
+
+        if data.is_empty() {
+            let hist = CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[bins]), vec![0.0; bins]).unwrap());
+            let edges = CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[bins + 1]), vec![0.0; bins + 1]).unwrap());
+            return Ok((hist, edges));
+        }
+
+        // Find min and max
+        let min_val = data.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_val = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Create bin edges
+        let bin_width = if (max_val - min_val).abs() < 1e-15 {
+            1.0 // Prevent division by zero for constant arrays
+        } else {
+            (max_val - min_val) / bins as f64
+        };
+
+        let edges: Vec<f64> = (0..=bins)
+            .map(|i| min_val + (i as f64) * bin_width)
+            .collect();
+
+        // Count values in each bin
+        let mut counts = vec![0.0; bins];
+        for &val in &data {
+            let bin_idx = if (val - max_val).abs() < 1e-15 {
+                bins - 1 // Include right edge in last bin
+            } else {
+                ((val - min_val) / bin_width).floor() as usize
+            };
+            if bin_idx < bins {
+                counts[bin_idx] += 1.0;
+            }
+        }
+
+        let hist = CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[bins]), counts).unwrap());
+        let edges_arr = CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&[bins + 1]), edges).unwrap());
+
+        Ok((hist, edges_arr))
+    }
+
+    fn where_cond(condition: &CpuArray, x: &CpuArray, y: &CpuArray) -> Result<CpuArray> {
+        use crate::broadcast::{broadcast_shapes, broadcast_to};
+
+        // First compute the broadcast shape of all three arrays
+        let cond_shape = condition.shape();
+        let x_shape = x.shape();
+        let y_shape = y.shape();
+
+        let temp_shape = broadcast_shapes(cond_shape, x_shape)?;
+        let output_shape = broadcast_shapes(&temp_shape, y_shape)?;
+
+        // Broadcast all arrays to output shape
+        let cond_bc = broadcast_to(condition.as_ndarray(), &output_shape)?;
+        let x_bc = broadcast_to(x.as_ndarray(), &output_shape)?;
+        let y_bc = broadcast_to(y.as_ndarray(), &output_shape)?;
+
+        // Apply condition
+        let result: Vec<f64> = cond_bc
+            .iter()
+            .zip(x_bc.iter())
+            .zip(y_bc.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect();
+
+        Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&output_shape), result).unwrap()))
+    }
 }
 
 #[cfg(test)]

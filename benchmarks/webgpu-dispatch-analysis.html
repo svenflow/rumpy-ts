@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU GEMM - Dispatch Analysis</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+</head>
+<body>
+  <h1>WebGPU GEMM - Dispatch Analysis</h1>
+  <p>Analyzing why 1024 is slow - checking workgroup counts and timing</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting analysis...\n';
+      try {
+        if (!navigator.gpu) { log('ERROR: WebGPU not supported'); return; }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { log('ERROR: No WebGPU adapter found'); return; }
+        const device = await adapter.requestDevice();
+
+        // Get device limits
+        const limits = device.limits;
+        log('=== DEVICE LIMITS ===');
+        log(`maxComputeWorkgroupsPerDimension: ${limits.maxComputeWorkgroupsPerDimension}`);
+        log(`maxComputeInvocationsPerWorkgroup: ${limits.maxComputeInvocationsPerWorkgroup}`);
+        log(`maxComputeWorkgroupSizeX: ${limits.maxComputeWorkgroupSizeX}`);
+        log(`maxComputeWorkgroupSizeY: ${limits.maxComputeWorkgroupSizeY}`);
+        log(`maxComputeWorkgroupSizeZ: ${limits.maxComputeWorkgroupSizeZ}`);
+        log(`maxComputeWorkgroupStorageSize: ${limits.maxComputeWorkgroupStorageSize}`);
+
+        log('\n=== DISPATCH ANALYSIS ===');
+        log('For tile=32x32, 8x8 workgroup (64 threads):\n');
+
+        const sizes = [256, 512, 768, 1024, 1536, 2048, 3072, 4096];
+        log('Size | Tiles | Workgroups | Total Threads | Arithmetic Ops');
+        log('-----|-------|------------|---------------|---------------');
+
+        for (const n of sizes) {
+          const tilesX = Math.ceil(n / 32);
+          const tilesY = Math.ceil(n / 32);
+          const totalWorkgroups = tilesX * tilesY;
+          const threadsPerWg = 64;
+          const totalThreads = totalWorkgroups * threadsPerWg;
+          const arithmeticOps = n * n * n * 2; // matmul is 2n^3 ops
+          const opsPerThread = arithmeticOps / totalThreads;
+
+          log(`${n.toString().padStart(4)} | ${tilesX.toString().padStart(2)}x${tilesY.toString().padEnd(2)} | ${totalWorkgroups.toString().padStart(10)} | ${totalThreads.toString().padStart(13)} | ${(arithmeticOps/1e9).toFixed(2)}B (${Math.round(opsPerThread)} ops/thread)`);
+        }
+
+        log('\n=== tfjs BACKEND INFO ===');
+        await tf.setBackend('webgpu');
+        await tf.ready();
+        const backend = tf.backend();
+        log(`Backend name: ${backend.constructor.name}`);
+
+        // Try to get info about how tfjs dispatches matmul
+        log('\n=== TIMING BREAKDOWN ===');
+        log('Testing with/without GPU buffer reuse...\n');
+
+        for (const n of [512, 1024, 2048]) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+
+          // Time with tensor creation each time
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+
+          // Warmup
+          await tf.matMul(tA, tB).data();
+
+          // Time just compute
+          let computeTime = Infinity;
+          for (let i = 0; i < 5; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            await res.data();
+            computeTime = Math.min(computeTime, performance.now() - start);
+            res.dispose();
+          }
+
+          // Time with tensor creation
+          let fullTime = Infinity;
+          for (let i = 0; i < 5; i++) {
+            const start = performance.now();
+            const tempA = tf.tensor2d(Array.from(a), [n, n]);
+            const tempB = tf.tensor2d(Array.from(b), [n, n]);
+            const res = tf.matMul(tempA, tempB);
+            await res.data();
+            res.dispose();
+            tempA.dispose();
+            tempB.dispose();
+            fullTime = Math.min(fullTime, performance.now() - start);
+          }
+
+          log(`${n}: compute-only=${computeTime.toFixed(1)}ms, with-creation=${fullTime.toFixed(1)}ms`);
+
+          tA.dispose();
+          tB.dispose();
+        }
+
+        log('\n=== GPU TIMESTAMP PROFILING ===');
+        log('(if available via extension)');
+
+        // Check if timestamp query is available
+        const features = adapter.features;
+        log('Adapter features:');
+        for (const f of features) {
+          log(`  - ${f}`);
+        }
+
+        log('\nDONE');
+      } catch (e) { log('ERROR: ' + e.message); log(e.stack); }
+    };
+  </script>
+</body>
+</html>

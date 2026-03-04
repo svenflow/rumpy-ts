@@ -184,4 +184,13 @@ mod tests {
         // Row 1: [4>2, 5>2, 6>2] = [1, 1, 1]
         assert_eq!(result.as_f64_slice(), vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
     }
+
+    #[test]
+    fn test_negative_zero_equals_positive_zero() {
+        // IEEE 754: -0.0 == 0.0 is true
+        let a = arr(vec![-0.0, 0.0, -0.0]);
+        let b = arr(vec![0.0, -0.0, -0.0]);
+        let result = CpuBackend::eq(&a, &b).unwrap();
+        assert_eq!(result.as_f64_slice(), vec![1.0, 1.0, 1.0]);
+    }
 }

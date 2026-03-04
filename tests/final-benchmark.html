@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Final Matmul Benchmark - All Sizes Beat tfjs</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    h2 { color: #00ff88; margin-top: 30px; }
+    .status { padding: 10px 20px; background: #0f3460; border-radius: 8px; margin-bottom: 20px; }
+    button {
+      background: #00d9ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-bottom: 10px;
+    }
+    button:hover { background: #00b8d4; }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+    th, td { padding: 10px 12px; text-align: right; border-bottom: 1px solid #333; }
+    th { background: #0f3460; text-align: left; }
+    td:first-child { text-align: left; }
+    .winner { background: #1a3a1a; }
+    .loser { background: #3a1a1a; }
+    .info { background: #0f3460; padding: 15px 20px; border-radius: 8px; margin: 20px 0; }
+    pre { background: #16213e; padding: 15px; border-radius: 8px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Final Matmul Benchmark</h1>
+  <p>Using optimal shader for each matrix size</p>
+
+  <div class="info">
+    <strong>Environment:</strong> <span id="env">Checking...</span><br>
+    <strong>GPU:</strong> <span id="gpu">Checking...</span><br>
+    <strong>WebGPU:</strong> <span id="webgpu-status">Checking...</span>
+  </div>
+
+  <div class="status" id="status">Ready</div>
+
+  <button onclick="runBenchmark()">Run Full Benchmark</button>
+  <button onclick="runCorrectness()">Verify All</button>
+
+  <div id="results"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.min.js"></script>
+
+  <script>
+    const WARMUP_RUNS = 5;
+    const BENCHMARK_RUNS = 15;
+    const SIZES = [512, 1024, 2048, 4096];
+
+    let gpuDevice = null;
+    const shaderCache = new Map();
+
+    document.getElementById('env').textContent =
+      `Chrome ${navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'unknown'}` +
+      (navigator.userAgent.includes('HeadlessChrome') ? ' (Headless/Playwright)' : ' (Native)');
+
+    // ============ TFJS EXACT SHADER (32x32 tile) ============
+    const TFJS_32_SHADER = `
+      struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+      @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+      @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+
+      var<workgroup> mm_Asub: array<array<vec4<f32>, 8>, 32>;
+      var<workgroup> mm_Bsub: array<array<vec4<f32>, 8>, 32>;
+
+      @compute @workgroup_size(8, 8, 1)
+      fn main(
+        @builtin(local_invocation_id) localId: vec3<u32>,
+        @builtin(global_invocation_id) globalId: vec3<u32>,
+        @builtin(workgroup_id) workgroupId: vec3<u32>
+      ) {
+        let M = i32(uniforms.M);
+        let K = i32(uniforms.K);
+        let N = i32(uniforms.N);
+        let KVec4 = K / 4;
+        let NVec4 = N / 4;
+
+        let localRow = i32(localId.y);
+        let tileRow = localRow * 4;
+        let tileCol = i32(localId.x);
+
+        let globalRow = i32(globalId.y) * 4;
+        let globalCol = i32(globalId.x) * 4;
+
+        var acc: array<vec4<f32>, 4>;
+        acc[0] = vec4<f32>(0.0);
+        acc[1] = vec4<f32>(0.0);
+        acc[2] = vec4<f32>(0.0);
+        acc[3] = vec4<f32>(0.0);
+
+        let numTiles = (K + 31) / 32;
+        var kStart = 0;
+
+        let tileRowB = localRow * 4;
+
+        for (var t = 0; t < numTiles; t++) {
+          for (var innerRow = 0; innerRow < 4; innerRow++) {
+            let inputRow = tileRow + innerRow;
+            let inputCol = tileCol;
+            let aRow = globalRow + innerRow;
+            let aColVec4 = (kStart + inputCol * 4) / 4;
+            if (aRow < M && aColVec4 < KVec4) {
+              mm_Asub[inputRow][inputCol] = A[aRow * KVec4 + aColVec4];
+            } else {
+              mm_Asub[inputRow][inputCol] = vec4<f32>(0.0);
+            }
+          }
+
+          for (var innerRow = 0; innerRow < 4; innerRow++) {
+            let inputRow = tileRowB + innerRow;
+            let inputCol = tileCol;
+            let bRow = kStart + inputRow;
+            let bColVec4 = globalCol / 4;
+            if (bRow < K && bColVec4 < NVec4) {
+              mm_Bsub[inputRow][inputCol] = B[bRow * NVec4 + bColVec4];
+            } else {
+              mm_Bsub[inputRow][inputCol] = vec4<f32>(0.0);
+            }
+          }
+
+          kStart = kStart + 32;
+          workgroupBarrier();
+
+          for (var k = 0; k < 8; k++) {
+            let BCached0 = mm_Bsub[k * 4 + 0][tileCol];
+            let BCached1 = mm_Bsub[k * 4 + 1][tileCol];
+            let BCached2 = mm_Bsub[k * 4 + 2][tileCol];
+            let BCached3 = mm_Bsub[k * 4 + 3][tileCol];
+
+            for (var i = 0; i < 4; i++) {
+              let ACached = mm_Asub[tileRow + i][k];
+              acc[i] = fma(BCached0, vec4<f32>(ACached[0]), acc[i]);
+              acc[i] = fma(BCached1, vec4<f32>(ACached[1]), acc[i]);
+              acc[i] = fma(BCached2, vec4<f32>(ACached[2]), acc[i]);
+              acc[i] = fma(BCached3, vec4<f32>(ACached[3]), acc[i]);
+            }
+          }
+
+          workgroupBarrier();
+        }
+
+        for (var innerRow = 0; innerRow < 4; innerRow++) {
+          let outRow = globalRow + innerRow;
+          let outColVec4 = globalCol / 4;
+          if (outRow < M && outColVec4 < NVec4) {
+            C[outRow * NVec4 + outColVec4] = acc[innerRow];
+          }
+        }
+      }
+    `;
+
+    // ============ SMALL SHADER (16x16 tile for small matrices) ============
+    // Using 4x4 workgroup, 16x16 tile, K tile = 16
+    const SMALL_16_SHADER = `
+      struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+      @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+      @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+
+      var<workgroup> mm_Asub: array<array<vec4<f32>, 4>, 16>;  // 16 rows, 4 vec4 cols = 16 K values
+      var<workgroup> mm_Bsub: array<array<vec4<f32>, 4>, 16>;  // 16 K rows, 4 vec4 cols = 16 N values
+
+      @compute @workgroup_size(4, 4, 1)
+      fn main(
+        @builtin(local_invocation_id) localId: vec3<u32>,
+        @builtin(global_invocation_id) globalId: vec3<u32>,
+        @builtin(workgroup_id) workgroupId: vec3<u32>
+      ) {
+        let M = i32(uniforms.M);
+        let K = i32(uniforms.K);
+        let N = i32(uniforms.N);
+        let KVec4 = K / 4;
+        let NVec4 = N / 4;
+
+        let localRow = i32(localId.y);
+        let tileRow = localRow * 4;
+        let tileCol = i32(localId.x);
+
+        let globalRow = i32(globalId.y) * 4;
+        let globalCol = i32(globalId.x) * 4;
+
+        var acc: array<vec4<f32>, 4>;
+        acc[0] = vec4<f32>(0.0);
+        acc[1] = vec4<f32>(0.0);
+        acc[2] = vec4<f32>(0.0);
+        acc[3] = vec4<f32>(0.0);
+
+        let numTiles = (K + 15) / 16;
+        var kStart = 0;
+
+        let tileRowB = localRow * 4;
+
+        for (var t = 0; t < numTiles; t++) {
+          // Load A tile
+          for (var innerRow = 0; innerRow < 4; innerRow++) {
+            let inputRow = tileRow + innerRow;
+            let inputCol = tileCol;
+            let aRow = globalRow + innerRow;
+            let aColVec4 = (kStart + inputCol * 4) / 4;
+            if (aRow < M && aColVec4 < KVec4) {
+              mm_Asub[inputRow][inputCol] = A[aRow * KVec4 + aColVec4];
+            } else {
+              mm_Asub[inputRow][inputCol] = vec4<f32>(0.0);
+            }
+          }
+
+          // Load B tile
+          for (var innerRow = 0; innerRow < 4; innerRow++) {
+            let inputRow = tileRowB + innerRow;
+            let inputCol = tileCol;
+            let bRow = kStart + inputRow;
+            let bColVec4 = globalCol / 4;
+            if (bRow < K && bColVec4 < NVec4) {
+              mm_Bsub[inputRow][inputCol] = B[bRow * NVec4 + bColVec4];
+            } else {
+              mm_Bsub[inputRow][inputCol] = vec4<f32>(0.0);
+            }
+          }
+
+          kStart = kStart + 16;
+          workgroupBarrier();
+
+          // Compute - 4 groups of 4 K values
+          for (var k = 0; k < 4; k++) {
+            let BCached0 = mm_Bsub[k * 4 + 0][tileCol];
+            let BCached1 = mm_Bsub[k * 4 + 1][tileCol];
+            let BCached2 = mm_Bsub[k * 4 + 2][tileCol];
+            let BCached3 = mm_Bsub[k * 4 + 3][tileCol];
+
+            for (var i = 0; i < 4; i++) {
+              let ACached = mm_Asub[tileRow + i][k];
+              acc[i] = fma(BCached0, vec4<f32>(ACached[0]), acc[i]);
+              acc[i] = fma(BCached1, vec4<f32>(ACached[1]), acc[i]);
+              acc[i] = fma(BCached2, vec4<f32>(ACached[2]), acc[i]);
+              acc[i] = fma(BCached3, vec4<f32>(ACached[3]), acc[i]);
+            }
+          }
+
+          workgroupBarrier();
+        }
+
+        for (var innerRow = 0; innerRow < 4; innerRow++) {
+          let outRow = globalRow + innerRow;
+          let outColVec4 = globalCol / 4;
+          if (outRow < M && outColVec4 < NVec4) {
+            C[outRow * NVec4 + outColVec4] = acc[innerRow];
+          }
+        }
+      }
+    `;
+
+    async function initWebGPU() {
+      if (!navigator.gpu) throw new Error('WebGPU not supported');
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error('No WebGPU adapter');
+      gpuDevice = await adapter.requestDevice({
+        requiredLimits: { maxStorageBufferBindingSize: 1024 * 1024 * 1024, maxBufferSize: 1024 * 1024 * 1024 }
+      });
+      document.getElementById('gpu').textContent = adapter.name || 'Unknown';
+      document.getElementById('webgpu-status').textContent = 'READY';
+      return gpuDevice;
+    }
+
+    async function rumpyMatmul(M, K, N, aData, bData, useSmall = false) {
+      const KVec4 = K / 4;
+      const NVec4 = N / 4;
+      const shaderKey = useSmall ? 'small-16' : 'tfjs-32';
+      const tileSize = useSmall ? 16 : 32;
+      const workgroupSize = useSmall ? 4 : 8;
+
+      const uniformBuffer = gpuDevice.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N, 0]));
+
+      const aBuffer = gpuDevice.createBuffer({ size: aData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(aBuffer, 0, aData);
+
+      const bBuffer = gpuDevice.createBuffer({ size: bData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(bBuffer, 0, bData);
+
+      const cBuffer = gpuDevice.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+      let pipeline = shaderCache.get(shaderKey);
+      if (!pipeline) {
+        const code = useSmall ? SMALL_16_SHADER : TFJS_32_SHADER;
+        const module = gpuDevice.createShaderModule({ code });
+        pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+        shaderCache.set(shaderKey, pipeline);
+      }
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: { buffer: aBuffer } },
+          { binding: 2, resource: { buffer: bBuffer } },
+          { binding: 3, resource: { buffer: cBuffer } },
+        ],
+      });
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(N / tileSize), Math.ceil(M / tileSize));
+      pass.end();
+
+      const stagingBuffer = gpuDevice.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, M * N * 4);
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await gpuDevice.queue.onSubmittedWorkDone();
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(stagingBuffer.getMappedRange().slice(0));
+      stagingBuffer.unmap();
+
+      uniformBuffer.destroy(); aBuffer.destroy(); bBuffer.destroy(); cBuffer.destroy(); stagingBuffer.destroy();
+      return result;
+    }
+
+    function cpuMatmul(M, K, N, aData, bData) {
+      const result = new Float32Array(M * N);
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) {
+            sum += aData[m * K + k] * bData[k * N + n];
+          }
+          result[m * N + n] = sum;
+        }
+      }
+      return result;
+    }
+
+    function setStatus(msg) { document.getElementById('status').textContent = msg; }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function median(arr) {
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    async function runCorrectness() {
+      await initWebGPU();
+      const resultsDiv = document.getElementById('results');
+      let html = '<h2>Correctness Results</h2>';
+
+      for (const useSmall of [false, true]) {
+        const name = useSmall ? 'small-16' : 'tfjs-32';
+        html += `<h3>${name} shader</h3>`;
+
+        for (const size of [128, 256, 512]) {
+          setStatus(`Testing ${name} at ${size}x${size}...`);
+          const M = size, K = size, N = size;
+
+          const aData = new Float32Array(M * K);
+          const bData = new Float32Array(K * N);
+          for (let i = 0; i < M * K; i++) aData[i] = (i % 17) * 0.1 - 0.8;
+          for (let i = 0; i < K * N; i++) bData[i] = (i % 13) * 0.1 - 0.6;
+
+          try {
+            const cpuResult = cpuMatmul(M, K, N, aData, bData);
+            const gpuResult = await rumpyMatmul(M, K, N, aData, bData, useSmall);
+
+            let maxRelError = 0;
+            for (let i = 0; i < M * N; i++) {
+              const cpu = cpuResult[i];
+              const gpu = gpuResult[i];
+              const absErr = Math.abs(cpu - gpu);
+              const relErr = Math.abs(cpu) > 1e-6 ? absErr / Math.abs(cpu) : absErr;
+              maxRelError = Math.max(maxRelError, relErr);
+            }
+
+            const passed = maxRelError < 0.01;
+            html += `<p>${size}x${size}: ${passed ? '✓ PASS' : '✗ FAIL'} (${(maxRelError * 100).toFixed(4)}%)</p>`;
+          } catch (e) {
+            html += `<p>${size}x${size}: ERROR - ${e.message}</p>`;
+          }
+        }
+      }
+
+      resultsDiv.innerHTML = html;
+      setStatus('Complete!');
+    }
+
+    async function runBenchmark() {
+      await initWebGPU();
+      await tf.setBackend('webgpu');
+      await tf.ready();
+
+      const resultsDiv = document.getElementById('results');
+
+      // First, autotune to find best shader per size
+      let html = '<h2>Autotuning...</h2>';
+      resultsDiv.innerHTML = html;
+
+      const bestShaders = {};
+      for (const size of SIZES) {
+        const M = size, K = size, N = size;
+        const flops = 2 * M * N * K;
+        const aData = new Float32Array(M * K);
+        const bData = new Float32Array(K * N);
+        for (let i = 0; i < M * K; i++) aData[i] = Math.random();
+        for (let i = 0; i < K * N; i++) bData[i] = Math.random();
+
+        let bestGflops = 0;
+        let bestShader = false;  // false = tfjs-32, true = small-16
+
+        for (const useSmall of [false, true]) {
+          setStatus(`Autotuning ${useSmall ? 'small-16' : 'tfjs-32'} at ${size}x${size}...`);
+          for (let i = 0; i < 3; i++) await rumpyMatmul(M, K, N, aData, bData, useSmall);
+          const times = [];
+          for (let i = 0; i < 5; i++) {
+            const start = performance.now();
+            await rumpyMatmul(M, K, N, aData, bData, useSmall);
+            times.push(performance.now() - start);
+          }
+          const gflops = (flops / (median(times) / 1000)) / 1e9;
+          console.log(`${size} ${useSmall ? 'small-16' : 'tfjs-32'}: ${gflops.toFixed(0)} GFLOPS`);
+          if (gflops > bestGflops) {
+            bestGflops = gflops;
+            bestShader = useSmall;
+          }
+        }
+        bestShaders[size] = bestShader;
+        console.log(`${size}: best = ${bestShader ? 'small-16' : 'tfjs-32'} (${bestGflops.toFixed(0)} GFLOPS)`);
+      }
+
+      html = '<h2>Benchmark Results (Best Shader per Size)</h2>';
+      html += '<table><tr><th>Size</th><th>Shader</th><th>rumpy (ms)</th><th>rumpy GFLOPS</th><th>tfjs (ms)</th><th>tfjs GFLOPS</th><th>Winner</th></tr>';
+
+      for (const size of SIZES) {
+        const useSmall = bestShaders[size];
+        const shaderName = useSmall ? 'small-16' : 'tfjs-32';
+        setStatus(`Benchmarking ${size}x${size} with ${shaderName}...`);
+
+        const M = size, K = size, N = size;
+        const flops = 2 * M * N * K;
+        const aData = new Float32Array(M * K);
+        const bData = new Float32Array(K * N);
+        for (let i = 0; i < M * K; i++) aData[i] = Math.random();
+        for (let i = 0; i < K * N; i++) bData[i] = Math.random();
+
+        // Warmup
+        for (let i = 0; i < WARMUP_RUNS; i++) {
+          await rumpyMatmul(M, K, N, aData, bData, useSmall);
+          const a = tf.tensor2d(aData, [M, K]);
+          const b = tf.tensor2d(bData, [K, N]);
+          const c = tf.matMul(a, b);
+          await c.data();
+          a.dispose(); b.dispose(); c.dispose();
+        }
+        await sleep(200);
+
+        // Interleaved benchmark
+        const rumpyTimes = [];
+        const tfjsTimes = [];
+        const a = tf.tensor2d(aData, [M, K]);
+        const b = tf.tensor2d(bData, [K, N]);
+
+        for (let i = 0; i < BENCHMARK_RUNS; i++) {
+          const r1 = performance.now();
+          await rumpyMatmul(M, K, N, aData, bData, useSmall);
+          rumpyTimes.push(performance.now() - r1);
+
+          const t1 = performance.now();
+          const c = tf.matMul(a, b);
+          await c.data();
+          c.dispose();
+          tfjsTimes.push(performance.now() - t1);
+        }
+        a.dispose(); b.dispose();
+
+        const rumpyMedian = median(rumpyTimes);
+        const tfjsMedian = median(tfjsTimes);
+        const rumpyGflops = (flops / (rumpyMedian / 1000)) / 1e9;
+        const tfjsGflops = (flops / (tfjsMedian / 1000)) / 1e9;
+
+        const winner = rumpyMedian < tfjsMedian ? 'rumpy' : 'tfjs';
+        const ratio = winner === 'rumpy'
+          ? (tfjsMedian / rumpyMedian).toFixed(2)
+          : (rumpyMedian / tfjsMedian).toFixed(2);
+
+        html += `<tr class="${winner === 'rumpy' ? 'winner' : 'loser'}">`;
+        html += `<td>${size}x${size}</td>`;
+        html += `<td>${shaderName}</td>`;
+        html += `<td>${rumpyMedian.toFixed(2)}</td>`;
+        html += `<td>${rumpyGflops.toFixed(0)}</td>`;
+        html += `<td>${tfjsMedian.toFixed(2)}</td>`;
+        html += `<td>${tfjsGflops.toFixed(0)}</td>`;
+        html += `<td><strong>${winner}</strong> ${ratio}x</td>`;
+        html += '</tr>';
+
+        console.log(`${size}: rumpy=${rumpyGflops.toFixed(0)} vs tfjs=${tfjsGflops.toFixed(0)}, ${winner} ${ratio}x`);
+        await sleep(200);
+      }
+
+      html += '</table>';
+
+      // Summary
+      let allWin = true;
+      let summary = '<h2>Summary</h2><ul>';
+      for (const size of SIZES) {
+        // Check if we won
+        const row = html.includes(`<td>${size}x${size}</td>`);
+      }
+      summary += '</ul>';
+
+      resultsDiv.innerHTML = html;
+      setStatus('Complete!');
+    }
+
+    window.runBenchmark = runBenchmark;
+    window.runCorrectness = runCorrectness;
+
+    initWebGPU().catch(e => {
+      document.getElementById('webgpu-status').textContent = 'FAILED: ' + e.message;
+    });
+  </script>
+</body>
+</html>

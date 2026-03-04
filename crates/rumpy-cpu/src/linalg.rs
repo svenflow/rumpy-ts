@@ -826,6 +826,123 @@ impl LinalgOps for CpuBackend {
         let reversed: Vec<usize> = (0..shape.len()).rev().collect();
         CpuArray::from_ndarray(data.clone().permuted_axes(reversed))
     }
+
+    fn tensordot(a: &CpuArray, b: &CpuArray, axes: usize) -> Result<CpuArray> {
+        // Simplified tensordot: sum over last `axes` axes of a and first `axes` axes of b
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+
+        if axes > a_shape.len() || axes > b_shape.len() {
+            return Err(RumpyError::InvalidArgument(format!(
+                "axes={} exceeds array dimensions (a={}, b={})",
+                axes, a_shape.len(), b_shape.len()
+            )));
+        }
+
+        // Check that contracted dimensions match
+        let a_contract: Vec<usize> = a_shape[(a_shape.len() - axes)..].to_vec();
+        let b_contract: Vec<usize> = b_shape[..axes].to_vec();
+        if a_contract != b_contract {
+            return Err(RumpyError::IncompatibleShapes(a_shape.to_vec(), b_shape.to_vec()));
+        }
+
+        // Result shape: a_shape[:-axes] + b_shape[axes:]
+        let mut result_shape: Vec<usize> = a_shape[..(a_shape.len() - axes)].to_vec();
+        result_shape.extend_from_slice(&b_shape[axes..]);
+
+        // If result is empty (scalar), return single value
+        if result_shape.is_empty() {
+            result_shape.push(1);
+        }
+
+        let contract_size: usize = a_contract.iter().product();
+        let a_outer_size: usize = a_shape[..(a_shape.len() - axes)].iter().product();
+        let b_outer_size: usize = b_shape[axes..].iter().product();
+
+        let a_data = a.as_f64_slice();
+        let b_data = b.as_f64_slice();
+
+        let mut result = Vec::with_capacity(a_outer_size * b_outer_size);
+
+        for i in 0..a_outer_size {
+            for j in 0..b_outer_size {
+                let mut sum = 0.0;
+                for k in 0..contract_size {
+                    let a_idx = i * contract_size + k;
+                    let b_idx = k * b_outer_size + j;
+                    sum += a_data[a_idx] * b_data[b_idx];
+                }
+                result.push(sum);
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&result_shape), result).unwrap()))
+    }
+
+    fn trapz(arr: &CpuArray, dx: f64, axis: Option<usize>) -> Result<CpuArray> {
+        // Numerical integration using trapezoidal rule
+        let shape = arr.shape();
+        let ndim = shape.len();
+
+        match axis {
+            None => {
+                // Integrate flattened array
+                let data = arr.as_f64_slice();
+                if data.len() < 2 {
+                    return Ok(CpuArray::from_f64_vec(vec![0.0], vec![1])?);
+                }
+                let mut result = 0.0;
+                for i in 0..(data.len() - 1) {
+                    result += (data[i] + data[i + 1]) * dx / 2.0;
+                }
+                Ok(CpuArray::from_f64_vec(vec![result], vec![1])?)
+            }
+            Some(ax) => {
+                if ax >= ndim {
+                    return Err(RumpyError::InvalidAxis { axis: ax, ndim });
+                }
+
+                let axis_len = shape[ax];
+                if axis_len < 2 {
+                    let mut new_shape = shape.to_vec();
+                    new_shape.remove(ax);
+                    if new_shape.is_empty() {
+                        new_shape.push(1);
+                    }
+                    let zeros = vec![0.0; new_shape.iter().product()];
+                    return Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), zeros).unwrap()));
+                }
+
+                let data = arr.as_ndarray();
+                let mut new_shape = shape.to_vec();
+                new_shape.remove(ax);
+                if new_shape.is_empty() {
+                    new_shape.push(1);
+                }
+
+                let outer_size: usize = shape[..ax].iter().product();
+                let inner_size: usize = shape[ax + 1..].iter().product();
+                let result_size = new_shape.iter().product();
+
+                let mut result = vec![0.0; result_size];
+
+                for outer in 0..outer_size {
+                    for inner in 0..inner_size {
+                        let result_idx = outer * inner_size + inner;
+                        let mut sum = 0.0;
+                        for i in 0..(axis_len - 1) {
+                            let idx_i = outer * (axis_len * inner_size) + i * inner_size + inner;
+                            let idx_i1 = outer * (axis_len * inner_size) + (i + 1) * inner_size + inner;
+                            sum += (data.as_slice().unwrap()[idx_i] + data.as_slice().unwrap()[idx_i1]) * dx / 2.0;
+                        }
+                        result[result_idx] = sum;
+                    }
+                }
+
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

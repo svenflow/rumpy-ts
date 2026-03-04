@@ -15,8 +15,16 @@ use rumpy_core::{ops::*, Array};
 use rumpy_cpu::{simd_gemm, CpuArray, CpuBackend};
 use wasm_bindgen::prelude::*;
 
-// Re-export wasm-bindgen-rayon's init function for Web Worker setup
+// Re-export wasm-bindgen-rayon's init function for Web Worker setup (only in threaded mode)
+#[cfg(feature = "threads")]
 pub use wasm_bindgen_rayon::init_thread_pool;
+
+// Stub for single-threaded mode
+#[cfg(not(feature = "threads"))]
+#[wasm_bindgen]
+pub fn init_thread_pool(_num_threads: usize) -> js_sys::Promise {
+    js_sys::Promise::resolve(&JsValue::UNDEFINED)
+}
 
 /// Initialize panic hook for better error messages
 #[wasm_bindgen(start)]
@@ -188,11 +196,11 @@ impl NDArray {
     }
 
     pub fn min(&self) -> f64 {
-        CpuBackend::min(&self.inner)
+        CpuBackend::min(&self.inner).unwrap_or(f64::NAN)
     }
 
     pub fn max(&self) -> f64 {
-        CpuBackend::max(&self.inner)
+        CpuBackend::max(&self.inner).unwrap_or(f64::NAN)
     }
 
     #[wasm_bindgen(js_name = std)]
@@ -443,12 +451,12 @@ impl NDArray {
 
     /// Argmax - index of maximum value (flattened)
     pub fn argmax(&self) -> usize {
-        CpuBackend::argmax(&self.inner)
+        CpuBackend::argmax(&self.inner).unwrap_or(0)
     }
 
     /// Argmin - index of minimum value (flattened)
     pub fn argmin(&self) -> usize {
-        CpuBackend::argmin(&self.inner)
+        CpuBackend::argmin(&self.inner).unwrap_or(0)
     }
 
     // ============ Concatenation ============
@@ -1751,9 +1759,15 @@ pub fn matmul_f32_parallel_v2(a: &Float32Array, b: &Float32Array, m: usize, n: u
 /// Get the current number of rayon threads
 #[wasm_bindgen(js_name = getNumThreads)]
 pub fn get_num_threads() -> usize {
-    rayon::current_num_threads()
+    #[cfg(feature = "threads")]
+    { rayon::current_num_threads() }
+    #[cfg(not(feature = "threads"))]
+    { 1 }
 }
 
+// ============ Threading debug functions (only available with `threads` feature) ============
+
+#[cfg(feature = "threads")]
 /// DEBUG: mimic v3's dispatch pattern (rayon::scope + inline caller +
 /// atomic tile counter) and record which rayon thread claims each tile.
 ///
@@ -1804,6 +1818,7 @@ pub fn probe_v3_dispatch(n_tiles: usize, work_ms_per_tile: f64) -> Vec<f64> {
     out
 }
 
+#[cfg(feature = "threads")]
 /// DEBUG: report which code path v3 would take for given (m,n,k).
 /// Returns: [below_threshold, pack_a, c_pad, fast_path, slab_rows, total_tiles, tz(k*4), tz(n*4)]
 #[wasm_bindgen(js_name = probeV3Path)]
@@ -1839,6 +1854,7 @@ pub fn probe_v3_path(m: usize, n: usize, k: usize) -> Vec<usize> {
     ]
 }
 
+#[cfg(feature = "threads")]
 /// DEBUG: probe whether rayon workers are actually executing in parallel.
 ///
 /// Spawns N tasks, each recording its rayon thread index and spinning for
@@ -1875,6 +1891,7 @@ pub fn probe_rayon_parallelism(n_tasks: usize, duration_ms: f64) -> Vec<f64> {
     vec![wall, n_distinct, max_idx.load(Ordering::Relaxed) as f64]
 }
 
+#[cfg(feature = "threads")]
 /// Parallel f32 matrix multiplication using pthreadpool-rs
 ///
 /// Uses pthreadpool-rs instead of rayon for parallelization.

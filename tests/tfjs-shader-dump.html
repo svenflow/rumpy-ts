@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>tfjs Shader Dump</title>
+  <style>
+    body {
+      font-family: monospace;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    button {
+      background: #00d9ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    pre {
+      background: #16213e;
+      padding: 15px;
+      border-radius: 8px;
+      font-size: 12px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+    .info { background: #0f3460; padding: 15px 20px; border-radius: 8px; margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h1>tfjs Shader Dump</h1>
+  <p>Intercepting tfjs WebGPU shader compilation to see actual shader code</p>
+
+  <div class="info">
+    <strong>Status:</strong> <span id="status">Loading tfjs...</span>
+  </div>
+
+  <button onclick="dumpShader()">Run Matmul & Dump Shader</button>
+
+  <pre id="output"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.min.js"></script>
+
+  <script>
+    let capturedShaders = [];
+
+    async function dumpShader() {
+      document.getElementById('status').textContent = 'Intercepting shader compilation...';
+      document.getElementById('output').textContent = '';
+
+      try {
+        await tf.setBackend('webgpu');
+        await tf.ready();
+      } catch (e) {
+        document.getElementById('output').textContent = 'Error: ' + e.message;
+        return;
+      }
+
+      // Get the WebGPU device
+      const backend = tf.backend();
+
+      // Try to intercept createShaderModule
+      if (backend.device) {
+        const originalCreateShaderModule = backend.device.createShaderModule.bind(backend.device);
+        backend.device.createShaderModule = function(descriptor) {
+          capturedShaders.push({
+            code: descriptor.code,
+            label: descriptor.label || 'unnamed'
+          });
+          return originalCreateShaderModule(descriptor);
+        };
+      }
+
+      // Run a matmul to trigger shader compilation
+      document.getElementById('status').textContent = 'Running matmul (512x512)...';
+
+      const size = 512;
+      const a = tf.randomUniform([size, size], 0, 1, 'float32');
+      const b = tf.randomUniform([size, size], 0, 1, 'float32');
+
+      // Force shader compilation
+      const c = tf.matMul(a, b);
+      await c.data();
+
+      // Clean up
+      a.dispose();
+      b.dispose();
+      c.dispose();
+
+      document.getElementById('status').textContent = `Captured ${capturedShaders.length} shaders`;
+
+      // Find matmul shaders
+      let output = '';
+      for (const shader of capturedShaders) {
+        if (shader.code.includes('mm_') || shader.code.includes('matMul') ||
+            shader.code.includes('Asub') || shader.code.includes('Bsub')) {
+          output += `\n\n========== ${shader.label} ==========\n\n`;
+          output += shader.code;
+        }
+      }
+
+      if (!output) {
+        output = 'No matmul shaders captured. All captured shaders:\n\n';
+        for (const shader of capturedShaders) {
+          output += `========== ${shader.label} ==========\n`;
+          output += shader.code.substring(0, 500) + '...\n\n';
+        }
+      }
+
+      document.getElementById('output').textContent = output;
+    }
+
+    window.dumpShader = dumpShader;
+    document.getElementById('status').textContent = 'Ready';
+  </script>
+</body>
+</html>

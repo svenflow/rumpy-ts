@@ -39,6 +39,29 @@ impl ManipulationOps for CpuBackend {
         CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&shape), arr.as_f64_slice()).unwrap())
     }
 
+    fn squeeze_axis(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
+        let shape = arr.shape();
+        if axis >= shape.len() {
+            return Err(RumpyError::InvalidAxis {
+                axis,
+                ndim: shape.len(),
+            });
+        }
+        if shape[axis] != 1 {
+            return Err(RumpyError::InvalidArgument(format!(
+                "Cannot squeeze axis {} with size {} (must be 1)",
+                axis, shape[axis]
+            )));
+        }
+        let new_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis)
+            .map(|(_, &s)| s)
+            .collect();
+        Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), arr.as_f64_slice()).unwrap()))
+    }
+
     fn expand_dims(arr: &CpuArray, axis: usize) -> Result<CpuArray> {
         let mut shape = arr.shape().to_vec();
         if axis > shape.len() {
@@ -434,6 +457,209 @@ impl ManipulationOps for CpuBackend {
         }
 
         Ok(result)
+    }
+
+    fn take(arr: &CpuArray, indices: &CpuArray, axis: Option<usize>) -> Result<CpuArray> {
+        let shape = arr.shape();
+        let idx_data = indices.as_f64_slice();
+
+        match axis {
+            None => {
+                // Flatten array and take at indices
+                let flat = arr.as_f64_slice();
+                let mut result = Vec::with_capacity(idx_data.len());
+                for &idx in &idx_data {
+                    let i = idx as usize;
+                    if i >= flat.len() {
+                        return Err(RumpyError::IndexOutOfBounds { index: i, size: flat.len() });
+                    }
+                    result.push(flat[i]);
+                }
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(indices.shape()), result).unwrap()))
+            }
+            Some(ax) => {
+                if ax >= shape.len() {
+                    return Err(RumpyError::InvalidAxis { axis: ax, ndim: shape.len() });
+                }
+
+                let data = arr.as_ndarray();
+                let axis_len = shape[ax];
+                let mut new_shape = shape.to_vec();
+                new_shape[ax] = idx_data.len();
+
+                let outer_size: usize = shape[..ax].iter().product();
+                let inner_size: usize = shape[ax + 1..].iter().product();
+
+                let mut result = Vec::with_capacity(new_shape.iter().product());
+
+                for outer in 0..outer_size {
+                    for &idx in &idx_data {
+                        let i = idx as usize;
+                        if i >= axis_len {
+                            return Err(RumpyError::IndexOutOfBounds { index: i, size: axis_len });
+                        }
+                        for inner in 0..inner_size {
+                            let flat_idx = outer * (axis_len * inner_size) + i * inner_size + inner;
+                            result.push(data.as_slice().unwrap()[flat_idx]);
+                        }
+                    }
+                }
+
+                Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap()))
+            }
+        }
+    }
+
+    fn put(arr: &CpuArray, indices: &CpuArray, values: &CpuArray) -> Result<CpuArray> {
+        // Put values at indices (flattened), returns new array
+        let mut result = arr.as_f64_slice();
+        let idx_data = indices.as_f64_slice();
+        let val_data = values.as_f64_slice();
+
+        for (i, &idx) in idx_data.iter().enumerate() {
+            let flat_idx = idx as usize;
+            if flat_idx >= result.len() {
+                return Err(RumpyError::IndexOutOfBounds { index: flat_idx, size: result.len() });
+            }
+            // Cycle through values if indices is longer
+            result[flat_idx] = val_data[i % val_data.len()];
+        }
+
+        Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(arr.shape()), result).unwrap()))
+    }
+
+    fn pad(arr: &CpuArray, pad_width: &[(usize, usize)], mode: &str, constant_value: f64) -> Result<CpuArray> {
+        let shape = arr.shape();
+        let ndim = shape.len();
+
+        if pad_width.len() != ndim {
+            return Err(RumpyError::InvalidArgument(format!(
+                "pad_width length {} doesn't match array dimensions {}",
+                pad_width.len(), ndim
+            )));
+        }
+
+        // Calculate new shape
+        let new_shape: Vec<usize> = shape.iter()
+            .zip(pad_width.iter())
+            .map(|(&s, &(before, after))| s + before + after)
+            .collect();
+
+        let total_size: usize = new_shape.iter().product();
+        let mut result = vec![constant_value; total_size];
+
+        // Copy original data
+        let data = arr.as_ndarray();
+
+        for (flat_idx, &val) in data.iter().enumerate() {
+            // Decompose flat index to coordinates
+            let mut idx = flat_idx;
+            let mut coords: Vec<usize> = vec![0; ndim];
+            for d in (0..ndim).rev() {
+                coords[d] = idx % shape[d];
+                idx /= shape[d];
+            }
+
+            // Apply pad offset
+            let new_coords: Vec<usize> = coords.iter()
+                .zip(pad_width.iter())
+                .map(|(&c, &(before, _))| c + before)
+                .collect();
+
+            // Calculate new flat index
+            let mut new_flat_idx = 0;
+            let mut mult = 1;
+            for d in (0..ndim).rev() {
+                new_flat_idx += new_coords[d] * mult;
+                mult *= new_shape[d];
+            }
+
+            result[new_flat_idx] = val;
+        }
+
+        // Handle different pad modes
+        match mode {
+            "constant" => {
+                // Already filled with constant_value
+            }
+            "edge" => {
+                // Fill with edge values
+                for new_flat_idx in 0..total_size {
+                    // Decompose to coords
+                    let mut idx = new_flat_idx;
+                    let mut new_coords: Vec<usize> = vec![0; ndim];
+                    for d in (0..ndim).rev() {
+                        new_coords[d] = idx % new_shape[d];
+                        idx /= new_shape[d];
+                    }
+
+                    // Clamp to original array bounds
+                    let orig_coords: Vec<usize> = new_coords.iter()
+                        .zip(pad_width.iter())
+                        .zip(shape.iter())
+                        .map(|((&nc, &(before, _)), &s)| {
+                            if nc < before { 0 }
+                            else if nc >= before + s { s - 1 }
+                            else { nc - before }
+                        })
+                        .collect();
+
+                    // Get value from original array
+                    let mut orig_flat_idx = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        orig_flat_idx += orig_coords[d] * mult;
+                        mult *= shape[d];
+                    }
+
+                    result[new_flat_idx] = data.as_slice().unwrap()[orig_flat_idx];
+                }
+            }
+            "reflect" => {
+                // Reflect values at boundaries
+                for new_flat_idx in 0..total_size {
+                    let mut idx = new_flat_idx;
+                    let mut new_coords: Vec<usize> = vec![0; ndim];
+                    for d in (0..ndim).rev() {
+                        new_coords[d] = idx % new_shape[d];
+                        idx /= new_shape[d];
+                    }
+
+                    let orig_coords: Vec<usize> = new_coords.iter()
+                        .zip(pad_width.iter())
+                        .zip(shape.iter())
+                        .map(|((&nc, &(before, _)), &s)| {
+                            let offset = nc as isize - before as isize;
+                            if offset < 0 {
+                                (-offset) as usize % s
+                            } else if offset >= s as isize {
+                                let excess = offset as usize - s;
+                                (s - 1).saturating_sub(excess % s)
+                            } else {
+                                offset as usize
+                            }
+                        })
+                        .collect();
+
+                    let mut orig_flat_idx = 0;
+                    let mut mult = 1;
+                    for d in (0..ndim).rev() {
+                        orig_flat_idx += orig_coords[d] * mult;
+                        mult *= shape[d];
+                    }
+
+                    result[new_flat_idx] = data.as_slice().unwrap()[orig_flat_idx];
+                }
+            }
+            _ => {
+                return Err(RumpyError::InvalidArgument(format!(
+                    "Unknown pad mode: {}. Supported: constant, edge, reflect",
+                    mode
+                )));
+            }
+        }
+
+        Ok(CpuArray::from_ndarray(ArrayD::from_shape_vec(IxDyn(&new_shape), result).unwrap()))
     }
 }
 

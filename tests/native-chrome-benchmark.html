@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Native Chrome WebGPU Benchmark - rumpy vs tfjs</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    h2 { color: #00ff88; margin-top: 30px; }
+    pre {
+      background: #16213e;
+      padding: 20px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 14px;
+      white-space: pre-wrap;
+    }
+    .status {
+      padding: 10px 20px;
+      background: #0f3460;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    button {
+      background: #00d9ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    button:hover { background: #00b8d4; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    .result-card {
+      background: #16213e;
+      padding: 20px;
+      border-radius: 8px;
+      margin: 10px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .result-card.winner { border: 2px solid #00ff88; }
+    .gflops { font-size: 24px; font-weight: bold; }
+    .ms { color: #888; }
+    .label { font-size: 18px; }
+    .gap { background: #533; padding: 10px 20px; border-radius: 8px; margin: 20px 0; }
+    .win { background: #353; padding: 10px 20px; border-radius: 8px; margin: 20px 0; }
+    .info { background: #0f3460; padding: 15px 20px; border-radius: 8px; margin: 20px 0; }
+  </style>
+</head>
+<body>
+  <h1>Native Chrome WebGPU Benchmark</h1>
+  <p>Testing hypothesis: Playwright Chromium might be slower than native Chrome for WebGPU</p>
+
+  <div class="info">
+    <strong>Environment:</strong> <span id="env">Checking...</span><br>
+    <strong>GPU:</strong> <span id="gpu">Checking...</span><br>
+    <strong>WebGPU:</strong> <span id="webgpu-status">Checking...</span>
+  </div>
+
+  <div class="status" id="status">Ready to run benchmarks</div>
+
+  <button id="runBtn" onclick="runBenchmarks()">Run WebGPU Benchmark (4096x4096)</button>
+  <button onclick="runAllSizes()">Run All Sizes</button>
+  <button onclick="runCorrectnessTest()" style="background:#00ff88;">Verify Correctness ✓</button>
+
+  <div id="results"></div>
+
+  <!-- TensorFlow.js with WebGPU -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.min.js"></script>
+
+  <script type="module">
+    const WARMUP_RUNS = 5;
+    const BENCHMARK_RUNS = 20;
+
+    let gpuDevice = null;
+    let shaderCache = new Map();
+
+    // ============ Check Environment ============
+    document.getElementById('env').textContent =
+      `Chrome ${navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'unknown'}` +
+      (navigator.userAgent.includes('HeadlessChrome') ? ' (Headless/Playwright)' : ' (Native)');
+
+    // ============ WebGPU Initialization ============
+    async function initWebGPU() {
+      if (!navigator.gpu) {
+        document.getElementById('webgpu-status').textContent = 'NOT AVAILABLE';
+        throw new Error('WebGPU not supported');
+      }
+
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) {
+        document.getElementById('webgpu-status').textContent = 'NO ADAPTER';
+        throw new Error('No WebGPU adapter');
+      }
+
+      gpuDevice = await adapter.requestDevice({
+        requiredLimits: {
+          maxStorageBufferBindingSize: 1024 * 1024 * 1024,
+          maxBufferSize: 1024 * 1024 * 1024,
+        }
+      });
+
+      document.getElementById('gpu').textContent = adapter.name || 'Unknown';
+      document.getElementById('webgpu-status').textContent = 'READY ✓';
+      return gpuDevice;
+    }
+
+    // ============ FIT Shader (FIXED: BLOCK_K=16 to fit in 16KB shared memory limit) ============
+    // Previous BLOCK_K=32 used 17KB shared memory (exceeds 16KB limit), causing silent zeros
+    // As: 16 * 65 = 1040 floats = 4160 bytes
+    // Bs: 16 * 17 = 272 vec4s = 4352 bytes
+    // Total: 8512 bytes < 16384 byte limit ✓
+    const MATMUL_FIT_SHADER = `
+      struct Uniforms { M: u32, K: u32, N: u32, NPadded: u32, }
+      const BLOCK_M: u32 = 64u; const BLOCK_N: u32 = 64u; const BLOCK_K: u32 = 16u;
+      const THREAD_M: u32 = 4u; const THREAD_N: u32 = 4u; const BLOCK_M_PADDED: u32 = 65u;
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+      @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+      var<workgroup> As: array<f32, 1040>;
+      var<workgroup> Bs: array<vec4<f32>, 272>;
+      const BLOCK_N_VEC4_PADDED: u32 = 17u;
+      @compute @workgroup_size(16, 16)
+      fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+        let K = uniforms.K; let NVec4 = uniforms.NPadded / 4u; let NVec4Out = uniforms.N / 4u;
+        let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+        let outRowBase = wid.y * BLOCK_M + ty * THREAD_M;
+        let outColVec4 = wid.x * (BLOCK_N / 4u) + tx;
+        var acc0: vec4<f32> = vec4<f32>(0.0); var acc1: vec4<f32> = vec4<f32>(0.0);
+        var acc2: vec4<f32> = vec4<f32>(0.0); var acc3: vec4<f32> = vec4<f32>(0.0);
+        let numTiles = K / BLOCK_K;
+        for (var t: u32 = 0u; t < numTiles; t = t + 1u) {
+          // Load A tile: 256 threads, need 1040 elements = 4.0625 per thread
+          for (var i: u32 = 0u; i < 5u; i = i + 1u) {
+            let loadIdx = tid * 5u + i;
+            if (loadIdx < 1040u) {
+              let loadK = loadIdx / BLOCK_M; let loadRow = loadIdx % BLOCK_M;
+              let globalK = t * BLOCK_K + loadK; let globalRow = wid.y * BLOCK_M + loadRow;
+              As[loadK * BLOCK_M_PADDED + loadRow] = A[globalRow * K + globalK];
+            }
+          }
+          // Load B tile: 256 threads, need 272 vec4s = 1.0625 per thread
+          if (tid < 272u) {
+            let loadK = tid / 16u; let loadColVec = tid % 16u;
+            let globalK = t * BLOCK_K + loadK; let globalColVec = wid.x * 16u + loadColVec;
+            Bs[loadK * BLOCK_N_VEC4_PADDED + loadColVec] = B[globalK * NVec4 + globalColVec];
+          }
+          workgroupBarrier();
+          let aRowBase = ty * THREAD_M;
+          for (var k: u32 = 0u; k < BLOCK_K; k = k + 1u) {
+            let a0 = As[k * BLOCK_M_PADDED + aRowBase]; let a1 = As[k * BLOCK_M_PADDED + aRowBase + 1u];
+            let a2 = As[k * BLOCK_M_PADDED + aRowBase + 2u]; let a3 = As[k * BLOCK_M_PADDED + aRowBase + 3u];
+            let b = Bs[k * BLOCK_N_VEC4_PADDED + tx];
+            acc0 = fma(vec4<f32>(a0), b, acc0); acc1 = fma(vec4<f32>(a1), b, acc1);
+            acc2 = fma(vec4<f32>(a2), b, acc2); acc3 = fma(vec4<f32>(a3), b, acc3);
+          }
+          workgroupBarrier();
+        }
+        C[(outRowBase + 0u) * NVec4Out + outColVec4] = acc0;
+        C[(outRowBase + 1u) * NVec4Out + outColVec4] = acc1;
+        C[(outRowBase + 2u) * NVec4Out + outColVec4] = acc2;
+        C[(outRowBase + 3u) * NVec4Out + outColVec4] = acc3;
+      }
+    `;
+
+    // ============ rumpy WebGPU matmul ============
+    async function rumpyMatmul(M, K, N, aData, bData) {
+      const NPadded = Math.ceil(N / 4) * 4;
+
+      // Create buffers
+      const uniformBuffer = gpuDevice.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N, NPadded]));
+
+      const aBuffer = gpuDevice.createBuffer({
+        size: aData.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(aBuffer, 0, aData);
+
+      // Pad B to vec4 alignment
+      const BVec4Size = Math.ceil(N / 4) * K;
+      const bPadded = new Float32Array(BVec4Size * 4);
+      for (let k = 0; k < K; k++) {
+        for (let n = 0; n < N; n++) {
+          bPadded[k * NPadded + n] = bData[k * N + n];
+        }
+      }
+      const bBuffer = gpuDevice.createBuffer({
+        size: bPadded.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(bBuffer, 0, bPadded);
+
+      const cBuffer = gpuDevice.createBuffer({
+        size: M * NPadded * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+
+      // Get or create pipeline
+      let pipeline = shaderCache.get('FIT');
+      if (!pipeline) {
+        const shaderModule = gpuDevice.createShaderModule({ code: MATMUL_FIT_SHADER });
+        pipeline = gpuDevice.createComputePipeline({
+          layout: 'auto',
+          compute: { module: shaderModule, entryPoint: 'main' },
+        });
+        shaderCache.set('FIT', pipeline);
+      }
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: { buffer: aBuffer } },
+          { binding: 2, resource: { buffer: bBuffer } },
+          { binding: 3, resource: { buffer: cBuffer } },
+        ],
+      });
+
+      // DEBUG: Log dispatch info
+      console.log(`FIT dispatch: M=${M}, K=${K}, N=${N}, NPadded=${NPadded}, workgroups=[${Math.ceil(N/64)}, ${Math.ceil(M/64)}]`);
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(N / 64), Math.ceil(M / 64));
+      pass.end();
+
+      // Read back result
+      const stagingBuffer = gpuDevice.createBuffer({
+        size: M * NPadded * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, M * NPadded * 4);
+
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await gpuDevice.queue.onSubmittedWorkDone();  // Ensure GPU is done
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(stagingBuffer.getMappedRange().slice(0));
+      console.log(`FIT matmul ${M}x${N}: first 5 outputs = [${Array.from(result.slice(0,5)).map(x=>x.toFixed(4)).join(', ')}]`);
+      stagingBuffer.unmap();
+
+      // Cleanup
+      uniformBuffer.destroy();
+      aBuffer.destroy();
+      bBuffer.destroy();
+      cBuffer.destroy();
+      stagingBuffer.destroy();
+
+      // Unpad result
+      const output = new Float32Array(M * N);
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          output[m * N + n] = result[m * NPadded + n];
+        }
+      }
+      return output;
+    }
+
+    // ============ Benchmark Functions ============
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg;
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function benchmarkRumpyWebGPU(size) {
+      const M = size, K = size, N = size;
+      const flops = 2 * M * N * K;
+
+      const aData = new Float32Array(M * K);
+      const bData = new Float32Array(K * N);
+      for (let i = 0; i < M * K; i++) aData[i] = Math.random();
+      for (let i = 0; i < K * N; i++) bData[i] = Math.random();
+
+      // Warmup
+      for (let i = 0; i < WARMUP_RUNS; i++) {
+        await rumpyMatmul(M, K, N, aData, bData);
+      }
+      await sleep(50);
+
+      // Benchmark
+      const times = [];
+      for (let i = 0; i < BENCHMARK_RUNS; i++) {
+        const start = performance.now();
+        await rumpyMatmul(M, K, N, aData, bData);
+        const end = performance.now();
+        times.push(end - start);
+      }
+
+      const avgMs = times.reduce((a, b) => a + b) / times.length;
+      const minMs = Math.min(...times);
+      const gflops = (flops / (avgMs / 1000)) / 1e9;
+
+      return { backend: 'rumpy-webgpu', size, avgMs, minMs, gflops, times };
+    }
+
+    async function benchmarkTfjsWebGPU(size) {
+      try {
+        await tf.setBackend('webgpu');
+        await tf.ready();
+      } catch (e) {
+        console.error('tfjs-webgpu unavailable:', e);
+        return null;
+      }
+
+      const flops = 2 * size * size * size;
+      const a = tf.randomUniform([size, size], 0, 1, 'float32');
+      const b = tf.randomUniform([size, size], 0, 1, 'float32');
+
+      // Warmup
+      for (let i = 0; i < WARMUP_RUNS; i++) {
+        const c = tf.matMul(a, b);
+        await c.data();
+        c.dispose();
+      }
+      await sleep(50);
+
+      // Benchmark
+      const times = [];
+      for (let i = 0; i < BENCHMARK_RUNS; i++) {
+        const start = performance.now();
+        const c = tf.matMul(a, b);
+        await c.data();
+        const end = performance.now();
+        times.push(end - start);
+        c.dispose();
+      }
+
+      a.dispose();
+      b.dispose();
+
+      const avgMs = times.reduce((a, b) => a + b) / times.length;
+      const minMs = Math.min(...times);
+      const gflops = (flops / (avgMs / 1000)) / 1e9;
+
+      return { backend: 'tfjs-webgpu', size, avgMs, minMs, gflops, times };
+    }
+
+    async function runBenchmarks(size = 4096) {
+      const btn = document.getElementById('runBtn');
+      btn.disabled = true;
+
+      try {
+        await initWebGPU();
+      } catch (e) {
+        setStatus('WebGPU init failed: ' + e.message);
+        btn.disabled = false;
+        return;
+      }
+
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = `<h2>${size}x${size} Matrix Multiplication</h2>`;
+
+      setStatus(`Benchmarking rumpy-webgpu (${size}x${size})...`);
+      const rumpy = await benchmarkRumpyWebGPU(size);
+
+      setStatus(`Benchmarking tfjs-webgpu (${size}x${size})...`);
+      const tfjs = await benchmarkTfjsWebGPU(size);
+
+      // Display results
+      const winner = rumpy.avgMs < tfjs.avgMs ? 'rumpy' : 'tfjs';
+      const gap = winner === 'rumpy'
+        ? (tfjs.avgMs / rumpy.avgMs).toFixed(2)
+        : (rumpy.avgMs / tfjs.avgMs).toFixed(2);
+
+      resultsDiv.innerHTML = `
+        <h2>${size}x${size} Matrix Multiplication</h2>
+
+        <div class="result-card ${rumpy.avgMs < tfjs.avgMs ? 'winner' : ''}">
+          <div class="label">rumpy-webgpu</div>
+          <div>
+            <span class="gflops">${rumpy.gflops.toFixed(0)} GFLOPS</span>
+            <span class="ms">(${rumpy.avgMs.toFixed(2)}ms avg, ${rumpy.minMs.toFixed(2)}ms min)</span>
+          </div>
+        </div>
+
+        <div class="result-card ${tfjs.avgMs < rumpy.avgMs ? 'winner' : ''}">
+          <div class="label">tfjs-webgpu</div>
+          <div>
+            <span class="gflops">${tfjs.gflops.toFixed(0)} GFLOPS</span>
+            <span class="ms">(${tfjs.avgMs.toFixed(2)}ms avg, ${tfjs.minMs.toFixed(2)}ms min)</span>
+          </div>
+        </div>
+
+        <div class="${winner === 'rumpy' ? 'win' : 'gap'}">
+          ${winner === 'rumpy'
+            ? `<strong>rumpy WINS!</strong> ${gap}x faster than tfjs`
+            : `<strong>tfjs ahead</strong> by ${gap}x - rumpy is ${((tfjs.avgMs / rumpy.avgMs) * 100).toFixed(1)}% of tfjs speed`}
+        </div>
+
+        <h3>Raw Times (ms)</h3>
+        <pre>
+rumpy: [${rumpy.times.map(t => t.toFixed(2)).join(', ')}]
+tfjs:  [${tfjs.times.map(t => t.toFixed(2)).join(', ')}]
+        </pre>
+      `;
+
+      setStatus('Complete! Check results below.');
+      btn.disabled = false;
+    }
+
+    async function runAllSizes() {
+      const sizes = [512, 1024, 2048, 4096];
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '';
+
+      try {
+        await initWebGPU();
+      } catch (e) {
+        setStatus('WebGPU init failed: ' + e.message);
+        return;
+      }
+
+      for (const size of sizes) {
+        setStatus(`Benchmarking ${size}x${size}...`);
+        const rumpy = await benchmarkRumpyWebGPU(size);
+        const tfjs = await benchmarkTfjsWebGPU(size);
+
+        const winner = rumpy.avgMs < tfjs.avgMs ? 'rumpy' : 'tfjs';
+        const gap = winner === 'rumpy'
+          ? (tfjs.avgMs / rumpy.avgMs).toFixed(2)
+          : (rumpy.avgMs / tfjs.avgMs).toFixed(2);
+
+        resultsDiv.innerHTML += `
+          <h2>${size}x${size}</h2>
+          <p>rumpy: ${rumpy.avgMs.toFixed(2)}ms (${rumpy.gflops.toFixed(0)} GFLOPS)</p>
+          <p>tfjs: ${tfjs.avgMs.toFixed(2)}ms (${tfjs.gflops.toFixed(0)} GFLOPS)</p>
+          <p><strong>${winner} ${winner === 'rumpy' ? 'wins' : 'ahead'}: ${gap}x</strong></p>
+          <hr>
+        `;
+      }
+
+      setStatus('All benchmarks complete!');
+    }
+
+    // ============ CPU Reference Matmul (for correctness check) ============
+    function cpuMatmul(M, K, N, aData, bData) {
+      const result = new Float32Array(M * N);
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) {
+            sum += aData[m * K + k] * bData[k * N + n];
+          }
+          result[m * N + n] = sum;
+        }
+      }
+      return result;
+    }
+
+    // ============ Simple Debug Matmul (naive, no tiling) ============
+    const SIMPLE_MATMUL_SHADER = `
+      struct Uniforms {
+        M: u32,
+        K: u32,
+        N: u32,
+        _pad: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+      @compute @workgroup_size(16, 16)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let row = gid.y;
+        let col = gid.x;
+
+        if (row >= uniforms.M || col >= uniforms.N) {
+          return;
+        }
+
+        var sum: f32 = 0.0;
+        for (var k: u32 = 0u; k < uniforms.K; k = k + 1u) {
+          sum = sum + A[row * uniforms.K + k] * B[k * uniforms.N + col];
+        }
+
+        C[row * uniforms.N + col] = sum;
+      }
+    `;
+
+    async function simpleMatmul(M, K, N, aData, bData) {
+      const uniformBuffer = gpuDevice.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N, 0]));
+
+      const aBuffer = gpuDevice.createBuffer({
+        size: aData.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(aBuffer, 0, aData);
+
+      const bBuffer = gpuDevice.createBuffer({
+        size: bData.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      gpuDevice.queue.writeBuffer(bBuffer, 0, bData);
+
+      const cBuffer = gpuDevice.createBuffer({
+        size: M * N * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+
+      let pipeline = shaderCache.get('SIMPLE');
+      if (!pipeline) {
+        const shaderModule = gpuDevice.createShaderModule({ code: SIMPLE_MATMUL_SHADER });
+        pipeline = gpuDevice.createComputePipeline({
+          layout: 'auto',
+          compute: { module: shaderModule, entryPoint: 'main' },
+        });
+        shaderCache.set('SIMPLE', pipeline);
+      }
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: { buffer: aBuffer } },
+          { binding: 2, resource: { buffer: bBuffer } },
+          { binding: 3, resource: { buffer: cBuffer } },
+        ],
+      });
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(M / 16));
+      pass.end();
+
+      const stagingBuffer = gpuDevice.createBuffer({
+        size: M * N * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, M * N * 4);
+
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(stagingBuffer.getMappedRange().slice(0));
+      stagingBuffer.unmap();
+
+      uniformBuffer.destroy();
+      aBuffer.destroy();
+      bBuffer.destroy();
+      cBuffer.destroy();
+      stagingBuffer.destroy();
+
+      return result;
+    }
+
+    // ============ Debug: Write-Only Test Shader ============
+    const DEBUG_WRITE_SHADER = `
+      @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+
+      @compute @workgroup_size(64)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        output[gid.x] = f32(gid.x) + 1.0;  // Write 1, 2, 3, 4, ...
+      }
+    `;
+
+    // ============ Debug: Test shared memory shader ============
+    const DEBUG_SHARED_SHADER = `
+      @group(0) @binding(0) var<storage, read> input: array<f32>;
+      @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+
+      var<workgroup> shared: array<f32, 256>;
+
+      @compute @workgroup_size(16, 16)
+      fn main(
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>
+      ) {
+        let tid = lid.y * 16u + lid.x;
+        let gid = wid.x * 256u + tid;
+
+        // Load into shared memory
+        shared[tid] = input[gid];
+        workgroupBarrier();
+
+        // Write from shared memory
+        output[gid] = shared[tid] * 2.0;
+      }
+    `;
+
+    async function testSharedMemory() {
+      console.log('Testing shared memory shader...');
+
+      // Test 1: Simple shared memory write-then-read using 2D array like tfjs
+      const SHARED_ONLY_SHADER = `
+        @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+        var<workgroup> shared: array<array<f32, 8>, 8>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+          let row = lid.y;
+          let col = lid.x;
+          let g = gid.y * 8u + gid.x;
+
+          // Write to shared memory
+          let val = f32(g) + 100.0;
+          shared[row][col] = val;
+          workgroupBarrier();
+
+          // Read from a DIFFERENT thread's location (col+1 mod 8)
+          let readCol = (col + 1u) % 8u;
+          output[g] = shared[row][readCol];
+        }
+      `;
+
+      // Also test: write to shared, then DON'T read - just write a constant
+      const SHARED_WRITE_ONLY_SHADER = `
+        @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+        var<workgroup> shared: array<f32, 64>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+          let tid = lid.x;
+          let g = gid.x;
+
+          // Write to shared memory (but don't read from it)
+          shared[tid] = f32(g) + 100.0;
+          workgroupBarrier();
+
+          // Just write a constant - does this work?
+          output[g] = 999.0;
+        }
+      `;
+
+      // Test B: No shared memory at all, but same workgroup size
+      const NO_SHARED_SHADER = `
+        @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+          let tid = lid.x;
+          let g = gid.x;
+          output[g] = 888.0;
+        }
+      `;
+
+      // Test C: EXACT tfjs style - 2D arrays with specific dimensions
+      const TFJS_STYLE_SHADER = `
+        @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+        var<workgroup> mm_Asub : array<array<f32, 32>, 32>;
+        var<workgroup> mm_Bsub : array<array<f32, 32>, 32>;
+
+        @compute @workgroup_size(8, 8)
+        fn main(@builtin(global_invocation_id) globalId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+          let localRow = i32(localId.y);
+          let localCol = i32(localId.x);
+          let globalRow = i32(globalId.y);
+          let globalCol = i32(globalId.x);
+
+          // Write to shared
+          mm_Asub[localRow][localCol] = f32(globalRow * 8 + globalCol) + 1.0;
+          mm_Bsub[localRow][localCol] = 2.0;
+          workgroupBarrier();
+
+          // Read from shared and write to output
+          let idx = u32(globalRow * 8 + globalCol);
+          output[idx] = mm_Asub[localRow][localCol] + mm_Bsub[localRow][localCol];
+        }
+      `;
+
+      // Test C: tfjs-style shared memory
+      console.log('Test C: tfjs-style 2D workgroup arrays');
+      {
+        const outBuffer = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const module = gpuDevice.createShaderModule({ code: TFJS_STYLE_SHADER });
+        const pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+        const bindGroup = gpuDevice.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: outBuffer } }] });
+        const commandEncoder = gpuDevice.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(1, 1); pass.end();
+        const staging = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        commandEncoder.copyBufferToBuffer(outBuffer, 0, staging, 0, 64 * 4);
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(staging.getMappedRange().slice(0));
+        staging.unmap(); outBuffer.destroy(); staging.destroy();
+        console.log(`Test C result: first 10 = [${Array.from(result.slice(0,10)).join(', ')}] (expect 3, 4, 5, ...)`);
+      }
+
+      // Test B first - does workgroup_size(64) work without shared memory?
+      console.log('Test B: No shared memory, workgroup_size(64)');
+      {
+        const outBuffer = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const module = gpuDevice.createShaderModule({ code: NO_SHARED_SHADER });
+        const pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+        const bindGroup = gpuDevice.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: outBuffer } }] });
+        const commandEncoder = gpuDevice.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(1); pass.end();
+        const staging = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        commandEncoder.copyBufferToBuffer(outBuffer, 0, staging, 0, 64 * 4);
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(staging.getMappedRange().slice(0));
+        staging.unmap(); outBuffer.destroy(); staging.destroy();
+        console.log(`Test B result: first 10 = [${Array.from(result.slice(0,10)).join(', ')}] (expect all 888)`);
+      }
+
+      // Test the write-only version first
+      console.log('Test A: Does write-to-output work with shared memory present?');
+      {
+        const outBuffer = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const module = gpuDevice.createShaderModule({ code: SHARED_WRITE_ONLY_SHADER });
+        const pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+        const bindGroup = gpuDevice.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: outBuffer } }] });
+        const commandEncoder = gpuDevice.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(1); pass.end();
+        const staging = gpuDevice.createBuffer({ size: 64 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        commandEncoder.copyBufferToBuffer(outBuffer, 0, staging, 0, 64 * 4);
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+        await staging.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(staging.getMappedRange().slice(0));
+        staging.unmap(); outBuffer.destroy(); staging.destroy();
+        console.log(`Test A result: first 10 = [${Array.from(result.slice(0,10)).join(', ')}] (expect all 999)`);
+      }
+
+      const size = 64;  // 8x8 workgroup
+      const outBuffer = gpuDevice.createBuffer({
+        size: size * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+
+      const module = gpuDevice.createShaderModule({ code: SHARED_ONLY_SHADER });
+      const pipeline = gpuDevice.createComputePipeline({
+        layout: 'auto',
+        compute: { module, entryPoint: 'main' },
+      });
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: outBuffer } }],
+      });
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(1);  // Single workgroup of 8x8=64 threads
+      pass.end();
+
+      const staging = gpuDevice.createBuffer({
+        size: size * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      commandEncoder.copyBufferToBuffer(outBuffer, 0, staging, 0, size * 4);
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(staging.getMappedRange().slice(0));
+      staging.unmap();
+      outBuffer.destroy(); staging.destroy();
+
+      console.log(`Shared memory shader (2D array): first 10 = [${Array.from(result.slice(0,10)).join(', ')}]`);
+      // Expected: 100, 101, 102, ...
+      return result[0] === 100 && result[1] === 101 && result[9] === 109;
+    }
+
+    async function testTfjsCorrectness() {
+      console.log('Testing tfjs WebGPU correctness...');
+      try {
+        await tf.setBackend('webgpu');
+        await tf.ready();
+      } catch (e) {
+        console.log('tfjs webgpu not available:', e);
+        return false;
+      }
+
+      // Small matrix for quick verification
+      const size = 64;
+      const aData = new Float32Array(size * size);
+      const bData = new Float32Array(size * size);
+      for (let i = 0; i < size * size; i++) {
+        aData[i] = (i % 17) * 0.1 - 0.8;
+        bData[i] = (i % 13) * 0.1 - 0.6;
+      }
+
+      // CPU reference
+      const cpuResult = cpuMatmul(size, size, size, aData, bData);
+
+      // tfjs WebGPU
+      const a = tf.tensor2d(aData, [size, size]);
+      const b = tf.tensor2d(bData, [size, size]);
+      const c = tf.matMul(a, b);
+      const tfjsResult = await c.data();
+      a.dispose(); b.dispose(); c.dispose();
+
+      // Compare
+      let maxRelError = 0;
+      for (let i = 0; i < size * size; i++) {
+        const cpu = cpuResult[i];
+        const gpu = tfjsResult[i];
+        const absErr = Math.abs(cpu - gpu);
+        const relErr = Math.abs(cpu) > 1e-6 ? absErr / Math.abs(cpu) : absErr;
+        maxRelError = Math.max(maxRelError, relErr);
+      }
+
+      console.log(`tfjs 64x64 matmul: first 5 = [${Array.from(tfjsResult.slice(0,5)).map(x=>x.toFixed(4)).join(', ')}]`);
+      console.log(`tfjs 64x64 CPU ref: first 5 = [${Array.from(cpuResult.slice(0,5)).map(x=>x.toFixed(4)).join(', ')}]`);
+      console.log(`tfjs max relative error: ${(maxRelError * 100).toFixed(4)}%`);
+
+      return maxRelError < 0.01;  // 1% tolerance
+    }
+
+    async function testDebugWrite() {
+      console.log('Testing debug write shader...');
+      const size = 256;
+      const outBuffer = gpuDevice.createBuffer({
+        size: size * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+
+      const module = gpuDevice.createShaderModule({ code: DEBUG_WRITE_SHADER });
+      const pipeline = gpuDevice.createComputePipeline({
+        layout: 'auto',
+        compute: { module, entryPoint: 'main' },
+      });
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: outBuffer } }],
+      });
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(4);  // 4 * 64 = 256 threads
+      pass.end();
+
+      const staging = gpuDevice.createBuffer({
+        size: size * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      commandEncoder.copyBufferToBuffer(outBuffer, 0, staging, 0, size * 4);
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(staging.getMappedRange().slice(0));
+      staging.unmap();
+      outBuffer.destroy();
+      staging.destroy();
+
+      console.log(`Debug write shader: first 10 = [${Array.from(result.slice(0,10)).join(', ')}]`);
+      return result[0] === 1 && result[1] === 2 && result[255] === 256;
+    }
+
+    // ============ Correctness Verification ============
+    async function runCorrectnessTest() {
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '<h2>Correctness Verification</h2><p>Testing WebGPU write capability...</p>';
+
+      try {
+        await initWebGPU();
+      } catch (e) {
+        setStatus('WebGPU init failed: ' + e.message);
+        return;
+      }
+
+      // First test if WebGPU can write at all
+      const debugOK = await testDebugWrite();
+      console.log(`Debug write test: ${debugOK ? 'PASS' : 'FAIL'}`);
+      if (!debugOK) {
+        resultsDiv.innerHTML = '<h2>FATAL: WebGPU cannot write to buffers!</h2>';
+        return;
+      }
+
+      // Test shared memory
+      const sharedOK = await testSharedMemory();
+      console.log(`Shared memory test: ${sharedOK ? 'PASS' : 'FAIL'}`);
+
+      // Test tfjs correctness
+      resultsDiv.innerHTML = '<h2>Testing tfjs WebGPU correctness...</h2>';
+      const tfjsOK = await testTfjsCorrectness();
+      console.log(`tfjs correctness test: ${tfjsOK ? 'PASS' : 'FAIL'}`);
+
+      if (!sharedOK) {
+        resultsDiv.innerHTML += '<p>WARNING: Our shared memory test failed!</p>';
+      }
+      if (!tfjsOK) {
+        resultsDiv.innerHTML += '<p>WARNING: tfjs WebGPU also produces wrong results!</p>';
+      }
+
+      const testSizes = [64, 128, 256, 512, 1024];
+      let allPassed = true;
+      let report = '<h2>Correctness Verification Results</h2>';
+
+      for (const size of testSizes) {
+        setStatus(`Verifying ${size}x${size}...`);
+
+        const M = size, K = size, N = size;
+
+        // Create deterministic test data
+        const aData = new Float32Array(M * K);
+        const bData = new Float32Array(K * N);
+        for (let i = 0; i < M * K; i++) aData[i] = (i % 17) * 0.1 - 0.8;
+        for (let i = 0; i < K * N; i++) bData[i] = (i % 13) * 0.1 - 0.6;
+
+        // Compute reference (CPU)
+        const cpuResult = cpuMatmul(M, K, N, aData, bData);
+
+        // Compute using FIT shader (the broken one we're debugging)
+        const gpuResult = await rumpyMatmul(M, K, N, aData, bData);
+
+        // Compare results
+        let maxAbsError = 0;
+        let maxRelError = 0;
+        let nanCount = 0;
+        let infCount = 0;
+
+        for (let i = 0; i < M * N; i++) {
+          const cpu = cpuResult[i];
+          const gpu = gpuResult[i];
+
+          if (isNaN(gpu)) { nanCount++; continue; }
+          if (!isFinite(gpu)) { infCount++; continue; }
+
+          const absErr = Math.abs(cpu - gpu);
+          const relErr = Math.abs(cpu) > 1e-6 ? absErr / Math.abs(cpu) : absErr;
+
+          maxAbsError = Math.max(maxAbsError, absErr);
+          maxRelError = Math.max(maxRelError, relErr);
+        }
+
+        // Check pass/fail (f32 has ~7 decimal digits precision, but accumulation adds error)
+        const passed = nanCount === 0 && infCount === 0 && maxRelError < 1e-3;
+        if (!passed) allPassed = false;
+
+        // Sample values comparison
+        const sampleIdx = [0, M*N-1, Math.floor(M*N/2)];
+        const samples = sampleIdx.map(i => ({
+          idx: i,
+          cpu: cpuResult[i].toFixed(6),
+          gpu: gpuResult[i].toFixed(6),
+          diff: Math.abs(cpuResult[i] - gpuResult[i]).toExponential(2)
+        }));
+
+        report += `
+          <div class="result-card ${passed ? 'winner' : ''}" style="${!passed ? 'border: 2px solid #f55;' : ''}">
+            <div>
+              <div class="label">${size}x${size}</div>
+              <div style="font-size: 12px; color: #aaa;">
+                Max abs error: ${maxAbsError.toExponential(2)}<br>
+                Max rel error: ${(maxRelError * 100).toFixed(4)}%<br>
+                NaN: ${nanCount}, Inf: ${infCount}
+              </div>
+            </div>
+            <div class="gflops" style="color: ${passed ? '#0f8' : '#f55'};">
+              ${passed ? 'PASS ✓' : 'FAIL ✗'}
+            </div>
+          </div>
+          <pre style="font-size: 11px;">Sample values:
+${samples.map(s => `  [${s.idx}] CPU: ${s.cpu}, GPU: ${s.gpu}, diff: ${s.diff}`).join('\n')}</pre>
+        `;
+      }
+
+      report += `
+        <div class="${allPassed ? 'win' : 'gap'}">
+          <strong>${allPassed ? 'ALL TESTS PASSED ✓' : 'SOME TESTS FAILED ✗'}</strong>
+          ${allPassed ? ' - Results are numerically correct!' : ' - Check the errors above'}
+        </div>
+      `;
+
+      resultsDiv.innerHTML = report;
+      setStatus(allPassed ? 'Correctness verified! ✓' : 'Correctness issues detected!');
+    }
+
+    window.runBenchmarks = runBenchmarks;
+    window.runAllSizes = runAllSizes;
+    window.runCorrectnessTest = runCorrectnessTest;
+
+    // Auto-init to check environment
+    initWebGPU().catch(e => {
+      document.getElementById('webgpu-status').textContent = 'FAILED: ' + e.message;
+    });
+  </script>
+</body>
+</html>

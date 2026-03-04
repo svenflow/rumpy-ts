@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU GEMM - Fully Unrolled for 1024</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+</head>
+<body>
+  <h1>WebGPU GEMM - Fully Unrolled</h1>
+  <p>Matching tfjs config exactly: 8x8 workgroup, 4x4 per thread, tileInner=32, vec4, fully unrolled</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    // Fully unrolled 4x4 shader with vec4 storage - matches tfjs config
+    // workgroup: 8x8 (64 threads)
+    // tile: 32x32 (8*4 x 8*4)
+    // each thread: 4x4 outputs (stored as 4x vec4)
+    // tileK: 32
+    const gemmShaderUnrolled = `
+      struct Uniforms {
+        M: u32,
+        N: u32,
+        K: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+      @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+      @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+
+      // Workgroup: 8x8, tile: 32x32, each thread handles 4x4 block
+      var<workgroup> mm_Asub: array<array<f32, 32>, 32>;
+      var<workgroup> mm_Bsub: array<array<f32, 32>, 32>;
+
+      @compute @workgroup_size(8, 8)
+      fn main(
+        @builtin(local_invocation_id) localId: vec3<u32>,
+        @builtin(workgroup_id) workgroupId: vec3<u32>
+      ) {
+        let M = uniforms.M;
+        let N = uniforms.N;
+        let K = uniforms.K;
+        let Kdiv4 = K / 4u;
+        let Ndiv4 = N / 4u;
+
+        let tileRow = workgroupId.y * 32u;
+        let tileCol = workgroupId.x * 32u;
+
+        let localRow = localId.y;
+        let localCol = localId.x;
+        let localIdx = localRow * 8u + localCol;
+
+        // Each thread's 4x4 block starts here
+        let globalRow = tileRow + localRow * 4u;
+        let globalCol = tileCol + localCol * 4u;
+
+        // Accumulators: 4 vec4s for 4x4 block
+        var acc0: vec4<f32> = vec4<f32>(0.0);
+        var acc1: vec4<f32> = vec4<f32>(0.0);
+        var acc2: vec4<f32> = vec4<f32>(0.0);
+        var acc3: vec4<f32> = vec4<f32>(0.0);
+
+        let numTiles = (K + 31u) / 32u;
+
+        for (var t: u32 = 0u; t < numTiles; t = t + 1u) {
+          // Each of 64 threads loads 4 elements each = 256 elements
+          // A tile: 32x32 = 1024 elements -> 16 elements per thread
+          // Load A tile with vec4
+          {
+            let loadBase = localIdx * 4u;
+            // Load 4 consecutive vec4s (16 elements)
+            for (var v: u32 = 0u; v < 4u; v = v + 1u) {
+              let flatIdx = loadBase + v;
+              let loadRow = flatIdx / 8u;  // 8 vec4s per row = 32 elements
+              let loadVec4Col = flatIdx % 8u;
+              let aRow = tileRow + loadRow;
+              let aVec4Col = t * 8u + loadVec4Col;  // 32/4 = 8 vec4s
+
+              if (aRow < M && aVec4Col * 4u < K) {
+                let vec4Val = A[aRow * Kdiv4 + aVec4Col];
+                mm_Asub[loadRow][loadVec4Col * 4u + 0u] = vec4Val.x;
+                mm_Asub[loadRow][loadVec4Col * 4u + 1u] = vec4Val.y;
+                mm_Asub[loadRow][loadVec4Col * 4u + 2u] = vec4Val.z;
+                mm_Asub[loadRow][loadVec4Col * 4u + 3u] = vec4Val.w;
+              } else {
+                mm_Asub[loadRow][loadVec4Col * 4u + 0u] = 0.0;
+                mm_Asub[loadRow][loadVec4Col * 4u + 1u] = 0.0;
+                mm_Asub[loadRow][loadVec4Col * 4u + 2u] = 0.0;
+                mm_Asub[loadRow][loadVec4Col * 4u + 3u] = 0.0;
+              }
+            }
+          }
+
+          // Load B tile
+          {
+            let loadBase = localIdx * 4u;
+            for (var v: u32 = 0u; v < 4u; v = v + 1u) {
+              let flatIdx = loadBase + v;
+              let loadRow = flatIdx / 8u;
+              let loadVec4Col = flatIdx % 8u;
+              let bRow = t * 32u + loadRow;
+              let bVec4Col = tileCol / 4u + loadVec4Col;
+
+              if (bRow < K && bVec4Col * 4u < N) {
+                let vec4Val = B[bRow * Ndiv4 + bVec4Col];
+                mm_Bsub[loadRow][loadVec4Col * 4u + 0u] = vec4Val.x;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 1u] = vec4Val.y;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 2u] = vec4Val.z;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 3u] = vec4Val.w;
+              } else {
+                mm_Bsub[loadRow][loadVec4Col * 4u + 0u] = 0.0;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 1u] = 0.0;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 2u] = 0.0;
+                mm_Bsub[loadRow][loadVec4Col * 4u + 3u] = 0.0;
+              }
+            }
+          }
+
+          workgroupBarrier();
+
+          // FULLY UNROLLED K-LOOP: k=0..31
+          // Thread handles rows [localRow*4, localRow*4+3] and cols [localCol*4, localCol*4+3]
+          let r0 = localRow * 4u;
+          let r1 = r0 + 1u;
+          let r2 = r0 + 2u;
+          let r3 = r0 + 3u;
+          let c0 = localCol * 4u;
+
+          // k=0
+          {
+            let bVec = vec4<f32>(mm_Bsub[0u][c0], mm_Bsub[0u][c0+1u], mm_Bsub[0u][c0+2u], mm_Bsub[0u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][0u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][0u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][0u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][0u]), bVec, acc3);
+          }
+          // k=1
+          {
+            let bVec = vec4<f32>(mm_Bsub[1u][c0], mm_Bsub[1u][c0+1u], mm_Bsub[1u][c0+2u], mm_Bsub[1u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][1u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][1u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][1u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][1u]), bVec, acc3);
+          }
+          // k=2
+          {
+            let bVec = vec4<f32>(mm_Bsub[2u][c0], mm_Bsub[2u][c0+1u], mm_Bsub[2u][c0+2u], mm_Bsub[2u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][2u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][2u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][2u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][2u]), bVec, acc3);
+          }
+          // k=3
+          {
+            let bVec = vec4<f32>(mm_Bsub[3u][c0], mm_Bsub[3u][c0+1u], mm_Bsub[3u][c0+2u], mm_Bsub[3u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][3u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][3u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][3u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][3u]), bVec, acc3);
+          }
+          // k=4
+          {
+            let bVec = vec4<f32>(mm_Bsub[4u][c0], mm_Bsub[4u][c0+1u], mm_Bsub[4u][c0+2u], mm_Bsub[4u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][4u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][4u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][4u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][4u]), bVec, acc3);
+          }
+          // k=5
+          {
+            let bVec = vec4<f32>(mm_Bsub[5u][c0], mm_Bsub[5u][c0+1u], mm_Bsub[5u][c0+2u], mm_Bsub[5u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][5u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][5u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][5u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][5u]), bVec, acc3);
+          }
+          // k=6
+          {
+            let bVec = vec4<f32>(mm_Bsub[6u][c0], mm_Bsub[6u][c0+1u], mm_Bsub[6u][c0+2u], mm_Bsub[6u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][6u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][6u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][6u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][6u]), bVec, acc3);
+          }
+          // k=7
+          {
+            let bVec = vec4<f32>(mm_Bsub[7u][c0], mm_Bsub[7u][c0+1u], mm_Bsub[7u][c0+2u], mm_Bsub[7u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][7u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][7u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][7u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][7u]), bVec, acc3);
+          }
+          // k=8
+          {
+            let bVec = vec4<f32>(mm_Bsub[8u][c0], mm_Bsub[8u][c0+1u], mm_Bsub[8u][c0+2u], mm_Bsub[8u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][8u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][8u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][8u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][8u]), bVec, acc3);
+          }
+          // k=9
+          {
+            let bVec = vec4<f32>(mm_Bsub[9u][c0], mm_Bsub[9u][c0+1u], mm_Bsub[9u][c0+2u], mm_Bsub[9u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][9u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][9u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][9u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][9u]), bVec, acc3);
+          }
+          // k=10
+          {
+            let bVec = vec4<f32>(mm_Bsub[10u][c0], mm_Bsub[10u][c0+1u], mm_Bsub[10u][c0+2u], mm_Bsub[10u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][10u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][10u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][10u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][10u]), bVec, acc3);
+          }
+          // k=11
+          {
+            let bVec = vec4<f32>(mm_Bsub[11u][c0], mm_Bsub[11u][c0+1u], mm_Bsub[11u][c0+2u], mm_Bsub[11u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][11u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][11u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][11u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][11u]), bVec, acc3);
+          }
+          // k=12
+          {
+            let bVec = vec4<f32>(mm_Bsub[12u][c0], mm_Bsub[12u][c0+1u], mm_Bsub[12u][c0+2u], mm_Bsub[12u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][12u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][12u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][12u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][12u]), bVec, acc3);
+          }
+          // k=13
+          {
+            let bVec = vec4<f32>(mm_Bsub[13u][c0], mm_Bsub[13u][c0+1u], mm_Bsub[13u][c0+2u], mm_Bsub[13u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][13u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][13u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][13u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][13u]), bVec, acc3);
+          }
+          // k=14
+          {
+            let bVec = vec4<f32>(mm_Bsub[14u][c0], mm_Bsub[14u][c0+1u], mm_Bsub[14u][c0+2u], mm_Bsub[14u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][14u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][14u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][14u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][14u]), bVec, acc3);
+          }
+          // k=15
+          {
+            let bVec = vec4<f32>(mm_Bsub[15u][c0], mm_Bsub[15u][c0+1u], mm_Bsub[15u][c0+2u], mm_Bsub[15u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][15u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][15u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][15u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][15u]), bVec, acc3);
+          }
+          // k=16
+          {
+            let bVec = vec4<f32>(mm_Bsub[16u][c0], mm_Bsub[16u][c0+1u], mm_Bsub[16u][c0+2u], mm_Bsub[16u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][16u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][16u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][16u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][16u]), bVec, acc3);
+          }
+          // k=17
+          {
+            let bVec = vec4<f32>(mm_Bsub[17u][c0], mm_Bsub[17u][c0+1u], mm_Bsub[17u][c0+2u], mm_Bsub[17u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][17u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][17u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][17u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][17u]), bVec, acc3);
+          }
+          // k=18
+          {
+            let bVec = vec4<f32>(mm_Bsub[18u][c0], mm_Bsub[18u][c0+1u], mm_Bsub[18u][c0+2u], mm_Bsub[18u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][18u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][18u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][18u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][18u]), bVec, acc3);
+          }
+          // k=19
+          {
+            let bVec = vec4<f32>(mm_Bsub[19u][c0], mm_Bsub[19u][c0+1u], mm_Bsub[19u][c0+2u], mm_Bsub[19u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][19u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][19u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][19u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][19u]), bVec, acc3);
+          }
+          // k=20
+          {
+            let bVec = vec4<f32>(mm_Bsub[20u][c0], mm_Bsub[20u][c0+1u], mm_Bsub[20u][c0+2u], mm_Bsub[20u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][20u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][20u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][20u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][20u]), bVec, acc3);
+          }
+          // k=21
+          {
+            let bVec = vec4<f32>(mm_Bsub[21u][c0], mm_Bsub[21u][c0+1u], mm_Bsub[21u][c0+2u], mm_Bsub[21u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][21u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][21u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][21u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][21u]), bVec, acc3);
+          }
+          // k=22
+          {
+            let bVec = vec4<f32>(mm_Bsub[22u][c0], mm_Bsub[22u][c0+1u], mm_Bsub[22u][c0+2u], mm_Bsub[22u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][22u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][22u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][22u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][22u]), bVec, acc3);
+          }
+          // k=23
+          {
+            let bVec = vec4<f32>(mm_Bsub[23u][c0], mm_Bsub[23u][c0+1u], mm_Bsub[23u][c0+2u], mm_Bsub[23u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][23u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][23u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][23u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][23u]), bVec, acc3);
+          }
+          // k=24
+          {
+            let bVec = vec4<f32>(mm_Bsub[24u][c0], mm_Bsub[24u][c0+1u], mm_Bsub[24u][c0+2u], mm_Bsub[24u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][24u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][24u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][24u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][24u]), bVec, acc3);
+          }
+          // k=25
+          {
+            let bVec = vec4<f32>(mm_Bsub[25u][c0], mm_Bsub[25u][c0+1u], mm_Bsub[25u][c0+2u], mm_Bsub[25u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][25u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][25u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][25u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][25u]), bVec, acc3);
+          }
+          // k=26
+          {
+            let bVec = vec4<f32>(mm_Bsub[26u][c0], mm_Bsub[26u][c0+1u], mm_Bsub[26u][c0+2u], mm_Bsub[26u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][26u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][26u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][26u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][26u]), bVec, acc3);
+          }
+          // k=27
+          {
+            let bVec = vec4<f32>(mm_Bsub[27u][c0], mm_Bsub[27u][c0+1u], mm_Bsub[27u][c0+2u], mm_Bsub[27u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][27u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][27u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][27u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][27u]), bVec, acc3);
+          }
+          // k=28
+          {
+            let bVec = vec4<f32>(mm_Bsub[28u][c0], mm_Bsub[28u][c0+1u], mm_Bsub[28u][c0+2u], mm_Bsub[28u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][28u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][28u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][28u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][28u]), bVec, acc3);
+          }
+          // k=29
+          {
+            let bVec = vec4<f32>(mm_Bsub[29u][c0], mm_Bsub[29u][c0+1u], mm_Bsub[29u][c0+2u], mm_Bsub[29u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][29u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][29u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][29u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][29u]), bVec, acc3);
+          }
+          // k=30
+          {
+            let bVec = vec4<f32>(mm_Bsub[30u][c0], mm_Bsub[30u][c0+1u], mm_Bsub[30u][c0+2u], mm_Bsub[30u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][30u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][30u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][30u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][30u]), bVec, acc3);
+          }
+          // k=31
+          {
+            let bVec = vec4<f32>(mm_Bsub[31u][c0], mm_Bsub[31u][c0+1u], mm_Bsub[31u][c0+2u], mm_Bsub[31u][c0+3u]);
+            acc0 = fma(vec4<f32>(mm_Asub[r0][31u]), bVec, acc0);
+            acc1 = fma(vec4<f32>(mm_Asub[r1][31u]), bVec, acc1);
+            acc2 = fma(vec4<f32>(mm_Asub[r2][31u]), bVec, acc2);
+            acc3 = fma(vec4<f32>(mm_Asub[r3][31u]), bVec, acc3);
+          }
+
+          workgroupBarrier();
+        }
+
+        // Write results
+        let outVec4Col = globalCol / 4u;
+        if (globalRow + 0u < M) { C[(globalRow + 0u) * Ndiv4 + outVec4Col] = acc0; }
+        if (globalRow + 1u < M) { C[(globalRow + 1u) * Ndiv4 + outVec4Col] = acc1; }
+        if (globalRow + 2u < M) { C[(globalRow + 2u) * Ndiv4 + outVec4Col] = acc2; }
+        if (globalRow + 3u < M) { C[(globalRow + 3u) * Ndiv4 + outVec4Col] = acc3; }
+      }
+    `;
+
+    class WebGPUMatmul {
+      constructor(device) { this.device = device; }
+
+      async init() {
+        const shaderModule = this.device.createShaderModule({ code: gemmShaderUnrolled });
+        this.bindGroupLayout = this.device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          ]
+        });
+        this.pipeline = this.device.createComputePipeline({
+          layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+          compute: { module: shaderModule, entryPoint: 'main' }
+        });
+      }
+
+      createBuffers(M, N, K) {
+        const device = this.device;
+        const uniformBuffer = device.createBuffer({ size: 12, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const bufferA = device.createBuffer({ size: M * K * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferB = device.createBuffer({ size: K * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferC = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readBuffer = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const bindGroup = device.createBindGroup({
+          layout: this.bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuffer } },
+            { binding: 1, resource: { buffer: bufferA } },
+            { binding: 2, resource: { buffer: bufferB } },
+            { binding: 3, resource: { buffer: bufferC } },
+          ]
+        });
+        return { uniformBuffer, bufferA, bufferB, bufferC, readBuffer, bindGroup };
+      }
+
+      async matmulReuse(a, b, M, N, K, buffers) {
+        const device = this.device;
+        device.queue.writeBuffer(buffers.uniformBuffer, 0, new Uint32Array([M, N, K]));
+        device.queue.writeBuffer(buffers.bufferA, 0, a);
+        device.queue.writeBuffer(buffers.bufferB, 0, b);
+        const TILE = 32;
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, buffers.bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(N / TILE), Math.ceil(M / TILE));
+        passEncoder.end();
+        commandEncoder.copyBufferToBuffer(buffers.bufferC, 0, buffers.readBuffer, 0, M * N * 4);
+        device.queue.submit([commandEncoder.finish()]);
+        await buffers.readBuffer.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(buffers.readBuffer.getMappedRange().slice(0));
+        buffers.readBuffer.unmap();
+        return result;
+      }
+
+      destroyBuffers(buffers) {
+        buffers.uniformBuffer.destroy();
+        buffers.bufferA.destroy();
+        buffers.bufferB.destroy();
+        buffers.bufferC.destroy();
+        buffers.readBuffer.destroy();
+      }
+    }
+
+    function cpuMatmul(a, b, M, N, K) {
+      const c = new Float32Array(M * N);
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < N; j++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) { sum += a[i * K + k] * b[k * N + j]; }
+          c[i * N + j] = sum;
+        }
+      }
+      return c;
+    }
+
+    function maxAbsDiff(a, b) {
+      let max = 0;
+      for (let i = 0; i < a.length; i++) { max = Math.max(max, Math.abs(a[i] - b[i])); }
+      return max;
+    }
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+      try {
+        if (!navigator.gpu) { log('ERROR: WebGPU not supported'); return; }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { log('ERROR: No WebGPU adapter found'); return; }
+        const device = await adapter.requestDevice();
+        log('WebGPU device ready');
+
+        const gpuMatmul = new WebGPUMatmul(device);
+        await gpuMatmul.init();
+        log('Fully unrolled GEMM kernel ready');
+
+        log('\nVerifying correctness...');
+        const testN = 64;
+        const testA = new Float32Array(testN * testN).map(() => Math.random());
+        const testB = new Float32Array(testN * testN).map(() => Math.random());
+        const testBuffers = gpuMatmul.createBuffers(testN, testN, testN);
+        const gpuResult = await gpuMatmul.matmulReuse(testA, testB, testN, testN, testN, testBuffers);
+        const cpuResult = cpuMatmul(testA, testB, testN, testN, testN);
+        const diff = maxAbsDiff(gpuResult, cpuResult);
+        log('Max abs diff from CPU: ' + diff.toExponential(2) + (diff < 0.001 ? ' ✓' : ' ✗'));
+        gpuMatmul.destroyBuffers(testBuffers);
+
+        log('\nLoading TensorFlow.js WebGPU backend...');
+        await tf.setBackend('webgpu');
+        await tf.ready();
+        log('tfjs WebGPU ready');
+
+        const sizes = [256, 512, 768, 1024, 1536, 2048, 3072, 4096];
+        const iters = 5;
+
+        log('\n=== BENCHMARK: Fully Unrolled vs tfjs ===\n');
+        log('Size | Ours (unrolled) | tfjs WebGPU | Ratio');
+        log('-----|-----------------|-------------|------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+          const buffers = gpuMatmul.createBuffers(n, n, n);
+          await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          await tf.matMul(tA, tB).data();
+
+          let ourTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+            ourTime = Math.min(ourTime, performance.now() - start);
+          }
+          gpuMatmul.destroyBuffers(buffers);
+
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            await res.data();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+          tA.dispose(); tB.dispose();
+
+          const ratio = (tfjsTime / ourTime).toFixed(2);
+          const win = parseFloat(ratio) >= 1.0 ? '✓' : '';
+          log(n.toString().padStart(4) + ' | ' + ourTime.toFixed(1).padStart(13) + 'ms | ' + tfjsTime.toFixed(1).padStart(9) + 'ms | ' + ratio.padStart(5) + 'x ' + win);
+        }
+        log('\nDONE');
+      } catch (e) { log('ERROR: ' + e.message); log(e.stack); }
+    };
+  </script>
+</body>
+</html>

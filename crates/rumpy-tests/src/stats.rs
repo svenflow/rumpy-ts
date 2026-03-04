@@ -96,19 +96,27 @@ mod tests {
     #[test]
     fn test_min() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        assert_eq!(CpuBackend::min(&a), 1.0);
+        assert_eq!(CpuBackend::min(&a).unwrap(), 1.0);
     }
 
     #[test]
     fn test_max() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        assert_eq!(CpuBackend::max(&a), 9.0);
+        assert_eq!(CpuBackend::max(&a).unwrap(), 9.0);
     }
 
     #[test]
     fn test_min_negative() {
         let a = arr(vec![-5.0, -2.0, -10.0, -1.0]);
-        assert_eq!(CpuBackend::min(&a), -10.0);
+        assert_eq!(CpuBackend::min(&a).unwrap(), -10.0);
+    }
+
+    #[test]
+    fn test_min_max_empty() {
+        // NumPy raises ValueError for empty arrays
+        let a = arr(vec![]);
+        assert!(CpuBackend::min(&a).is_err());
+        assert!(CpuBackend::max(&a).is_err());
     }
 
     // ============ argmin/argmax ============
@@ -116,13 +124,21 @@ mod tests {
     #[test]
     fn test_argmin() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0]);
-        assert_eq!(CpuBackend::argmin(&a), 1);
+        assert_eq!(CpuBackend::argmin(&a).unwrap(), 1);
     }
 
     #[test]
     fn test_argmax() {
         let a = arr(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
-        assert_eq!(CpuBackend::argmax(&a), 5);
+        assert_eq!(CpuBackend::argmax(&a).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_argmin_argmax_empty() {
+        // NumPy raises ValueError for empty arrays
+        let a = arr(vec![]);
+        assert!(CpuBackend::argmin(&a).is_err());
+        assert!(CpuBackend::argmax(&a).is_err());
     }
 
     // ============ sum_axis ============

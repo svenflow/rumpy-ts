@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-02-25T21:40:00Z",
+  "hardware": {
+    "cores": 14,
+    "rumpyThreads": 14
+  },
+  "summary": {
+    "conclusion": "WASM SIMD is inherently ~4-6x slower than native C code due to 128-bit SIMD limit and JIT overhead",
+    "best_approach": "parallel (rayon) for production use",
+    "vs_tfjs_xnnpack": {
+      "256x256": "2.9x slower with parallel, 4.6x slower single-threaded",
+      "512x512": "1.6x slower with parallel, 6.2x slower single-threaded",
+      "1024x1024": "1.7x slower with parallel, 6.5x slower single-threaded"
+    }
+  },
+  "benchmarks": {
+    "32": {
+      "rumpy-fma": 0.004,
+      "rumpy-parallel": 0.003,
+      "tfjs-wasm": 0.017
+    },
+    "64": {
+      "rumpy-fma": 0.064,
+      "rumpy-parallel": 0.082,
+      "tfjs-wasm": 0.020
+    },
+    "128": {
+      "rumpy-fma": 0.073,
+      "rumpy-parallel": 0.269,
+      "tfjs-wasm": 0.040
+    },
+    "256": {
+      "rumpy-fma": 0.697,
+      "rumpy-parallel": 0.399,
+      "tfjs-wasm": 0.126
+    },
+    "512": {
+      "rumpy-fma": 4.077,
+      "rumpy-parallel": 1.234,
+      "tfjs-wasm": 0.749
+    },
+    "768": {
+      "rumpy-fma": 12.375,
+      "rumpy-parallel": 3.446,
+      "tfjs-wasm": 2.325
+    },
+    "1024": {
+      "rumpy-fma": 35.398,
+      "rumpy-parallel": 9.104,
+      "tfjs-wasm": 5.370
+    }
+  },
+  "notes": [
+    "gemm crate (BLIS-style) was 28x slower - doesn't translate well to WASM",
+    "6x8 tile size matching XNNPACK gave ~15% improvement",
+    "XNNPACK-style vectorized A loading gave no improvement",
+    "FMA (f32x4.relaxed_madd) is being used correctly",
+    "Pre-packing B matrix didn't help since we pack every call anyway",
+    "WebGPU could be much faster for large matrices but requires GPU"
+  ]
+}

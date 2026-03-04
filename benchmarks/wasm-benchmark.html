@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WASM Numeric Libraries Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    h1 { color: #6366f1; }
+    pre {
+      background: #141414;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 400px;
+    }
+    button {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      margin: 0.5rem;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .results {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .card {
+      background: #141414;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .card h3 { color: #6366f1; margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #2a2a2a; }
+    .fastest { color: #22c55e; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>WASM Numeric Libraries Benchmark</h1>
+  <p>Comparing WASM-based numeric libraries: rumpy-ts, TensorFlow.js (WASM), ONNX Runtime Web</p>
+
+  <div>
+    <button id="runBtn" onclick="runBenchmarks()">▶ Run Benchmarks</button>
+    <button id="exportBtn" onclick="exportResults()" disabled>📥 Export JSON</button>
+  </div>
+
+  <pre id="log">Initializing libraries...</pre>
+
+  <div class="results" id="results"></div>
+
+  <!-- TensorFlow.js WASM backend -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+  <!-- jax-js (WebGPU/WASM) - import via module -->
+
+  <script type="module">
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    let results = {
+      timestamp: new Date().toISOString(),
+      config: { arraySize: 10000, matrixSize: 100, iterations: 100 },
+      libraries: [],
+      operations: {}
+    };
+
+    window.benchmarkResults = results;
+
+    // Initialize TensorFlow.js WASM
+    async function initTFJS() {
+      log('Initializing TensorFlow.js WASM backend...');
+      try {
+        await tf.setBackend('wasm');
+        await tf.ready();
+        const backend = tf.getBackend();
+        log(`✅ TensorFlow.js ready (backend: ${backend})`);
+        results.libraries.push('tensorflow.js-wasm');
+        return true;
+      } catch (e) {
+        log(`❌ TensorFlow.js WASM failed: ${e.message}`);
+        return false;
+      }
+    }
+
+    // Initialize rumpy-ts
+    async function initRumpy() {
+      log('Initializing rumpy-ts WASM...');
+      try {
+        const module = await import('./pkg-web/rumpy_wasm.js');
+        await module.default();  // Initialize WASM
+        window.rumpy = module;
+        log('✅ rumpy-ts ready');
+        results.libraries.push('rumpy-ts');
+        return true;
+      } catch (e) {
+        log(`❌ rumpy-ts failed: ${e.message}`);
+        return false;
+      }
+    }
+
+    // Initialize jax-js
+    async function initJaxJs() {
+      log('Initializing jax-js (WebGPU/WASM)...');
+      try {
+        const jax = await import('@jax-js/jax');
+        // jax-js exports { numpy as np }
+        window.np = jax.numpy;
+        log('✅ jax-js ready');
+        results.libraries.push('jax-js');
+        return true;
+      } catch (e) {
+        log(`❌ jax-js failed: ${e.message}`);
+        return false;
+      }
+    }
+
+    // Benchmark utility
+    function benchmark(name, fn, iterations = 100) {
+      // Warmup
+      for (let i = 0; i < 5; i++) fn();
+
+      const times = [];
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        fn();
+        times.push(performance.now() - start);
+      }
+
+      times.sort((a, b) => a - b);
+      const trimmed = times.slice(Math.floor(times.length * 0.05), Math.floor(times.length * 0.95));
+      const mean = trimmed.reduce((a, b) => a + b, 0) / trimmed.length;
+
+      return mean;
+    }
+
+    function randomArray(size) {
+      return new Float64Array(size).map(() => Math.random());
+    }
+
+    async function runBenchmarks() {
+      document.getElementById('runBtn').disabled = true;
+      logEl.textContent = 'Running benchmarks...';
+
+      const size = 10000;
+      const matrixSize = 100;
+      const iterations = 100;
+
+      const data1 = randomArray(size);
+      const data2 = randomArray(size);
+
+      log(`\nConfig: array=${size}, matrix=${matrixSize}x${matrixSize}, iterations=${iterations}`);
+
+      // ===== ELEMENT-WISE ADD =====
+      log('\n--- ADD ---');
+      results.operations.add = {};
+
+      // rumpy-ts
+      if (window.rumpy) {
+        try {
+          const r1 = rumpy.arrayFromTyped(data1, new Uint32Array([size]));
+          const r2 = rumpy.arrayFromTyped(data2, new Uint32Array([size]));
+          const time = benchmark('rumpy add', () => {
+            const r = r1.add(r2);
+            r.free();
+          }, iterations);
+          results.operations.add['rumpy-ts'] = time;
+          log(`rumpy-ts add: ${time.toFixed(3)}ms`);
+          r1.free();
+          r2.free();
+        } catch (e) {
+          log(`rumpy-ts add error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js
+      if (tf.getBackend()) {
+        const t1 = tf.tensor1d(Array.from(data1));
+        const t2 = tf.tensor1d(Array.from(data2));
+        const time = benchmark('tfjs add', () => {
+          const r = tf.add(t1, t2);
+          r.dataSync(); // Force execution
+          r.dispose();
+        }, iterations);
+        results.operations.add['tensorflow.js'] = time;
+        log(`tensorflow.js add: ${time.toFixed(3)}ms`);
+        t1.dispose();
+        t2.dispose();
+      }
+
+      // jax-js
+      if (window.np) {
+        try {
+          const j1 = np.array(Array.from(data1));
+          const j2 = np.array(Array.from(data2));
+          const time = benchmark('jax add', () => {
+            const r = np.add(j1, j2);
+            r.toArray(); // Force execution
+          }, iterations);
+          results.operations.add['jax-js'] = time;
+          log(`jax-js add: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`jax-js add error: ${e.message}`);
+        }
+      }
+
+      // Native JS baseline
+      const timeNative = benchmark('native add', () => {
+        const result = new Float64Array(size);
+        for (let i = 0; i < size; i++) result[i] = data1[i] + data2[i];
+      }, iterations);
+      results.operations.add['native'] = timeNative;
+      log(`native add: ${timeNative.toFixed(3)}ms`);
+
+      // ===== MULTIPLY =====
+      log('\n--- MULTIPLY ---');
+      results.operations.mul = {};
+
+      // rumpy-ts
+      if (window.rumpy) {
+        try {
+          const r1 = rumpy.arrayFromTyped(data1, new Uint32Array([size]));
+          const r2 = rumpy.arrayFromTyped(data2, new Uint32Array([size]));
+          const time = benchmark('rumpy mul', () => {
+            const r = r1.mul(r2);
+            r.free();
+          }, iterations);
+          results.operations.mul['rumpy-ts'] = time;
+          log(`rumpy-ts mul: ${time.toFixed(3)}ms`);
+          r1.free();
+          r2.free();
+        } catch (e) {
+          log(`rumpy-ts mul error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js
+      if (tf.getBackend()) {
+        const t1 = tf.tensor1d(Array.from(data1));
+        const t2 = tf.tensor1d(Array.from(data2));
+        const time = benchmark('tfjs mul', () => {
+          const r = tf.mul(t1, t2);
+          r.dataSync();
+          r.dispose();
+        }, iterations);
+        results.operations.mul['tensorflow.js'] = time;
+        log(`tensorflow.js mul: ${time.toFixed(3)}ms`);
+        t1.dispose();
+        t2.dispose();
+      }
+
+      // jax-js multiply
+      if (window.np) {
+        try {
+          const j1 = np.array(Array.from(data1));
+          const j2 = np.array(Array.from(data2));
+          const time = benchmark('jax mul', () => {
+            const r = np.multiply(j1, j2);
+            r.toArray();
+          }, iterations);
+          results.operations.mul['jax-js'] = time;
+          log(`jax-js mul: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`jax-js mul error: ${e.message}`);
+        }
+      }
+
+      // ===== MATMUL =====
+      log('\n--- MATMUL ---');
+      results.operations.matmul = {};
+
+      const n = matrixSize;
+      const matData1 = randomArray(n * n);
+      const matData2 = randomArray(n * n);
+      const matData1_f32 = new Float32Array(matData1);
+      const matData2_f32 = new Float32Array(matData2);
+
+      // rumpy-ts f64 (original)
+      if (window.rumpy) {
+        try {
+          const m1 = rumpy.arrayFromTyped(matData1, new Uint32Array([n, n]));
+          const m2 = rumpy.arrayFromTyped(matData2, new Uint32Array([n, n]));
+          const time = benchmark('rumpy matmul f64', () => {
+            const r = rumpy.matmul(m1, m2);
+            r.free();
+          }, Math.floor(iterations / 2));
+          results.operations.matmul['rumpy-ts-f64'] = time;
+          log(`rumpy-ts matmul (f64): ${time.toFixed(3)}ms`);
+          m1.free();
+          m2.free();
+        } catch (e) {
+          log(`rumpy-ts matmul f64 error: ${e.message}`);
+        }
+      }
+
+      // rumpy-ts f32 (XNNPACK-style SIMD)
+      if (window.rumpy && window.rumpy.matmulF32) {
+        try {
+          const time = benchmark('rumpy matmul f32', () => {
+            rumpy.matmulF32(matData1_f32, matData2_f32, n, n, n);
+          }, Math.floor(iterations / 2));
+          results.operations.matmul['rumpy-ts-f32'] = time;
+          log(`rumpy-ts matmul (f32 SIMD): ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`rumpy-ts matmul f32 error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js (uses f32 internally via XNNPACK)
+      if (tf.getBackend()) {
+        const t1 = tf.tensor2d(Array.from(matData1), [n, n]);
+        const t2 = tf.tensor2d(Array.from(matData2), [n, n]);
+        const time = benchmark('tfjs matmul', () => {
+          const r = tf.matMul(t1, t2);
+          r.dataSync();
+          r.dispose();
+        }, Math.floor(iterations / 2));
+        results.operations.matmul['tensorflow.js'] = time;
+        log(`tensorflow.js matmul (XNNPACK): ${time.toFixed(3)}ms`);
+        t1.dispose();
+        t2.dispose();
+      }
+
+      // jax-js matmul
+      if (window.np) {
+        try {
+          const j1 = np.array(Array.from(matData1)).reshape([n, n]);
+          const j2 = np.array(Array.from(matData2)).reshape([n, n]);
+          const time = benchmark('jax matmul', () => {
+            const r = np.dot(j1, j2);
+            r.toArray();
+          }, Math.floor(iterations / 2));
+          results.operations.matmul['jax-js'] = time;
+          log(`jax-js matmul: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`jax-js matmul error: ${e.message}`);
+        }
+      }
+
+      // ===== SUM =====
+      log('\n--- SUM ---');
+      results.operations.sum = {};
+
+      // rumpy-ts
+      if (window.rumpy) {
+        try {
+          const r1 = rumpy.arrayFromTyped(data1, new Uint32Array([size]));
+          const time = benchmark('rumpy sum', () => {
+            r1.sum();
+          }, iterations);
+          results.operations.sum['rumpy-ts'] = time;
+          log(`rumpy-ts sum: ${time.toFixed(3)}ms`);
+          r1.free();
+        } catch (e) {
+          log(`rumpy-ts sum error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js
+      if (tf.getBackend()) {
+        const t1 = tf.tensor1d(Array.from(data1));
+        const time = benchmark('tfjs sum', () => {
+          const r = tf.sum(t1);
+          r.dataSync();
+          r.dispose();
+        }, iterations);
+        results.operations.sum['tensorflow.js'] = time;
+        log(`tensorflow.js sum: ${time.toFixed(3)}ms`);
+        t1.dispose();
+      }
+
+      // Native
+      const timeSumNative = benchmark('native sum', () => {
+        data1.reduce((a, b) => a + b, 0);
+      }, iterations);
+      results.operations.sum['native'] = timeSumNative;
+      log(`native sum: ${timeSumNative.toFixed(3)}ms`);
+
+      // ===== MEAN =====
+      log('\n--- MEAN ---');
+      results.operations.mean = {};
+
+      // rumpy-ts
+      if (window.rumpy) {
+        try {
+          const r1 = rumpy.arrayFromTyped(data1, new Uint32Array([size]));
+          const time = benchmark('rumpy mean', () => {
+            r1.mean();
+          }, iterations);
+          results.operations.mean['rumpy-ts'] = time;
+          log(`rumpy-ts mean: ${time.toFixed(3)}ms`);
+          r1.free();
+        } catch (e) {
+          log(`rumpy-ts mean error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js
+      if (tf.getBackend()) {
+        const t1 = tf.tensor1d(Array.from(data1));
+        const time = benchmark('tfjs mean', () => {
+          const r = tf.mean(t1);
+          r.dataSync();
+          r.dispose();
+        }, iterations);
+        results.operations.mean['tensorflow.js'] = time;
+        log(`tensorflow.js mean: ${time.toFixed(3)}ms`);
+        t1.dispose();
+      }
+
+      // ===== CHAINED OPERATIONS (where jax-js shines) =====
+      log('\n--- CHAINED OPS (matmul + add + mean) ---');
+      results.operations.chained = {};
+
+      // rumpy-ts chained
+      if (window.rumpy) {
+        try {
+          const m1 = rumpy.arrayFromTyped(matData1, new Uint32Array([n, n]));
+          const m2 = rumpy.arrayFromTyped(matData2, new Uint32Array([n, n]));
+          const time = benchmark('rumpy chained', () => {
+            const mm = rumpy.matmul(m1, m2);
+            const added = mm.add(m1);
+            const result = added.mean();
+            mm.free();
+            added.free();
+          }, Math.floor(iterations / 2));
+          results.operations.chained['rumpy-ts'] = time;
+          log(`rumpy-ts chained: ${time.toFixed(3)}ms`);
+          m1.free();
+          m2.free();
+        } catch (e) {
+          log(`rumpy-ts chained error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js chained
+      if (tf.getBackend()) {
+        const t1 = tf.tensor2d(Array.from(matData1), [n, n]);
+        const t2 = tf.tensor2d(Array.from(matData2), [n, n]);
+        const time = benchmark('tfjs chained', () => {
+          const mm = tf.matMul(t1, t2);
+          const added = tf.add(mm, t1);
+          const result = tf.mean(added);
+          result.dataSync();
+          mm.dispose();
+          added.dispose();
+          result.dispose();
+        }, Math.floor(iterations / 2));
+        results.operations.chained['tensorflow.js'] = time;
+        log(`tensorflow.js chained: ${time.toFixed(3)}ms`);
+        t1.dispose();
+        t2.dispose();
+      }
+
+      // jax-js chained (should benefit from JIT compilation)
+      if (window.np) {
+        try {
+          const j1 = np.array(Array.from(matData1)).reshape([n, n]);
+          const j2 = np.array(Array.from(matData2)).reshape([n, n]);
+          const time = benchmark('jax chained', () => {
+            const mm = np.dot(j1, j2);
+            const added = np.add(mm, j1);
+            const result = np.mean(added);
+            result.toArray();
+          }, Math.floor(iterations / 2));
+          results.operations.chained['jax-js'] = time;
+          log(`jax-js chained: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`jax-js chained error: ${e.message}`);
+        }
+      }
+
+      // ===== LINEAR REGRESSION (bigger chained test) =====
+      log('\n--- LINEAR REGRESSION PIPELINE ---');
+      results.operations['linear-regression'] = {};
+
+      const nSamples = 1000;
+      const X = new Float64Array(nSamples).map(() => Math.random() * 10);
+      const y = new Float64Array(nSamples).map((_, i) => 3 * X[i] + 2 + (Math.random() - 0.5) * 2);
+
+      // rumpy-ts linear regression
+      if (window.rumpy) {
+        try {
+          const time = benchmark('rumpy linreg', () => {
+            const XwBias = new Float64Array(nSamples * 2);
+            for (let i = 0; i < nSamples; i++) {
+              XwBias[i * 2] = X[i];
+              XwBias[i * 2 + 1] = 1;
+            }
+            const Xmat = rumpy.arrayFromTyped(XwBias, new Uint32Array([nSamples, 2]));
+            const Ymat = rumpy.arrayFromTyped(y, new Uint32Array([nSamples, 1]));
+            const Xt = Xmat.transpose();
+            const XtX = rumpy.matmul(Xt, Xmat);
+            const XtXinv = rumpy.inv(XtX);
+            const XtY = rumpy.matmul(Xt, Ymat);
+            const w = rumpy.matmul(XtXinv, XtY);
+            Xmat.free(); Ymat.free(); Xt.free(); XtX.free(); XtXinv.free(); XtY.free(); w.free();
+          }, Math.floor(iterations / 2));
+          results.operations['linear-regression']['rumpy-ts'] = time;
+          log(`rumpy-ts linreg: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`rumpy-ts linreg error: ${e.message}`);
+        }
+      }
+
+      // TensorFlow.js linear regression (skip pinv, not available in WASM backend)
+      // Will only test matmul-based operations for now
+
+      // jax-js linear regression
+      if (window.jax && window.np.linalg) {
+        try {
+          const time = benchmark('jax linreg', () => {
+            const XwBias = [];
+            for (let i = 0; i < nSamples; i++) {
+              XwBias.push([X[i], 1]);
+            }
+            const Xmat = np.array(XwBias);
+            const Ymat = np.array(Array.from(y).map(v => [v]));
+            const Xt = np.transpose(Xmat);
+            const XtX = np.dot(Xt, Xmat);
+            const XtXinv = np.linalg.inv(XtX);
+            const XtY = np.dot(Xt, Ymat);
+            const w = np.dot(XtXinv, XtY);
+            w.toArray();
+          }, Math.floor(iterations / 2));
+          results.operations['linear-regression']['jax-js'] = time;
+          log(`jax-js linreg: ${time.toFixed(3)}ms`);
+        } catch (e) {
+          log(`jax-js linreg error: ${e.message}`);
+        }
+      }
+
+      log('\n✅ Benchmarks complete!');
+      log('\nJSON_RESULT:' + JSON.stringify(results));
+
+      // Display results
+      displayResults();
+      document.getElementById('runBtn').disabled = false;
+      document.getElementById('exportBtn').disabled = false;
+
+      // Signal completion for headless runner
+      window.benchmarkComplete = true;
+      window.benchmarkResults = results;
+    }
+
+    function displayResults() {
+      const container = document.getElementById('results');
+      container.innerHTML = '';
+
+      for (const [op, libs] of Object.entries(results.operations)) {
+        const card = document.createElement('div');
+        card.className = 'card';
+
+        const times = Object.entries(libs).sort((a, b) => a[1] - b[1]);
+        const fastest = times[0]?.[0];
+
+        let tableHtml = `<h3>${op.toUpperCase()}</h3><table><tr><th>Library</th><th>Time (ms)</th></tr>`;
+        for (const [lib, time] of times) {
+          const cls = lib === fastest ? 'fastest' : '';
+          tableHtml += `<tr class="${cls}"><td>${lib}</td><td>${time.toFixed(3)}${lib === fastest ? ' ⭐' : ''}</td></tr>`;
+        }
+        tableHtml += '</table>';
+
+        card.innerHTML = tableHtml;
+        container.appendChild(card);
+      }
+    }
+
+    window.exportResults = function() {
+      const blob = new Blob([JSON.stringify(results, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wasm-benchmark-results.json';
+      a.click();
+    };
+
+    window.runBenchmarks = runBenchmarks;
+
+    // Initialize on load
+    async function init() {
+      await initTFJS();
+      await initRumpy();
+      await initJaxJs();
+      log('\nReady! Click "Run Benchmarks" to start.');
+      window.benchmarkReady = true;
+    }
+
+    init();
+  </script>
+</body>
+</html>

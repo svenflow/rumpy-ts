@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-02-26T00:11:34.567Z",
+  "config": {
+    "arraySize": 10000,
+    "matrixSize": 100,
+    "iterations": 100
+  },
+  "libraries": [
+    "tensorflow.js-wasm",
+    "rumpy-ts",
+    "jax-js"
+  ],
+  "operations": {
+    "add": {
+      "rumpy-ts": 0.04477777216169569,
+      "tensorflow.js": 0.018944443596733942,
+      "native": 0.013111111852857802
+    },
+    "mul": {
+      "rumpy-ts": 0.03333333068423801,
+      "tensorflow.js": 0.015055561065673828
+    },
+    "matmul": {
+      "rumpy-ts": 0.18911111089918348,
+      "tensorflow.js": 0.04055555661519369
+    },
+    "sum": {
+      "rumpy-ts": 0.0027777751286824546,
+      "tensorflow.js": 0.019944447941250273,
+      "native": 0.06955555544959174
+    },
+    "mean": {
+      "rumpy-ts": 0.000888885392083062,
+      "tensorflow.js": 0.01583334075080024
+    },
+    "chained": {
+      "rumpy-ts": 0.17066667874654134,
+      "tensorflow.js": 0.04233332210116916
+    },
+    "linear-regression": {
+      "rumpy-ts": 0.05744444529215495
+    }
+  }
+}

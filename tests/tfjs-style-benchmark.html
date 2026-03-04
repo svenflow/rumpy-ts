@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>tfjs-style Matmul Benchmark</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    h2 { color: #00ff88; margin-top: 30px; }
+    .status {
+      padding: 10px 20px;
+      background: #0f3460;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    button {
+      background: #00d9ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-bottom: 10px;
+    }
+    button:hover { background: #00b8d4; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: right;
+      border-bottom: 1px solid #333;
+    }
+    th { background: #0f3460; text-align: left; }
+    td:first-child { text-align: left; }
+    .winner { background: #1a3a1a; }
+    .loser { background: #3a1a1a; }
+    .info { background: #0f3460; padding: 15px 20px; border-radius: 8px; margin: 20px 0; }
+    pre { background: #16213e; padding: 15px; border-radius: 8px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>tfjs-style Matmul Shader</h1>
+  <p>Testing a shader that mimics tfjs's approach: each thread computes multiple output elements (workPerThread pattern)</p>
+
+  <div class="info">
+    <strong>Environment:</strong> <span id="env">Checking...</span><br>
+    <strong>GPU:</strong> <span id="gpu">Checking...</span><br>
+    <strong>WebGPU:</strong> <span id="webgpu-status">Checking...</span>
+  </div>
+
+  <div class="status" id="status">Ready</div>
+
+  <button onclick="runBenchmark()">Run Benchmark</button>
+  <button onclick="runCorrectness()">Verify Correctness</button>
+
+  <div id="results"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.min.js"></script>
+
+  <script type="module">
+    const WARMUP_RUNS = 5;
+    const BENCHMARK_RUNS = 15;
+    const SIZES = [512, 1024, 2048, 4096];
+
+    let gpuDevice = null;
+    const shaderCache = new Map();
+
+    document.getElementById('env').textContent =
+      `Chrome ${navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'unknown'}` +
+      (navigator.userAgent.includes('HeadlessChrome') ? ' (Headless/Playwright)' : ' (Native)');
+
+    // ============ tfjs-style Shader ============
+    // Key differences from our previous shaders:
+    // 1. Each thread computes 4x4 = 16 output elements (rowPerThread=4, colPerThread=4)
+    // 2. Uses 8x8 workgroup = 64 threads, each computing 4x4 outputs = 32x32 tile per workgroup
+    // 3. Loads A and B tiles with explicit coalescing
+    // 4. Caches B values in registers before iterating over A
+    //
+    // Shared memory: 32 * 32 = 1024 floats = 4KB for A, same for B = 8KB total (under 16KB)
+    const TFJS_STYLE_SHADER = `
+      struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+
+      // Tile dimensions
+      const TILE_M: u32 = 32u;  // rowPerThread=4 * workgroupY=8
+      const TILE_N: u32 = 32u;  // colPerThread=4 * workgroupX=8
+      const TILE_K: u32 = 32u;  // tileInner
+
+      // Per-thread work
+      const ROW_PER_THREAD: u32 = 4u;
+      const COL_PER_THREAD: u32 = 4u;
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+      // Shared memory (with padding to avoid bank conflicts)
+      var<workgroup> mm_Asub: array<array<f32, 33>, 32>;  // [TILE_K][TILE_M + padding]
+      var<workgroup> mm_Bsub: array<array<f32, 33>, 32>;  // [TILE_K][TILE_N + padding]
+
+      @compute @workgroup_size(8, 8)
+      fn main(
+        @builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>
+      ) {
+        let K = uniforms.K;
+        let N = uniforms.N;
+        let M = uniforms.M;
+
+        let localRow = lid.y;
+        let localCol = lid.x;
+
+        // Which row/col of the output tile this thread starts at
+        let tileRow = localRow * ROW_PER_THREAD;
+        let tileCol = localCol * COL_PER_THREAD;
+
+        // Global row/col for this thread's output
+        let globalRowStart = wid.y * TILE_M + tileRow;
+        let globalColStart = wid.x * TILE_N + tileCol;
+
+        // Accumulators for 4x4 output per thread = 16 registers
+        var acc: array<array<f32, 4>, 4>;
+        for (var i = 0u; i < 4u; i++) {
+          for (var j = 0u; j < 4u; j++) {
+            acc[i][j] = 0.0;
+          }
+        }
+
+        let numTiles = K / TILE_K;
+
+        for (var t: u32 = 0u; t < numTiles; t++) {
+          // ===== Load A tile: 64 threads loading 32x32 = 1024 elements = 16 per thread =====
+          // Each thread loads 16 elements (4 rows * 4 cols pattern doesn't match well)
+          // Better: each thread loads a contiguous chunk
+          let tid = localRow * 8u + localCol;  // 0..63
+          let elementsPerThread = 16u;  // 1024 / 64
+
+          for (var i = 0u; i < elementsPerThread; i++) {
+            let idx = tid * elementsPerThread + i;
+            let loadK = idx / TILE_M;  // 0..31
+            let loadRow = idx % TILE_M;  // 0..31
+            let globalARow = wid.y * TILE_M + loadRow;
+            let globalACol = t * TILE_K + loadK;
+            mm_Asub[loadK][loadRow] = A[globalARow * K + globalACol];
+          }
+
+          // ===== Load B tile: same pattern =====
+          for (var i = 0u; i < elementsPerThread; i++) {
+            let idx = tid * elementsPerThread + i;
+            let loadK = idx / TILE_N;  // 0..31
+            let loadCol = idx % TILE_N;  // 0..31
+            let globalBRow = t * TILE_K + loadK;
+            let globalBCol = wid.x * TILE_N + loadCol;
+            mm_Bsub[loadK][loadCol] = B[globalBRow * N + globalBCol];
+          }
+
+          workgroupBarrier();
+
+          // ===== Compute 4x4 outputs =====
+          for (var k = 0u; k < TILE_K; k++) {
+            // Cache B values for this k in registers (critical for performance)
+            var BCached: array<f32, 4>;
+            for (var j = 0u; j < 4u; j++) {
+              BCached[j] = mm_Bsub[k][tileCol + j];
+            }
+
+            // For each of our 4 output rows, accumulate with the cached B
+            for (var i = 0u; i < 4u; i++) {
+              let AVal = mm_Asub[k][tileRow + i];
+              for (var j = 0u; j < 4u; j++) {
+                acc[i][j] = fma(AVal, BCached[j], acc[i][j]);
+              }
+            }
+          }
+
+          workgroupBarrier();
+        }
+
+        // ===== Write outputs =====
+        for (var i = 0u; i < 4u; i++) {
+          let globalRow = globalRowStart + i;
+          if (globalRow < M) {
+            for (var j = 0u; j < 4u; j++) {
+              let globalCol = globalColStart + j;
+              if (globalCol < N) {
+                C[globalRow * N + globalCol] = acc[i][j];
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    // ============ WebGPU Init ============
+    async function initWebGPU() {
+      if (!navigator.gpu) throw new Error('WebGPU not supported');
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error('No WebGPU adapter');
+      gpuDevice = await adapter.requestDevice({
+        requiredLimits: { maxStorageBufferBindingSize: 1024 * 1024 * 1024, maxBufferSize: 1024 * 1024 * 1024 }
+      });
+      document.getElementById('gpu').textContent = adapter.name || 'Unknown';
+      document.getElementById('webgpu-status').textContent = 'READY';
+      return gpuDevice;
+    }
+
+    // ============ rumpy matmul ============
+    async function rumpyMatmul(M, K, N, aData, bData) {
+      const uniformBuffer = gpuDevice.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N, 0]));
+
+      const aBuffer = gpuDevice.createBuffer({ size: aData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(aBuffer, 0, aData);
+
+      const bBuffer = gpuDevice.createBuffer({ size: bData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      gpuDevice.queue.writeBuffer(bBuffer, 0, bData);
+
+      const cBuffer = gpuDevice.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+      let pipeline = shaderCache.get('tfjs-style');
+      if (!pipeline) {
+        const module = gpuDevice.createShaderModule({ code: TFJS_STYLE_SHADER });
+        pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+        shaderCache.set('tfjs-style', pipeline);
+      }
+
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: { buffer: aBuffer } },
+          { binding: 2, resource: { buffer: bBuffer } },
+          { binding: 3, resource: { buffer: cBuffer } },
+        ],
+      });
+
+      const commandEncoder = gpuDevice.createCommandEncoder();
+      const pass = commandEncoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      // Dispatch: each workgroup handles 32x32 output tile
+      pass.dispatchWorkgroups(Math.ceil(N / 32), Math.ceil(M / 32));
+      pass.end();
+
+      const stagingBuffer = gpuDevice.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, M * N * 4);
+      gpuDevice.queue.submit([commandEncoder.finish()]);
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(stagingBuffer.getMappedRange().slice(0));
+      stagingBuffer.unmap();
+
+      uniformBuffer.destroy(); aBuffer.destroy(); bBuffer.destroy(); cBuffer.destroy(); stagingBuffer.destroy();
+      return result;
+    }
+
+    // ============ CPU Reference ============
+    function cpuMatmul(M, K, N, aData, bData) {
+      const result = new Float32Array(M * N);
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) {
+            sum += aData[m * K + k] * bData[k * N + n];
+          }
+          result[m * N + n] = sum;
+        }
+      }
+      return result;
+    }
+
+    function setStatus(msg) { document.getElementById('status').textContent = msg; }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function median(arr) {
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    async function runCorrectness() {
+      await initWebGPU();
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '<h2>Testing Correctness...</h2>';
+
+      const testSizes = [64, 128, 256, 512];
+      let html = '<h2>Correctness Results</h2>';
+
+      for (const size of testSizes) {
+        setStatus(`Testing ${size}x${size}...`);
+        const M = size, K = size, N = size;
+
+        const aData = new Float32Array(M * K);
+        const bData = new Float32Array(K * N);
+        for (let i = 0; i < M * K; i++) aData[i] = (i % 17) * 0.1 - 0.8;
+        for (let i = 0; i < K * N; i++) bData[i] = (i % 13) * 0.1 - 0.6;
+
+        const cpuResult = cpuMatmul(M, K, N, aData, bData);
+        const gpuResult = await rumpyMatmul(M, K, N, aData, bData);
+
+        let maxRelError = 0;
+        let errorIdx = -1;
+        for (let i = 0; i < M * N; i++) {
+          const cpu = cpuResult[i];
+          const gpu = gpuResult[i];
+          const absErr = Math.abs(cpu - gpu);
+          const relErr = Math.abs(cpu) > 1e-6 ? absErr / Math.abs(cpu) : absErr;
+          if (relErr > maxRelError) {
+            maxRelError = relErr;
+            errorIdx = i;
+          }
+        }
+
+        const passed = maxRelError < 0.01;
+        html += `<p>${size}x${size}: ${passed ? '✓ PASS' : '✗ FAIL'} (max relative error: ${(maxRelError * 100).toFixed(4)}%`;
+        if (!passed && errorIdx >= 0) {
+          html += `, at idx ${errorIdx}: CPU=${cpuResult[errorIdx].toFixed(4)}, GPU=${gpuResult[errorIdx].toFixed(4)}`;
+        }
+        html += `)</p>`;
+        html += `<p style="font-size: 11px; color: #888;">First 5 GPU: [${Array.from(gpuResult.slice(0, 5)).map(x => x.toFixed(4)).join(', ')}]</p>`;
+        html += `<p style="font-size: 11px; color: #888;">First 5 CPU: [${Array.from(cpuResult.slice(0, 5)).map(x => x.toFixed(4)).join(', ')}]</p>`;
+      }
+
+      resultsDiv.innerHTML = html;
+      setStatus('Complete!');
+    }
+
+    async function runBenchmark() {
+      await initWebGPU();
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '<h2>Running Benchmark...</h2>';
+
+      // Init tfjs
+      try {
+        await tf.setBackend('webgpu');
+        await tf.ready();
+      } catch (e) {
+        resultsDiv.innerHTML = `<h2>Error: tfjs init failed</h2><p>${e}</p>`;
+        return;
+      }
+
+      let html = '<h2>Benchmark Results</h2>';
+      html += '<table><tr><th>Size</th><th>rumpy (ms)</th><th>rumpy GFLOPS</th><th>tfjs (ms)</th><th>tfjs GFLOPS</th><th>Winner</th></tr>';
+
+      for (const size of SIZES) {
+        setStatus(`Benchmarking ${size}x${size}...`);
+        const M = size, K = size, N = size;
+        const flops = 2 * M * N * K;
+
+        const aData = new Float32Array(M * K);
+        const bData = new Float32Array(K * N);
+        for (let i = 0; i < M * K; i++) aData[i] = Math.random();
+        for (let i = 0; i < K * N; i++) bData[i] = Math.random();
+
+        // Warmup rumpy
+        for (let i = 0; i < WARMUP_RUNS; i++) await rumpyMatmul(M, K, N, aData, bData);
+        await sleep(100);
+
+        // Benchmark rumpy
+        const rumpyTimes = [];
+        for (let i = 0; i < BENCHMARK_RUNS; i++) {
+          const start = performance.now();
+          await rumpyMatmul(M, K, N, aData, bData);
+          rumpyTimes.push(performance.now() - start);
+        }
+        await sleep(100);
+
+        // Warmup tfjs
+        const a = tf.tensor2d(aData, [M, K]);
+        const b = tf.tensor2d(bData, [K, N]);
+        for (let i = 0; i < WARMUP_RUNS; i++) {
+          const c = tf.matMul(a, b);
+          await c.data();
+          c.dispose();
+        }
+        await sleep(100);
+
+        // Benchmark tfjs
+        const tfjsTimes = [];
+        for (let i = 0; i < BENCHMARK_RUNS; i++) {
+          const start = performance.now();
+          const c = tf.matMul(a, b);
+          await c.data();
+          c.dispose();
+          tfjsTimes.push(performance.now() - start);
+        }
+        a.dispose();
+        b.dispose();
+
+        const rumpyMedian = median(rumpyTimes);
+        const tfjsMedian = median(tfjsTimes);
+        const rumpyGflops = (flops / (rumpyMedian / 1000)) / 1e9;
+        const tfjsGflops = (flops / (tfjsMedian / 1000)) / 1e9;
+
+        const winner = rumpyMedian < tfjsMedian ? 'rumpy' : 'tfjs';
+        const ratio = winner === 'rumpy'
+          ? (tfjsMedian / rumpyMedian).toFixed(2)
+          : (rumpyMedian / tfjsMedian).toFixed(2);
+
+        html += `<tr class="${winner === 'rumpy' ? 'winner' : 'loser'}">`;
+        html += `<td>${size}x${size}</td>`;
+        html += `<td>${rumpyMedian.toFixed(2)}</td>`;
+        html += `<td>${rumpyGflops.toFixed(0)}</td>`;
+        html += `<td>${tfjsMedian.toFixed(2)}</td>`;
+        html += `<td>${tfjsGflops.toFixed(0)}</td>`;
+        html += `<td><strong>${winner}</strong> ${ratio}x</td>`;
+        html += '</tr>';
+
+        await sleep(200);
+      }
+
+      html += '</table>';
+      resultsDiv.innerHTML = html;
+      setStatus('Complete!');
+    }
+
+    window.runBenchmark = runBenchmark;
+    window.runCorrectness = runCorrectness;
+
+    initWebGPU().catch(e => {
+      document.getElementById('webgpu-status').textContent = 'FAILED: ' + e.message;
+    });
+  </script>
+</body>
+</html>

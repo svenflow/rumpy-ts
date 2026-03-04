@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebGPU GEMM 8x8 Coalesced</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+</head>
+<body>
+  <h1>WebGPU GEMM - 8x8 Coalesced Memory Access</h1>
+  <p>64 outputs/thread, coalesced global loads, 8x8 workgroup</p>
+  <pre id="output">Click the button to run benchmark</pre>
+  <button id="run">Run Benchmark</button>
+  <script type="module">
+    const output = document.getElementById('output');
+    const log = (msg) => { output.textContent += '\n' + msg; console.log(msg); };
+
+    // Key insight: consecutive threads should access consecutive memory addresses
+    // A[row][k]: rows are contiguous, so load by rows (tidy controls row)
+    // B[k][col]: cols are strided, so load by cols (tidx controls col)
+    // For coalescing: threads (0,0), (1,0), (2,0)... should load consecutive addresses
+    const gemmShaderCoalesced = `
+      struct Uniforms {
+        M: u32,
+        N: u32,
+        K: u32,
+      }
+
+      @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+      @group(0) @binding(1) var<storage, read> A: array<f32>;
+      @group(0) @binding(2) var<storage, read> B: array<f32>;
+      @group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+      // Config: 64x64 tile per workgroup, 8x8 threads
+      // Each thread: 8x8 outputs (64 total)
+      const TS: u32 = 64u;
+      const TSK: u32 = 8u;
+      const WPT: u32 = 8u;
+
+      var<workgroup> Asub: array<array<f32, TSK>, TS>;  // [64][8]
+      var<workgroup> Bsub: array<array<f32, TS>, TSK>;  // [8][64] - B row-major for coalesced reads
+
+      @compute @workgroup_size(8, 8)
+      fn main(
+        @builtin(local_invocation_id) local_id: vec3<u32>,
+        @builtin(workgroup_id) workgroup_id: vec3<u32>
+      ) {
+        let M = uniforms.M;
+        let N = uniforms.N;
+        let K = uniforms.K;
+
+        let tidx = local_id.x;
+        let tidy = local_id.y;
+
+        let row = workgroup_id.y * TS + tidy * WPT;
+        let col = workgroup_id.x * TS + tidx * WPT;
+
+        var acc: array<array<vec4<f32>, 2>, 8>;
+        for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+          acc[i][0] = vec4<f32>(0.0);
+          acc[i][1] = vec4<f32>(0.0);
+        }
+
+        let numTiles = (K + TSK - 1u) / TSK;
+
+        for (var t: u32 = 0u; t < numTiles; t = t + 1u) {
+          // COALESCED LOADING PATTERN:
+          // Each thread loads 8 elements from A and 8 elements from B
+          // Total: 64 threads * 8 = 512 elements for A (64x8)
+          // Total: 64 threads * 8 = 512 elements for B (8x64)
+
+          // A: 64 rows x 8 cols. Thread (tidx, tidy) loads rows [tidy*8..tidy*8+7], col tidx
+          // This puts consecutive threads (tidx=0,1,2...) loading same rows, different cols
+          // Memory layout A[row*K + col] - for same row, col=tidx gives stride-1 access!
+          for (var i: u32 = 0u; i < WPT; i = i + 1u) {
+            let aRow = workgroup_id.y * TS + tidy * WPT + i;
+            let aCol = t * TSK + tidx;
+            if (aRow < M && aCol < K) {
+              Asub[tidy * WPT + i][tidx] = A[aRow * K + aCol];
+            } else {
+              Asub[tidy * WPT + i][tidx] = 0.0;
+            }
+          }
+
+          // B: 8 rows x 64 cols. Thread (tidx, tidy) loads row tidy, cols [tidx*8..tidx*8+7]
+          // Memory B[row*N + col] - consecutive cols = stride-1 access
+          for (var j: u32 = 0u; j < WPT; j = j + 1u) {
+            let bRow = t * TSK + tidy;
+            let bCol = workgroup_id.x * TS + tidx * WPT + j;
+            if (bRow < K && bCol < N) {
+              Bsub[tidy][tidx * WPT + j] = B[bRow * N + bCol];
+            } else {
+              Bsub[tidy][tidx * WPT + j] = 0.0;
+            }
+          }
+
+          workgroupBarrier();
+
+          // Compute with fully unrolled k-loop
+          // k=0
+          {
+            let b0 = vec4<f32>(Bsub[0][tidx * WPT + 0u], Bsub[0][tidx * WPT + 1u], Bsub[0][tidx * WPT + 2u], Bsub[0][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[0][tidx * WPT + 4u], Bsub[0][tidx * WPT + 5u], Bsub[0][tidx * WPT + 6u], Bsub[0][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][0]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][0]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][0]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][0]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][0]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][0]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][0]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][0]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][0]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][0]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][0]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][0]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][0]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][0]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][0]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][0]), b1, acc[7][1]);
+          }
+          // k=1
+          {
+            let b0 = vec4<f32>(Bsub[1][tidx * WPT + 0u], Bsub[1][tidx * WPT + 1u], Bsub[1][tidx * WPT + 2u], Bsub[1][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[1][tidx * WPT + 4u], Bsub[1][tidx * WPT + 5u], Bsub[1][tidx * WPT + 6u], Bsub[1][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][1]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][1]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][1]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][1]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][1]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][1]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][1]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][1]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][1]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][1]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][1]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][1]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][1]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][1]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][1]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][1]), b1, acc[7][1]);
+          }
+          // k=2
+          {
+            let b0 = vec4<f32>(Bsub[2][tidx * WPT + 0u], Bsub[2][tidx * WPT + 1u], Bsub[2][tidx * WPT + 2u], Bsub[2][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[2][tidx * WPT + 4u], Bsub[2][tidx * WPT + 5u], Bsub[2][tidx * WPT + 6u], Bsub[2][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][2]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][2]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][2]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][2]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][2]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][2]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][2]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][2]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][2]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][2]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][2]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][2]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][2]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][2]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][2]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][2]), b1, acc[7][1]);
+          }
+          // k=3
+          {
+            let b0 = vec4<f32>(Bsub[3][tidx * WPT + 0u], Bsub[3][tidx * WPT + 1u], Bsub[3][tidx * WPT + 2u], Bsub[3][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[3][tidx * WPT + 4u], Bsub[3][tidx * WPT + 5u], Bsub[3][tidx * WPT + 6u], Bsub[3][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][3]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][3]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][3]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][3]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][3]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][3]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][3]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][3]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][3]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][3]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][3]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][3]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][3]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][3]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][3]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][3]), b1, acc[7][1]);
+          }
+          // k=4
+          {
+            let b0 = vec4<f32>(Bsub[4][tidx * WPT + 0u], Bsub[4][tidx * WPT + 1u], Bsub[4][tidx * WPT + 2u], Bsub[4][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[4][tidx * WPT + 4u], Bsub[4][tidx * WPT + 5u], Bsub[4][tidx * WPT + 6u], Bsub[4][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][4]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][4]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][4]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][4]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][4]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][4]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][4]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][4]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][4]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][4]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][4]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][4]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][4]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][4]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][4]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][4]), b1, acc[7][1]);
+          }
+          // k=5
+          {
+            let b0 = vec4<f32>(Bsub[5][tidx * WPT + 0u], Bsub[5][tidx * WPT + 1u], Bsub[5][tidx * WPT + 2u], Bsub[5][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[5][tidx * WPT + 4u], Bsub[5][tidx * WPT + 5u], Bsub[5][tidx * WPT + 6u], Bsub[5][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][5]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][5]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][5]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][5]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][5]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][5]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][5]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][5]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][5]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][5]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][5]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][5]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][5]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][5]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][5]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][5]), b1, acc[7][1]);
+          }
+          // k=6
+          {
+            let b0 = vec4<f32>(Bsub[6][tidx * WPT + 0u], Bsub[6][tidx * WPT + 1u], Bsub[6][tidx * WPT + 2u], Bsub[6][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[6][tidx * WPT + 4u], Bsub[6][tidx * WPT + 5u], Bsub[6][tidx * WPT + 6u], Bsub[6][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][6]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][6]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][6]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][6]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][6]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][6]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][6]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][6]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][6]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][6]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][6]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][6]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][6]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][6]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][6]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][6]), b1, acc[7][1]);
+          }
+          // k=7
+          {
+            let b0 = vec4<f32>(Bsub[7][tidx * WPT + 0u], Bsub[7][tidx * WPT + 1u], Bsub[7][tidx * WPT + 2u], Bsub[7][tidx * WPT + 3u]);
+            let b1 = vec4<f32>(Bsub[7][tidx * WPT + 4u], Bsub[7][tidx * WPT + 5u], Bsub[7][tidx * WPT + 6u], Bsub[7][tidx * WPT + 7u]);
+            acc[0][0] = fma(vec4<f32>(Asub[tidy * WPT + 0u][7]), b0, acc[0][0]); acc[0][1] = fma(vec4<f32>(Asub[tidy * WPT + 0u][7]), b1, acc[0][1]);
+            acc[1][0] = fma(vec4<f32>(Asub[tidy * WPT + 1u][7]), b0, acc[1][0]); acc[1][1] = fma(vec4<f32>(Asub[tidy * WPT + 1u][7]), b1, acc[1][1]);
+            acc[2][0] = fma(vec4<f32>(Asub[tidy * WPT + 2u][7]), b0, acc[2][0]); acc[2][1] = fma(vec4<f32>(Asub[tidy * WPT + 2u][7]), b1, acc[2][1]);
+            acc[3][0] = fma(vec4<f32>(Asub[tidy * WPT + 3u][7]), b0, acc[3][0]); acc[3][1] = fma(vec4<f32>(Asub[tidy * WPT + 3u][7]), b1, acc[3][1]);
+            acc[4][0] = fma(vec4<f32>(Asub[tidy * WPT + 4u][7]), b0, acc[4][0]); acc[4][1] = fma(vec4<f32>(Asub[tidy * WPT + 4u][7]), b1, acc[4][1]);
+            acc[5][0] = fma(vec4<f32>(Asub[tidy * WPT + 5u][7]), b0, acc[5][0]); acc[5][1] = fma(vec4<f32>(Asub[tidy * WPT + 5u][7]), b1, acc[5][1]);
+            acc[6][0] = fma(vec4<f32>(Asub[tidy * WPT + 6u][7]), b0, acc[6][0]); acc[6][1] = fma(vec4<f32>(Asub[tidy * WPT + 6u][7]), b1, acc[6][1]);
+            acc[7][0] = fma(vec4<f32>(Asub[tidy * WPT + 7u][7]), b0, acc[7][0]); acc[7][1] = fma(vec4<f32>(Asub[tidy * WPT + 7u][7]), b1, acc[7][1]);
+          }
+
+          workgroupBarrier();
+        }
+
+        // Write results
+        for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+          let outRow = row + i;
+          if (outRow < M) {
+            if (col + 0u < N) { C[outRow * N + col + 0u] = acc[i][0].x; }
+            if (col + 1u < N) { C[outRow * N + col + 1u] = acc[i][0].y; }
+            if (col + 2u < N) { C[outRow * N + col + 2u] = acc[i][0].z; }
+            if (col + 3u < N) { C[outRow * N + col + 3u] = acc[i][0].w; }
+            if (col + 4u < N) { C[outRow * N + col + 4u] = acc[i][1].x; }
+            if (col + 5u < N) { C[outRow * N + col + 5u] = acc[i][1].y; }
+            if (col + 6u < N) { C[outRow * N + col + 6u] = acc[i][1].z; }
+            if (col + 7u < N) { C[outRow * N + col + 7u] = acc[i][1].w; }
+          }
+        }
+      }
+    `;
+
+    class WebGPUMatmul {
+      constructor(device) {
+        this.device = device;
+        this.pipeline = null;
+        this.bindGroupLayout = null;
+      }
+
+      async init() {
+        const shaderModule = this.device.createShaderModule({ code: gemmShaderCoalesced });
+
+        this.bindGroupLayout = this.device.createBindGroupLayout({
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          ]
+        });
+
+        this.pipeline = this.device.createComputePipeline({
+          layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+          compute: { module: shaderModule, entryPoint: 'main' }
+        });
+      }
+
+      createBuffers(M, N, K) {
+        const device = this.device;
+        const uniformBuffer = device.createBuffer({ size: 12, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const bufferA = device.createBuffer({ size: M * K * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferB = device.createBuffer({ size: K * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const bufferC = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readBuffer = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const bindGroup = device.createBindGroup({
+          layout: this.bindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: uniformBuffer } },
+            { binding: 1, resource: { buffer: bufferA } },
+            { binding: 2, resource: { buffer: bufferB } },
+            { binding: 3, resource: { buffer: bufferC } },
+          ]
+        });
+        return { uniformBuffer, bufferA, bufferB, bufferC, readBuffer, bindGroup };
+      }
+
+      async matmulReuse(a, b, M, N, K, buffers) {
+        const device = this.device;
+        device.queue.writeBuffer(buffers.uniformBuffer, 0, new Uint32Array([M, N, K]));
+        device.queue.writeBuffer(buffers.bufferA, 0, a);
+        device.queue.writeBuffer(buffers.bufferB, 0, b);
+        const TS = 64;
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, buffers.bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(N / TS), Math.ceil(M / TS));
+        passEncoder.end();
+        commandEncoder.copyBufferToBuffer(buffers.bufferC, 0, buffers.readBuffer, 0, M * N * 4);
+        device.queue.submit([commandEncoder.finish()]);
+        await buffers.readBuffer.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(buffers.readBuffer.getMappedRange().slice(0));
+        buffers.readBuffer.unmap();
+        return result;
+      }
+
+      destroyBuffers(buffers) {
+        buffers.uniformBuffer.destroy();
+        buffers.bufferA.destroy();
+        buffers.bufferB.destroy();
+        buffers.bufferC.destroy();
+        buffers.readBuffer.destroy();
+      }
+    }
+
+    function cpuMatmul(a, b, M, N, K) {
+      const c = new Float32Array(M * N);
+      for (let i = 0; i < M; i++) {
+        for (let j = 0; j < N; j++) {
+          let sum = 0;
+          for (let k = 0; k < K; k++) { sum += a[i * K + k] * b[k * N + j]; }
+          c[i * N + j] = sum;
+        }
+      }
+      return c;
+    }
+
+    function maxAbsDiff(a, b) {
+      let max = 0;
+      for (let i = 0; i < a.length; i++) { max = Math.max(max, Math.abs(a[i] - b[i])); }
+      return max;
+    }
+
+    document.getElementById('run').onclick = async () => {
+      output.textContent = 'Starting benchmark...\n';
+      try {
+        if (!navigator.gpu) { log('ERROR: WebGPU not supported'); return; }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { log('ERROR: No WebGPU adapter found'); return; }
+        const device = await adapter.requestDevice();
+        log('WebGPU device ready');
+
+        const gpuMatmul = new WebGPUMatmul(device);
+        await gpuMatmul.init();
+        log('8x8 coalesced GEMM kernel ready (fully unrolled k-loop)');
+
+        log('\nVerifying correctness...');
+        const testN = 64;
+        const testA = new Float32Array(testN * testN).map(() => Math.random());
+        const testB = new Float32Array(testN * testN).map(() => Math.random());
+        const testBuffers = gpuMatmul.createBuffers(testN, testN, testN);
+        const gpuResult = await gpuMatmul.matmulReuse(testA, testB, testN, testN, testN, testBuffers);
+        const cpuResult = cpuMatmul(testA, testB, testN, testN, testN);
+        const diff = maxAbsDiff(gpuResult, cpuResult);
+        log('Max abs diff from CPU: ' + diff.toExponential(2) + (diff < 0.001 ? ' ✓' : ' ✗'));
+        gpuMatmul.destroyBuffers(testBuffers);
+
+        log('\nLoading TensorFlow.js WebGPU backend...');
+        await tf.setBackend('webgpu');
+        await tf.ready();
+        log('tfjs WebGPU ready');
+
+        const sizes = [512, 1024, 2048, 4096];
+        const iters = 5;
+
+        log('\n=== BENCHMARK: 8x8 Coalesced + Unrolled ===\n');
+        log('Size | Our Coalesc | tfjs WebGPU | Ratio');
+        log('-----|-------------|-------------|------');
+
+        for (const n of sizes) {
+          const a = new Float32Array(n*n).map(() => Math.random());
+          const b = new Float32Array(n*n).map(() => Math.random());
+          const buffers = gpuMatmul.createBuffers(n, n, n);
+          await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+          const tA = tf.tensor2d(Array.from(a), [n, n]);
+          const tB = tf.tensor2d(Array.from(b), [n, n]);
+          await tf.matMul(tA, tB).data();
+
+          let ourTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            await gpuMatmul.matmulReuse(a, b, n, n, n, buffers);
+            ourTime = Math.min(ourTime, performance.now() - start);
+          }
+          gpuMatmul.destroyBuffers(buffers);
+
+          let tfjsTime = Infinity;
+          for (let i = 0; i < iters; i++) {
+            const start = performance.now();
+            const res = tf.matMul(tA, tB);
+            await res.data();
+            res.dispose();
+            tfjsTime = Math.min(tfjsTime, performance.now() - start);
+          }
+          tA.dispose(); tB.dispose();
+
+          const ratio = (tfjsTime / ourTime).toFixed(2);
+          const win = parseFloat(ratio) >= 1.0 ? '✓' : '';
+          log(n.toString().padStart(4) + ' | ' + ourTime.toFixed(1).padStart(9) + 'ms | ' + tfjsTime.toFixed(1).padStart(9) + 'ms | ' + ratio.padStart(5) + 'x ' + win);
+        }
+        log('\n=== ANALYSIS ===');
+        log('Ratio > 1.0 = we beat tfjs WebGPU');
+        log('\nDONE');
+      } catch (e) { log('ERROR: ' + e.message); log(e.stack); }
+    };
+  </script>
+</body>
+</html>
