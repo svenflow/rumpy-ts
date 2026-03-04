@@ -15,6 +15,7 @@ import { creationTests } from './creation.test';
 import { mathTests } from './math.test';
 import { linalgTests } from './linalg.test';
 import { statsTests } from './stats.test';
+import { manipulationTests } from './manipulation.test';
 
 // Import backends
 import { initWasmBackend, createWasmBackend } from './wasm-backend';
@@ -38,6 +39,7 @@ describe('rumpy-ts', () => {
     mathTests(getBackend);
     linalgTests(getBackend);
     statsTests(getBackend);
+    manipulationTests(getBackend);
   });
 
   // Run tests against WebGPU backend
@@ -55,5 +57,6 @@ describe('rumpy-ts', () => {
     mathTests(getBackend);
     linalgTests(getBackend);
     statsTests(getBackend);
+    manipulationTests(getBackend);
   });
 });

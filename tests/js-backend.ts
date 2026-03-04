@@ -745,6 +745,683 @@ export class JsBackend implements Backend {
       sign,
     };
   }
+
+  // ============ Creation - Like Functions ============
+
+  zerosLike(arr: NDArray): NDArray {
+    return this.zeros(arr.shape);
+  }
+
+  onesLike(arr: NDArray): NDArray {
+    return this.ones(arr.shape);
+  }
+
+  emptyLike(arr: NDArray): NDArray {
+    // In JS, we can't have uninitialized memory, so same as zeros
+    return this.zeros(arr.shape);
+  }
+
+  fullLike(arr: NDArray, value: number): NDArray {
+    return this.full(arr.shape, value);
+  }
+
+  // ============ Broadcasting ============
+
+  broadcastTo(arr: NDArray, shape: number[]): NDArray {
+    // Validate shapes are compatible
+    const arrShape = arr.shape;
+    if (arrShape.length > shape.length) {
+      throw new Error('Cannot broadcast to smaller number of dimensions');
+    }
+
+    // Pad arr shape with 1s on the left
+    const paddedShape = new Array(shape.length - arrShape.length).fill(1).concat(arrShape);
+
+    // Check compatibility
+    for (let i = 0; i < shape.length; i++) {
+      if (paddedShape[i] !== 1 && paddedShape[i] !== shape[i]) {
+        throw new Error(`Cannot broadcast shape [${arrShape}] to [${shape}]`);
+      }
+    }
+
+    const size = shape.reduce((a, b) => a * b, 1);
+    const result = new Float64Array(size);
+    const strides = this._computeStrides(shape);
+    const srcStrides = this._computeBroadcastStrides(paddedShape, shape);
+
+    for (let i = 0; i < size; i++) {
+      let srcIdx = 0;
+      let remaining = i;
+      for (let d = 0; d < shape.length; d++) {
+        const coord = Math.floor(remaining / strides[d]);
+        remaining = remaining % strides[d];
+        srcIdx += coord * srcStrides[d];
+      }
+      result[i] = arr.data[srcIdx];
+    }
+
+    return new JsNDArray(result, shape);
+  }
+
+  broadcastArrays(...arrays: NDArray[]): NDArray[] {
+    if (arrays.length === 0) return [];
+    if (arrays.length === 1) return [new JsNDArray(arrays[0].data.slice(), arrays[0].shape)];
+
+    // Compute broadcast shape
+    const shapes = arrays.map(a => a.shape);
+    const maxDims = Math.max(...shapes.map(s => s.length));
+
+    // Pad all shapes with 1s on the left
+    const paddedShapes = shapes.map(s => {
+      const padded = new Array(maxDims - s.length).fill(1);
+      return padded.concat(s);
+    });
+
+    // Compute output shape
+    const outShape: number[] = [];
+    for (let i = 0; i < maxDims; i++) {
+      const dims = paddedShapes.map(s => s[i]);
+      const maxDim = Math.max(...dims);
+      for (const d of dims) {
+        if (d !== 1 && d !== maxDim) {
+          throw new Error('Shapes are not broadcastable');
+        }
+      }
+      outShape.push(maxDim);
+    }
+
+    // Broadcast each array
+    return arrays.map(arr => this.broadcastTo(arr, outShape));
+  }
+
+  private _computeStrides(shape: number[]): number[] {
+    const strides = new Array(shape.length);
+    let stride = 1;
+    for (let i = shape.length - 1; i >= 0; i--) {
+      strides[i] = stride;
+      stride *= shape[i];
+    }
+    return strides;
+  }
+
+  private _computeBroadcastStrides(srcShape: number[], dstShape: number[]): number[] {
+    const strides = new Array(dstShape.length);
+    let srcStride = 1;
+    for (let i = srcShape.length - 1; i >= 0; i--) {
+      // If dimension is 1, stride is 0 (broadcast)
+      strides[i] = srcShape[i] === 1 ? 0 : srcStride;
+      srcStride *= srcShape[i];
+    }
+    return strides;
+  }
+
+  // ============ Shape Manipulation ============
+
+  private _normalizeAxis(axis: number, ndim: number): number {
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
+    }
+    return axis;
+  }
+
+  swapaxes(arr: NDArray, axis1: number, axis2: number): NDArray {
+    const ndim = arr.shape.length;
+    axis1 = this._normalizeAxis(axis1, ndim);
+    axis2 = this._normalizeAxis(axis2, ndim);
+
+    if (axis1 === axis2) {
+      return new JsNDArray(arr.data.slice(), arr.shape);
+    }
+
+    // Create new shape with swapped axes
+    const newShape = [...arr.shape];
+    [newShape[axis1], newShape[axis2]] = [newShape[axis2], newShape[axis1]];
+
+    // Create permutation array
+    const perm = Array.from({ length: ndim }, (_, i) => i);
+    [perm[axis1], perm[axis2]] = [perm[axis2], perm[axis1]];
+
+    return this._transposeGeneral(arr, perm, newShape);
+  }
+
+  moveaxis(arr: NDArray, source: number, destination: number): NDArray {
+    const ndim = arr.shape.length;
+    source = this._normalizeAxis(source, ndim);
+    destination = this._normalizeAxis(destination, ndim);
+
+    if (source === destination) {
+      return new JsNDArray(arr.data.slice(), arr.shape);
+    }
+
+    // Build permutation
+    const perm: number[] = [];
+    for (let i = 0; i < ndim; i++) {
+      if (i !== source) perm.push(i);
+    }
+    perm.splice(destination, 0, source);
+
+    const newShape = perm.map(i => arr.shape[i]);
+    return this._transposeGeneral(arr, perm, newShape);
+  }
+
+  private _transposeGeneral(arr: NDArray, perm: number[], newShape: number[]): NDArray {
+    const size = arr.data.length;
+    const result = new Float64Array(size);
+
+    const oldStrides = this._computeStrides(arr.shape);
+    const newStrides = this._computeStrides(newShape);
+
+    for (let i = 0; i < size; i++) {
+      // Convert flat index to coordinates in new array
+      const coords = new Array(newShape.length);
+      let remaining = i;
+      for (let d = 0; d < newShape.length; d++) {
+        coords[d] = Math.floor(remaining / newStrides[d]);
+        remaining = remaining % newStrides[d];
+      }
+
+      // Map to old coordinates using inverse permutation
+      let oldIdx = 0;
+      for (let d = 0; d < perm.length; d++) {
+        oldIdx += coords[d] * oldStrides[perm[d]];
+      }
+
+      result[i] = arr.data[oldIdx];
+    }
+
+    return new JsNDArray(result, newShape);
+  }
+
+  squeeze(arr: NDArray, axis?: number): NDArray {
+    if (axis !== undefined) {
+      const normalizedAxis = this._normalizeAxis(axis, arr.shape.length);
+      if (arr.shape[normalizedAxis] !== 1) {
+        throw new Error(`cannot squeeze axis ${axis} with size ${arr.shape[normalizedAxis]}`);
+      }
+      const newShape = arr.shape.filter((_, i) => i !== normalizedAxis);
+      return new JsNDArray(arr.data.slice(), newShape.length === 0 ? [1] : newShape);
+    }
+
+    // Remove all dimensions of size 1
+    const newShape = arr.shape.filter(d => d !== 1);
+    return new JsNDArray(arr.data.slice(), newShape.length === 0 ? [1] : newShape);
+  }
+
+  expandDims(arr: NDArray, axis: number): NDArray {
+    const ndim = arr.shape.length + 1;
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds`);
+    }
+
+    const newShape = [...arr.shape];
+    newShape.splice(axis, 0, 1);
+    return new JsNDArray(arr.data.slice(), newShape);
+  }
+
+  reshape(arr: NDArray, shape: number[]): NDArray {
+    // Handle -1 in shape (infer dimension)
+    let inferIdx = -1;
+    let knownSize = 1;
+    for (let i = 0; i < shape.length; i++) {
+      if (shape[i] === -1) {
+        if (inferIdx !== -1) throw new Error('can only specify one unknown dimension');
+        inferIdx = i;
+      } else {
+        knownSize *= shape[i];
+      }
+    }
+
+    const newShape = [...shape];
+    if (inferIdx !== -1) {
+      newShape[inferIdx] = arr.data.length / knownSize;
+    }
+
+    const newSize = newShape.reduce((a, b) => a * b, 1);
+    if (newSize !== arr.data.length) {
+      throw new Error(`cannot reshape array of size ${arr.data.length} into shape [${newShape}]`);
+    }
+
+    return new JsNDArray(arr.data.slice(), newShape);
+  }
+
+  flatten(arr: NDArray): NDArray {
+    return new JsNDArray(arr.data.slice(), [arr.data.length]);
+  }
+
+  concatenate(arrays: NDArray[], axis: number = 0): NDArray {
+    if (arrays.length === 0) throw new Error('need at least one array to concatenate');
+    if (arrays.length === 1) return new JsNDArray(arrays[0].data.slice(), arrays[0].shape);
+
+    const ndim = arrays[0].shape.length;
+    axis = this._normalizeAxis(axis, ndim);
+
+    // Verify shapes match except along concat axis
+    for (let i = 1; i < arrays.length; i++) {
+      if (arrays[i].shape.length !== ndim) {
+        throw new Error('all input arrays must have same number of dimensions');
+      }
+      for (let d = 0; d < ndim; d++) {
+        if (d !== axis && arrays[i].shape[d] !== arrays[0].shape[d]) {
+          throw new Error('all input array dimensions except concat axis must match');
+        }
+      }
+    }
+
+    // Compute output shape
+    const outShape = [...arrays[0].shape];
+    outShape[axis] = arrays.reduce((sum, arr) => sum + arr.shape[axis], 0);
+
+    const outSize = outShape.reduce((a, b) => a * b, 1);
+    const result = new Float64Array(outSize);
+
+    // For 1D, simple concatenation
+    if (ndim === 1) {
+      let offset = 0;
+      for (const arr of arrays) {
+        result.set(arr.data, offset);
+        offset += arr.data.length;
+      }
+      return new JsNDArray(result, outShape);
+    }
+
+    // For nD, use stride-based copy
+    const outStrides = this._computeStrides(outShape);
+
+    let axisOffset = 0;
+    for (const arr of arrays) {
+      const srcStrides = this._computeStrides(arr.shape);
+      const srcSize = arr.data.length;
+
+      for (let srcIdx = 0; srcIdx < srcSize; srcIdx++) {
+        // Convert to coordinates
+        const coords = new Array(ndim);
+        let remaining = srcIdx;
+        for (let d = 0; d < ndim; d++) {
+          coords[d] = Math.floor(remaining / srcStrides[d]);
+          remaining = remaining % srcStrides[d];
+        }
+
+        // Add offset along concat axis
+        coords[axis] += axisOffset;
+
+        // Convert to dest index
+        let dstIdx = 0;
+        for (let d = 0; d < ndim; d++) {
+          dstIdx += coords[d] * outStrides[d];
+        }
+
+        result[dstIdx] = arr.data[srcIdx];
+      }
+
+      axisOffset += arr.shape[axis];
+    }
+
+    return new JsNDArray(result, outShape);
+  }
+
+  stack(arrays: NDArray[], axis: number = 0): NDArray {
+    if (arrays.length === 0) throw new Error('need at least one array to stack');
+
+    // Verify all shapes are the same
+    const shape = arrays[0].shape;
+    for (let i = 1; i < arrays.length; i++) {
+      if (arrays[i].shape.length !== shape.length) {
+        throw new Error('all input arrays must have the same shape');
+      }
+      for (let d = 0; d < shape.length; d++) {
+        if (arrays[i].shape[d] !== shape[d]) {
+          throw new Error('all input arrays must have the same shape');
+        }
+      }
+    }
+
+    // Expand dims on each array, then concatenate
+    const expanded = arrays.map(arr => this.expandDims(arr, axis));
+    return this.concatenate(expanded, axis);
+  }
+
+  split(arr: NDArray, indices: number | number[], axis: number = 0): NDArray[] {
+    const ndim = arr.shape.length;
+    axis = this._normalizeAxis(axis, ndim);
+    const axisSize = arr.shape[axis];
+
+    let splitIndices: number[];
+    if (typeof indices === 'number') {
+      // Split into n equal parts
+      if (axisSize % indices !== 0) {
+        throw new Error(`array of size ${axisSize} cannot be split into ${indices} equal parts`);
+      }
+      const partSize = axisSize / indices;
+      splitIndices = [];
+      for (let i = partSize; i < axisSize; i += partSize) {
+        splitIndices.push(i);
+      }
+    } else {
+      splitIndices = indices;
+    }
+
+    const results: NDArray[] = [];
+    let start = 0;
+
+    const getSlice = (startIdx: number, endIdx: number): NDArray => {
+      const sliceShape = [...arr.shape];
+      sliceShape[axis] = endIdx - startIdx;
+      const sliceSize = sliceShape.reduce((a, b) => a * b, 1);
+      const sliceData = new Float64Array(sliceSize);
+
+      const srcStrides = this._computeStrides(arr.shape);
+      const dstStrides = this._computeStrides(sliceShape);
+
+      for (let dstIdx = 0; dstIdx < sliceSize; dstIdx++) {
+        const coords = new Array(ndim);
+        let remaining = dstIdx;
+        for (let d = 0; d < ndim; d++) {
+          coords[d] = Math.floor(remaining / dstStrides[d]);
+          remaining = remaining % dstStrides[d];
+        }
+
+        coords[axis] += startIdx;
+
+        let srcIdx = 0;
+        for (let d = 0; d < ndim; d++) {
+          srcIdx += coords[d] * srcStrides[d];
+        }
+
+        sliceData[dstIdx] = arr.data[srcIdx];
+      }
+
+      return new JsNDArray(sliceData, sliceShape);
+    };
+
+    for (const idx of splitIndices) {
+      results.push(getSlice(start, idx));
+      start = idx;
+    }
+    results.push(getSlice(start, axisSize));
+
+    return results;
+  }
+
+  // ============ Conditional ============
+
+  where(condition: NDArray, x: NDArray, y: NDArray): NDArray {
+    // Broadcast all arrays to the same shape
+    const [condBcast, xBcast, yBcast] = this.broadcastArrays(condition, x, y);
+    const size = condBcast.data.length;
+    const result = new Float64Array(size);
+
+    for (let i = 0; i < size; i++) {
+      result[i] = condBcast.data[i] !== 0 ? xBcast.data[i] : yBcast.data[i];
+    }
+
+    return new JsNDArray(result, condBcast.shape);
+  }
+
+  // ============ Advanced Indexing ============
+
+  take(arr: NDArray, indices: NDArray | number[], axis?: number): NDArray {
+    const indexArray = Array.isArray(indices) ? indices : Array.from(indices.data);
+
+    if (axis === undefined) {
+      // Take from flattened array
+      const result = new Float64Array(indexArray.length);
+      for (let i = 0; i < indexArray.length; i++) {
+        let idx = indexArray[i];
+        if (idx < 0) idx += arr.data.length;
+        result[i] = arr.data[idx];
+      }
+      return new JsNDArray(result, [indexArray.length]);
+    }
+
+    const ndim = arr.shape.length;
+    axis = this._normalizeAxis(axis, ndim);
+
+    // Output shape: replace axis dimension with indices length
+    const outShape = [...arr.shape];
+    outShape[axis] = indexArray.length;
+
+    const outSize = outShape.reduce((a, b) => a * b, 1);
+    const result = new Float64Array(outSize);
+
+    const srcStrides = this._computeStrides(arr.shape);
+    const dstStrides = this._computeStrides(outShape);
+
+    for (let dstIdx = 0; dstIdx < outSize; dstIdx++) {
+      const coords = new Array(ndim);
+      let remaining = dstIdx;
+      for (let d = 0; d < ndim; d++) {
+        coords[d] = Math.floor(remaining / dstStrides[d]);
+        remaining = remaining % dstStrides[d];
+      }
+
+      // Map the axis coordinate through indices
+      let srcAxisCoord = indexArray[coords[axis]];
+      if (srcAxisCoord < 0) srcAxisCoord += arr.shape[axis];
+      coords[axis] = srcAxisCoord;
+
+      let srcIdx = 0;
+      for (let d = 0; d < ndim; d++) {
+        srcIdx += coords[d] * srcStrides[d];
+      }
+
+      result[dstIdx] = arr.data[srcIdx];
+    }
+
+    return new JsNDArray(result, outShape);
+  }
+
+  // ============ Batched Operations ============
+
+  batchedMatmul(a: NDArray, b: NDArray): NDArray {
+    // Supports shapes like (batch, M, K) @ (batch, K, N) -> (batch, M, N)
+    // Or (batch, M, K) @ (K, N) -> (batch, M, N) with broadcasting
+    if (a.shape.length < 2 || b.shape.length < 2) {
+      throw new Error('batchedMatmul requires at least 2D arrays');
+    }
+
+    // Get matrix dimensions (last two axes)
+    const aM = a.shape[a.shape.length - 2];
+    const aK = a.shape[a.shape.length - 1];
+    const bK = b.shape[b.shape.length - 2];
+    const bN = b.shape[b.shape.length - 1];
+
+    if (aK !== bK) throw new Error('matmul inner dimensions must match');
+
+    // Compute batch dimensions
+    const aBatchShape = a.shape.slice(0, -2);
+    const bBatchShape = b.shape.slice(0, -2);
+
+    // Broadcast batch dimensions
+    const maxBatchDims = Math.max(aBatchShape.length, bBatchShape.length);
+    const paddedABatch = new Array(maxBatchDims - aBatchShape.length).fill(1).concat(aBatchShape);
+    const paddedBBatch = new Array(maxBatchDims - bBatchShape.length).fill(1).concat(bBatchShape);
+
+    const outBatchShape: number[] = [];
+    for (let i = 0; i < maxBatchDims; i++) {
+      const ad = paddedABatch[i];
+      const bd = paddedBBatch[i];
+      if (ad !== 1 && bd !== 1 && ad !== bd) {
+        throw new Error('batch dimensions are not broadcastable');
+      }
+      outBatchShape.push(Math.max(ad, bd));
+    }
+
+    const outShape = [...outBatchShape, aM, bN];
+    const batchSize = outBatchShape.reduce((a, b) => a * b, 1);
+    const matSize = aM * bN;
+    const result = new Float64Array(batchSize * matSize);
+
+    // Compute strides for batch indexing
+    const aBatchStrides = this._computeStrides(paddedABatch);
+    const bBatchStrides = this._computeStrides(paddedBBatch);
+    const outBatchStrides = this._computeStrides(outBatchShape);
+
+    const aMatStride = aM * aK;
+    const bMatStride = bK * bN;
+
+    for (let batch = 0; batch < batchSize; batch++) {
+      // Convert batch index to coordinates
+      const coords = new Array(maxBatchDims);
+      let remaining = batch;
+      for (let d = 0; d < maxBatchDims; d++) {
+        coords[d] = Math.floor(remaining / outBatchStrides[d]);
+        remaining = remaining % outBatchStrides[d];
+      }
+
+      // Map to source batch indices with broadcasting
+      let aOffset = 0;
+      let bOffset = 0;
+      for (let d = 0; d < maxBatchDims; d++) {
+        const aCoord = paddedABatch[d] === 1 ? 0 : coords[d];
+        const bCoord = paddedBBatch[d] === 1 ? 0 : coords[d];
+        aOffset += aCoord * aBatchStrides[d];
+        bOffset += bCoord * bBatchStrides[d];
+      }
+      aOffset *= aMatStride;
+      bOffset *= bMatStride;
+
+      // Perform matmul for this batch
+      const outOffset = batch * matSize;
+      for (let i = 0; i < aM; i++) {
+        for (let j = 0; j < bN; j++) {
+          let sum = 0;
+          for (let k = 0; k < aK; k++) {
+            sum += a.data[aOffset + i * aK + k] * b.data[bOffset + k * bN + j];
+          }
+          result[outOffset + i * bN + j] = sum;
+        }
+      }
+    }
+
+    return new JsNDArray(result, outShape);
+  }
+
+  // ============ Einstein Summation ============
+
+  einsum(subscripts: string, ...operands: NDArray[]): NDArray {
+    // Parse einsum string
+    const [inputStr, outputStr] = subscripts.split('->').map(s => s.trim());
+    const inputSubscripts = inputStr.split(',').map(s => s.trim());
+
+    if (inputSubscripts.length !== operands.length) {
+      throw new Error(`einsum: expected ${inputSubscripts.length} operands, got ${operands.length}`);
+    }
+
+    // Map each label to its dimension size
+    const labelSizes: Map<string, number> = new Map();
+    const inputLabels: string[][] = [];
+
+    for (let i = 0; i < operands.length; i++) {
+      const labels = inputSubscripts[i].split('');
+      inputLabels.push(labels);
+      if (labels.length !== operands[i].shape.length) {
+        throw new Error(`einsum: operand ${i} has ${operands[i].shape.length} dimensions but subscripts specify ${labels.length}`);
+      }
+      for (let j = 0; j < labels.length; j++) {
+        const label = labels[j];
+        const size = operands[i].shape[j];
+        if (labelSizes.has(label)) {
+          if (labelSizes.get(label) !== size) {
+            throw new Error(`einsum: inconsistent size for label '${label}'`);
+          }
+        } else {
+          labelSizes.set(label, size);
+        }
+      }
+    }
+
+    // Determine output labels
+    let outputLabels: string[];
+    if (outputStr !== undefined) {
+      outputLabels = outputStr.split('');
+    } else {
+      // Implicit mode: output labels are those that appear exactly once
+      const labelCounts: Map<string, number> = new Map();
+      for (const labels of inputLabels) {
+        for (const label of labels) {
+          labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+        }
+      }
+      outputLabels = [];
+      const allLabels = Array.from(labelSizes.keys()).sort();
+      for (const label of allLabels) {
+        if (labelCounts.get(label) === 1) {
+          outputLabels.push(label);
+        }
+      }
+    }
+
+    // Compute output shape
+    const outputShape = outputLabels.map(l => labelSizes.get(l)!);
+    const outputSize = outputShape.length === 0 ? 1 : outputShape.reduce((a, b) => a * b, 1);
+
+    // Find contracted (summed) labels
+    const outputSet = new Set(outputLabels);
+    const allLabels = Array.from(labelSizes.keys());
+    const contractedLabels = allLabels.filter(l => !outputSet.has(l));
+
+    // Compute contracted dimensions size
+    const contractedSizes = contractedLabels.map(l => labelSizes.get(l)!);
+    const contractedTotal = contractedSizes.length === 0 ? 1 : contractedSizes.reduce((a, b) => a * b, 1);
+
+    const result = new Float64Array(outputSize);
+
+    // Compute input strides
+    const inputStrides = operands.map(op => this._computeStrides(op.shape));
+
+    // For each output position
+    const outputStrides = outputShape.length === 0 ? [] : this._computeStrides(outputShape);
+
+    for (let outIdx = 0; outIdx < outputSize; outIdx++) {
+      // Convert to output coordinates
+      const outCoords: Map<string, number> = new Map();
+      let remaining = outIdx;
+      for (let d = 0; d < outputLabels.length; d++) {
+        const coord = Math.floor(remaining / outputStrides[d]);
+        remaining = remaining % outputStrides[d];
+        outCoords.set(outputLabels[d], coord);
+      }
+
+      // Sum over contracted indices
+      let sum = 0;
+      for (let contrIdx = 0; contrIdx < contractedTotal; contrIdx++) {
+        // Convert to contracted coordinates
+        const contrCoords: Map<string, number> = new Map();
+        let contrRemaining = contrIdx;
+        for (let d = 0; d < contractedLabels.length; d++) {
+          const size = contractedSizes[d];
+          const stride = d < contractedSizes.length - 1
+            ? contractedSizes.slice(d + 1).reduce((a, b) => a * b, 1)
+            : 1;
+          const coord = Math.floor(contrRemaining / stride);
+          contrRemaining = contrRemaining % stride;
+          contrCoords.set(contractedLabels[d], coord);
+        }
+
+        // Merge coordinates
+        const allCoords = new Map([...outCoords, ...contrCoords]);
+
+        // Compute product of all operands at these coordinates
+        let prod = 1;
+        for (let i = 0; i < operands.length; i++) {
+          const labels = inputLabels[i];
+          const strides = inputStrides[i];
+          let idx = 0;
+          for (let d = 0; d < labels.length; d++) {
+            idx += allCoords.get(labels[d])! * strides[d];
+          }
+          prod *= operands[i].data[idx];
+        }
+        sum += prod;
+      }
+
+      result[outIdx] = sum;
+    }
+
+    return new JsNDArray(result, outputShape.length === 0 ? [1] : outputShape);
+  }
 }
 
 export function createJsBackend(): Backend {

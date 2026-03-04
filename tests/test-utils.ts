@@ -123,4 +123,37 @@ export interface Backend {
   norm(arr: NDArray, ord?: number): number;
   qr(arr: NDArray): { q: NDArray; r: NDArray };
   svd(arr: NDArray): { u: NDArray; s: NDArray; vt: NDArray };
+
+  // ============ Creation - Like Functions ============
+  zerosLike(arr: NDArray): NDArray;
+  onesLike(arr: NDArray): NDArray;
+  emptyLike(arr: NDArray): NDArray;
+  fullLike(arr: NDArray, value: number): NDArray;
+
+  // ============ Broadcasting ============
+  broadcastTo(arr: NDArray, shape: number[]): NDArray;
+  broadcastArrays(...arrays: NDArray[]): NDArray[];
+
+  // ============ Shape Manipulation ============
+  swapaxes(arr: NDArray, axis1: number, axis2: number): NDArray;
+  moveaxis(arr: NDArray, source: number, destination: number): NDArray;
+  squeeze(arr: NDArray, axis?: number): NDArray;
+  expandDims(arr: NDArray, axis: number): NDArray;
+  reshape(arr: NDArray, shape: number[]): NDArray;
+  flatten(arr: NDArray): NDArray;
+  concatenate(arrays: NDArray[], axis?: number): NDArray;
+  stack(arrays: NDArray[], axis?: number): NDArray;
+  split(arr: NDArray, indices: number | number[], axis?: number): NDArray[];
+
+  // ============ Conditional ============
+  where(condition: NDArray, x: NDArray, y: NDArray): NDArray;
+
+  // ============ Advanced Indexing ============
+  take(arr: NDArray, indices: NDArray | number[], axis?: number): NDArray;
+
+  // ============ Batched Operations ============
+  batchedMatmul(a: NDArray, b: NDArray): NDArray;
+
+  // ============ Einstein Summation ============
+  einsum(subscripts: string, ...operands: NDArray[]): NDArray;
 }
