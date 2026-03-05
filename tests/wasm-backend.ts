@@ -746,16 +746,6 @@ export class WasmBackend implements Backend {
     return this.array(Array.from(result), outShape);
   }
 
-  private _computeStrides(shape: number[]): number[] {
-    const strides = new Array(shape.length);
-    let stride = 1;
-    for (let i = shape.length - 1; i >= 0; i--) {
-      strides[i] = stride;
-      stride *= shape[i];
-    }
-    return strides;
-  }
-
   // ============ Linalg ============
 
   matmul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
