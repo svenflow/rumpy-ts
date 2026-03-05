@@ -86,6 +86,30 @@
     let gpuDevice = null;
     let shaderCache = new Map();
 
+    // ============ Buffer Pool (tfjs-style) ============
+    class BufferPool {
+      constructor() {
+        this.free = new Map();  // Key: "size_usage" -> GPUBuffer[]
+      }
+
+      acquire(size, usage) {
+        const key = `${size}_${usage}`;
+        if (!this.free.has(key)) this.free.set(key, []);
+        const list = this.free.get(key);
+        if (list.length > 0) return list.pop();
+        return gpuDevice.createBuffer({ size, usage });
+      }
+
+      release(buffer) {
+        const key = `${buffer.size}_${buffer.usage}`;
+        if (!this.free.has(key)) this.free.set(key, []);
+        this.free.get(key).push(buffer);
+      }
+    }
+
+    let bufferPool = null;
+    let stagingPool = null;  // Separate pool for MAP_READ buffers
+
     // ============ Check Environment ============
     document.getElementById('env').textContent =
       `Chrome ${navigator.userAgent.match(/Chrome\/(\d+)/)?.[1] || 'unknown'}` +
@@ -113,6 +137,11 @@
 
       document.getElementById('gpu').textContent = adapter.name || 'Unknown';
       document.getElementById('webgpu-status').textContent = 'READY ✓';
+
+      // Initialize buffer pools
+      bufferPool = new BufferPool();
+      stagingPool = new BufferPool();
+
       return gpuDevice;
     }
 
@@ -179,17 +208,11 @@
     async function rumpyMatmul(M, K, N, aData, bData) {
       const NPadded = Math.ceil(N / 4) * 4;
 
-      // Create buffers
-      const uniformBuffer = gpuDevice.createBuffer({
-        size: 16,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
+      // Use pooled buffers (tfjs-style)
+      const uniformBuffer = bufferPool.acquire(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([M, K, N, NPadded]));
 
-      const aBuffer = gpuDevice.createBuffer({
-        size: aData.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const aBuffer = bufferPool.acquire(aData.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
       gpuDevice.queue.writeBuffer(aBuffer, 0, aData);
 
       // Pad B to vec4 alignment
@@ -200,16 +223,10 @@
           bPadded[k * NPadded + n] = bData[k * N + n];
         }
       }
-      const bBuffer = gpuDevice.createBuffer({
-        size: bPadded.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const bBuffer = bufferPool.acquire(bPadded.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
       gpuDevice.queue.writeBuffer(bBuffer, 0, bPadded);
 
-      const cBuffer = gpuDevice.createBuffer({
-        size: M * NPadded * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-      });
+      const cBuffer = bufferPool.acquire(M * NPadded * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
 
       // Get or create pipeline
       let pipeline = shaderCache.get('FIT');
@@ -242,12 +259,10 @@
       pass.dispatchWorkgroups(Math.ceil(N / 64), Math.ceil(M / 64));
       pass.end();
 
-      // Read back result
-      const stagingBuffer = gpuDevice.createBuffer({
-        size: M * NPadded * 4,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-      });
-      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, M * NPadded * 4);
+      // Read back result with pooled staging buffer
+      const stagingSize = M * NPadded * 4;
+      const stagingBuffer = stagingPool.acquire(stagingSize, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      commandEncoder.copyBufferToBuffer(cBuffer, 0, stagingBuffer, 0, stagingSize);
 
       gpuDevice.queue.submit([commandEncoder.finish()]);
       await gpuDevice.queue.onSubmittedWorkDone();  // Ensure GPU is done
@@ -256,12 +271,12 @@
       console.log(`FIT matmul ${M}x${N}: first 5 outputs = [${Array.from(result.slice(0,5)).map(x=>x.toFixed(4)).join(', ')}]`);
       stagingBuffer.unmap();
 
-      // Cleanup
-      uniformBuffer.destroy();
-      aBuffer.destroy();
-      bBuffer.destroy();
-      cBuffer.destroy();
-      stagingBuffer.destroy();
+      // Release buffers back to pools (not destroyed - reused!)
+      bufferPool.release(uniformBuffer);
+      bufferPool.release(aBuffer);
+      bufferPool.release(bBuffer);
+      bufferPool.release(cBuffer);
+      stagingPool.release(stagingBuffer);
 
       // Unpad result
       const output = new Float32Array(M * N);

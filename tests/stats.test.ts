@@ -6,6 +6,12 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { Backend, DEFAULT_TOL, RELAXED_TOL, approxEq } from './test-utils';
 
+// Helper to get data from arrays (handles GPU materialization)
+async function getData(arr: { toArray(): number[] }, B: Backend): Promise<number[]> {
+  if (B.materializeAll) await B.materializeAll();
+  return arr.toArray();
+}
+
 export function statsTests(getBackend: () => Backend) {
   describe('stats', () => {
     let B: Backend;
@@ -169,16 +175,16 @@ export function statsTests(getBackend: () => Backend) {
     // ============ axis operations ============
 
     describe('axis operations', () => {
-      it('computes sum along axis 0', () => {
+      it('computes sum along axis 0', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
         const result = B.sumAxis(a, 0);
-        expect(result.toArray()).toEqual([5.0, 7.0, 9.0]);
+        expect(await getData(result, B)).toEqual([5.0, 7.0, 9.0]);
       });
 
-      it('computes sum along axis 1', () => {
+      it('computes sum along axis 1', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
         const result = B.sumAxis(a, 1);
-        expect(result.toArray()).toEqual([6.0, 15.0]);
+        expect(await getData(result, B)).toEqual([6.0, 15.0]);
       });
 
       it('throws on invalid axis', () => {
@@ -186,32 +192,32 @@ export function statsTests(getBackend: () => Backend) {
         expect(() => B.sumAxis(a, 5)).toThrow();
       });
 
-      it('computes mean along axis 0', () => {
+      it('computes mean along axis 0', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
         const result = B.meanAxis(a, 0);
-        expect(result.toArray()).toEqual([2.5, 3.5, 4.5]);
+        expect(await getData(result, B)).toEqual([2.5, 3.5, 4.5]);
       });
     });
 
     // ============ cumsum/cumprod ============
 
     describe('cumulative operations', () => {
-      it('computes cumsum', () => {
+      it('computes cumsum', async () => {
         const a = arr([1.0, 2.0, 3.0, 4.0, 5.0]);
         const result = B.cumsum(a);
-        expect(result.toArray()).toEqual([1.0, 3.0, 6.0, 10.0, 15.0]);
+        expect(await getData(result, B)).toEqual([1.0, 3.0, 6.0, 10.0, 15.0]);
       });
 
-      it('computes cumsum of single element', () => {
+      it('computes cumsum of single element', async () => {
         const a = arr([42.0]);
         const result = B.cumsum(a);
-        expect(result.toArray()).toEqual([42.0]);
+        expect(await getData(result, B)).toEqual([42.0]);
       });
 
-      it('computes cumprod', () => {
+      it('computes cumprod', async () => {
         const a = arr([1.0, 2.0, 3.0, 4.0]);
         const result = B.cumprod(a);
-        expect(result.toArray()).toEqual([1.0, 2.0, 6.0, 24.0]);
+        expect(await getData(result, B)).toEqual([1.0, 2.0, 6.0, 24.0]);
       });
     });
 

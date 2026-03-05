@@ -678,6 +678,355 @@ export class WasmBackend implements Backend {
     throw new Error('SVD not yet implemented in WASM backend');
   }
 
+  // ============ Advanced Linalg ============
+
+  matrixPower(arr: IFaceNDArray, n: number): IFaceNDArray {
+    if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
+      throw new Error('matrixPower requires square 2D array');
+    }
+    if (n === 0) {
+      return this.eye(arr.shape[0]);
+    }
+    if (n < 0) {
+      arr = this.inv(arr);
+      n = -n;
+    }
+    let result = this.eye(arr.shape[0]);
+    let base = arr;
+    while (n > 0) {
+      if (n % 2 === 1) {
+        result = this.matmul(result, base);
+      }
+      base = this.matmul(base, base);
+      n = Math.floor(n / 2);
+    }
+    return result;
+  }
+
+  kron(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+    const aFlat = a.shape.length === 1 ? this.reshape(a, [a.shape[0], 1]) : a;
+    const bFlat = b.shape.length === 1 ? this.reshape(b, [b.shape[0], 1]) : b;
+
+    if (aFlat.shape.length !== 2 || bFlat.shape.length !== 2) {
+      throw new Error('kron requires 1D or 2D arrays');
+    }
+
+    const [am, an] = aFlat.shape;
+    const [bm, bn] = bFlat.shape;
+    const outShape = [am * bm, an * bn];
+    const result = new Float64Array(outShape[0] * outShape[1]);
+
+    for (let i = 0; i < am; i++) {
+      for (let j = 0; j < an; j++) {
+        const aVal = aFlat.data[i * an + j];
+        for (let k = 0; k < bm; k++) {
+          for (let l = 0; l < bn; l++) {
+            const outRow = i * bm + k;
+            const outCol = j * bn + l;
+            result[outRow * outShape[1] + outCol] = aVal * bFlat.data[k * bn + l];
+          }
+        }
+      }
+    }
+
+    return this.array(Array.from(result), outShape);
+  }
+
+  cond(arr: IFaceNDArray, _p: number | 'fro' = 2): number {
+    // Condition number requires SVD which is not implemented in WASM
+    // For now, throw an error similar to SVD
+    throw new Error('cond requires SVD which is not yet implemented in WASM backend');
+  }
+
+  slogdet(arr: IFaceNDArray): { sign: number; logabsdet: number } {
+    if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
+      throw new Error('slogdet requires a square 2D matrix');
+    }
+    const det = this.det(arr);
+    if (det === 0) {
+      return { sign: 0, logabsdet: -Infinity };
+    }
+    return {
+      sign: det > 0 ? 1 : -1,
+      logabsdet: Math.log(Math.abs(det)),
+    };
+  }
+
+  multiDot(arrays: IFaceNDArray[]): IFaceNDArray {
+    if (arrays.length === 0) {
+      throw new Error('multiDot requires at least one array');
+    }
+    if (arrays.length === 1) {
+      return this.array(Array.from(arrays[0].data), arrays[0].shape);
+    }
+    let result = arrays[0];
+    for (let i = 1; i < arrays.length; i++) {
+      result = this.matmul(result, arrays[i]);
+    }
+    return result;
+  }
+
+  // ============ Polynomial ============
+
+  polyval(p: IFaceNDArray, x: IFaceNDArray): IFaceNDArray {
+    const coeffs = this.flatten(p).data;
+    const result = x.data.map(xi => {
+      let res = 0;
+      for (let i = 0; i < coeffs.length; i++) {
+        res = res * xi + coeffs[i];
+      }
+      return res;
+    });
+    return this.array(Array.from(result), x.shape);
+  }
+
+  polyadd(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+    const aCoeffs = Array.from(this.flatten(a).data);
+    const bCoeffs = Array.from(this.flatten(b).data);
+    const maxLen = Math.max(aCoeffs.length, bCoeffs.length);
+    const result = new Float64Array(maxLen);
+    const aPadded = new Array(maxLen - aCoeffs.length).fill(0).concat(aCoeffs);
+    const bPadded = new Array(maxLen - bCoeffs.length).fill(0).concat(bCoeffs);
+    for (let i = 0; i < maxLen; i++) {
+      result[i] = aPadded[i] + bPadded[i];
+    }
+    return this.array(Array.from(result), [maxLen]);
+  }
+
+  polymul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+    const aCoeffs = Array.from(this.flatten(a).data);
+    const bCoeffs = Array.from(this.flatten(b).data);
+    const resultLen = aCoeffs.length + bCoeffs.length - 1;
+    const result = new Float64Array(resultLen);
+    for (let i = 0; i < aCoeffs.length; i++) {
+      for (let j = 0; j < bCoeffs.length; j++) {
+        result[i + j] += aCoeffs[i] * bCoeffs[j];
+      }
+    }
+    return this.array(Array.from(result), [resultLen]);
+  }
+
+  polyfit(x: IFaceNDArray, y: IFaceNDArray, deg: number): IFaceNDArray {
+    const xData = this.flatten(x).data;
+    const yData = this.flatten(y).data;
+    const n = xData.length;
+    const m = deg + 1;
+
+    const V = new Float64Array(n * m);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < m; j++) {
+        V[i * m + j] = Math.pow(xData[i], deg - j);
+      }
+    }
+
+    const VtV = new Float64Array(m * m);
+    const Vty = new Float64Array(m);
+
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < m; j++) {
+        let sum = 0;
+        for (let k = 0; k < n; k++) {
+          sum += V[k * m + i] * V[k * m + j];
+        }
+        VtV[i * m + j] = sum;
+      }
+      let sum = 0;
+      for (let k = 0; k < n; k++) {
+        sum += V[k * m + i] * yData[k];
+      }
+      Vty[i] = sum;
+    }
+
+    const A = Array.from(VtV);
+    const b = Array.from(Vty);
+
+    for (let k = 0; k < m; k++) {
+      let maxVal = Math.abs(A[k * m + k]);
+      let maxRow = k;
+      for (let i = k + 1; i < m; i++) {
+        if (Math.abs(A[i * m + k]) > maxVal) {
+          maxVal = Math.abs(A[i * m + k]);
+          maxRow = i;
+        }
+      }
+      if (maxRow !== k) {
+        for (let j = 0; j < m; j++) {
+          const tmp = A[k * m + j];
+          A[k * m + j] = A[maxRow * m + j];
+          A[maxRow * m + j] = tmp;
+        }
+        const tmp = b[k];
+        b[k] = b[maxRow];
+        b[maxRow] = tmp;
+      }
+      for (let i = k + 1; i < m; i++) {
+        const factor = A[i * m + k] / A[k * m + k];
+        for (let j = k; j < m; j++) {
+          A[i * m + j] -= factor * A[k * m + j];
+        }
+        b[i] -= factor * b[k];
+      }
+    }
+
+    const c = new Float64Array(m);
+    for (let i = m - 1; i >= 0; i--) {
+      let sum = b[i];
+      for (let j = i + 1; j < m; j++) {
+        sum -= A[i * m + j] * c[j];
+      }
+      c[i] = sum / A[i * m + i];
+    }
+
+    return this.array(Array.from(c), [m]);
+  }
+
+  roots(p: IFaceNDArray): IFaceNDArray {
+    const coeffs = Array.from(this.flatten(p).data);
+
+    while (coeffs.length > 0 && coeffs[0] === 0) {
+      coeffs.shift();
+    }
+
+    if (coeffs.length <= 1) {
+      return this.array([], [0]);
+    }
+
+    const n = coeffs.length - 1;
+
+    const a0 = coeffs[0];
+    for (let i = 0; i < coeffs.length; i++) {
+      coeffs[i] /= a0;
+    }
+
+    const C = new Float64Array(n * n);
+    for (let i = 1; i < n; i++) {
+      C[i * n + (i - 1)] = 1;
+    }
+    for (let i = 0; i < n; i++) {
+      C[i * n + (n - 1)] = -coeffs[n - i];
+    }
+
+    const maxIter = 100;
+    const tol = 1e-10;
+    const roots: number[] = [];
+
+    const H = Array.from(C);
+
+    let size = n;
+    for (let deflation = 0; deflation < n; deflation++) {
+      if (size === 0) break;
+
+      if (size === 1) {
+        roots.push(H[0]);
+        break;
+      }
+
+      for (let iter = 0; iter < maxIter; iter++) {
+        const bottomLeft = Math.abs(H[(size - 1) * n + (size - 2)]);
+        const diag1 = Math.abs(H[(size - 2) * n + (size - 2)]);
+        const diag2 = Math.abs(H[(size - 1) * n + (size - 1)]);
+
+        if (bottomLeft < tol * (diag1 + diag2 + tol)) {
+          roots.push(H[(size - 1) * n + (size - 1)]);
+          size--;
+          break;
+        }
+
+        const d = (H[(size - 2) * n + (size - 2)] - H[(size - 1) * n + (size - 1)]) / 2;
+        const bElem = H[(size - 1) * n + (size - 2)];
+        const shift = H[(size - 1) * n + (size - 1)] -
+          (bElem * bElem) / (d + Math.sign(d || 1) * Math.sqrt(d * d + bElem * bElem));
+
+        for (let i = 0; i < size; i++) {
+          H[i * n + i] -= shift;
+        }
+
+        for (let i = 0; i < size - 1; i++) {
+          const a = H[i * n + i];
+          const b = H[(i + 1) * n + i];
+          const r = Math.sqrt(a * a + b * b);
+          if (r < tol) continue;
+          const c = a / r;
+          const s = b / r;
+
+          for (let j = 0; j < size; j++) {
+            const t1 = H[i * n + j];
+            const t2 = H[(i + 1) * n + j];
+            H[i * n + j] = c * t1 + s * t2;
+            H[(i + 1) * n + j] = -s * t1 + c * t2;
+          }
+
+          for (let j = 0; j < size; j++) {
+            const t1 = H[j * n + i];
+            const t2 = H[j * n + (i + 1)];
+            H[j * n + i] = c * t1 + s * t2;
+            H[j * n + (i + 1)] = -s * t1 + c * t2;
+          }
+        }
+
+        for (let i = 0; i < size; i++) {
+          H[i * n + i] += shift;
+        }
+      }
+
+      if (roots.length === deflation) {
+        roots.push(H[(size - 1) * n + (size - 1)]);
+        size--;
+      }
+    }
+
+    roots.sort((a, b) => b - a);
+
+    return this.array(roots, [roots.length]);
+  }
+
+  // ============ Interpolation ============
+
+  interp(x: IFaceNDArray, xp: IFaceNDArray, fp: IFaceNDArray): IFaceNDArray {
+    const xpData = this.flatten(xp).data;
+    const fpData = this.flatten(fp).data;
+
+    const result = x.data.map(xi => {
+      if (xi <= xpData[0]) return fpData[0];
+      if (xi >= xpData[xpData.length - 1]) return fpData[fpData.length - 1];
+
+      let lo = 0, hi = xpData.length - 1;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (xpData[mid] <= xi) lo = mid;
+        else hi = mid;
+      }
+
+      const t = (xi - xpData[lo]) / (xpData[hi] - xpData[lo]);
+      return fpData[lo] + t * (fpData[hi] - fpData[lo]);
+    });
+    return this.array(Array.from(result), x.shape);
+  }
+
+  // ============ Histogram ============
+
+  bincount(x: IFaceNDArray, weights?: IFaceNDArray, minlength?: number): IFaceNDArray {
+    const xFlat = this.flatten(x).data;
+    const wFlat = weights ? this.flatten(weights).data : null;
+
+    let maxVal = 0;
+    for (let i = 0; i < xFlat.length; i++) {
+      const v = Math.floor(xFlat[i]);
+      if (v < 0) throw new Error('bincount requires non-negative integers');
+      if (v > maxVal) maxVal = v;
+    }
+
+    const outLen = Math.max(maxVal + 1, minlength || 0);
+    const result = new Float64Array(outLen);
+
+    for (let i = 0; i < xFlat.length; i++) {
+      const bin = Math.floor(xFlat[i]);
+      result[bin] += wFlat ? wFlat[i] : 1;
+    }
+
+    return this.array(Array.from(result), [outLen]);
+  }
+
   // ============ Creation - Like Functions ============
 
   zerosLike(arr: IFaceNDArray): IFaceNDArray {
@@ -1112,6 +1461,323 @@ export class WasmBackend implements Backend {
     }
 
     return this.array(Array.from(result), outShape);
+  }
+
+  partition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
+    }
+
+    const result = new Float64Array(arr.data);
+    const strides = this._computeStrides(arr.shape);
+    const axisLen = arr.shape[axis];
+
+    if (kth < 0 || kth >= axisLen) {
+      throw new Error(`kth(=${kth}) out of bounds (${axisLen})`);
+    }
+
+    const outerShape = arr.shape.filter((_, i) => i !== axis);
+    const outerStrides = outerShape.length > 0 ? this._computeStrides(outerShape) : [1];
+    const outerSize = outerShape.reduce((a, b) => a * b, 1) || 1;
+
+    for (let outerIdx = 0; outerIdx < outerSize; outerIdx++) {
+      const outerCoords = new Array(outerShape.length);
+      let remaining = outerIdx;
+      for (let d = 0; d < outerShape.length; d++) {
+        outerCoords[d] = Math.floor(remaining / outerStrides[d]);
+        remaining = remaining % outerStrides[d];
+      }
+
+      const baseCoords = new Array(ndim);
+      let outerD = 0;
+      for (let d = 0; d < ndim; d++) {
+        if (d === axis) {
+          baseCoords[d] = 0;
+        } else {
+          baseCoords[d] = outerCoords[outerD++];
+        }
+      }
+
+      const slice: { value: number; idx: number }[] = [];
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        slice.push({ value: arr.data[idx], idx });
+      }
+
+      const nth = (arr: { value: number; idx: number }[], k: number, lo: number, hi: number) => {
+        while (lo < hi) {
+          const pivot = arr[Math.floor((lo + hi) / 2)].value;
+          let i = lo, j = hi;
+          while (i <= j) {
+            while (arr[i].value < pivot) i++;
+            while (arr[j].value > pivot) j--;
+            if (i <= j) {
+              const tmp = arr[i];
+              arr[i] = arr[j];
+              arr[j] = tmp;
+              i++;
+              j--;
+            }
+          }
+          if (k <= j) hi = j;
+          else if (k >= i) lo = i;
+          else break;
+        }
+      };
+
+      nth(slice, kth, 0, axisLen - 1);
+
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        result[idx] = slice[i].value;
+      }
+    }
+
+    return this.array(Array.from(result), arr.shape);
+  }
+
+  argpartition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
+    }
+
+    const result = new Float64Array(arr.data.length);
+    const strides = this._computeStrides(arr.shape);
+    const axisLen = arr.shape[axis];
+
+    if (kth < 0 || kth >= axisLen) {
+      throw new Error(`kth(=${kth}) out of bounds (${axisLen})`);
+    }
+
+    const outerShape = arr.shape.filter((_, i) => i !== axis);
+    const outerStrides = outerShape.length > 0 ? this._computeStrides(outerShape) : [1];
+    const outerSize = outerShape.reduce((a, b) => a * b, 1) || 1;
+
+    for (let outerIdx = 0; outerIdx < outerSize; outerIdx++) {
+      const outerCoords = new Array(outerShape.length);
+      let remaining = outerIdx;
+      for (let d = 0; d < outerShape.length; d++) {
+        outerCoords[d] = Math.floor(remaining / outerStrides[d]);
+        remaining = remaining % outerStrides[d];
+      }
+
+      const baseCoords = new Array(ndim);
+      let outerD = 0;
+      for (let d = 0; d < ndim; d++) {
+        if (d === axis) {
+          baseCoords[d] = 0;
+        } else {
+          baseCoords[d] = outerCoords[outerD++];
+        }
+      }
+
+      const indices: { value: number; origIdx: number }[] = [];
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        indices.push({ value: arr.data[idx], origIdx: i });
+      }
+
+      const nth = (arr: { value: number; origIdx: number }[], k: number, lo: number, hi: number) => {
+        while (lo < hi) {
+          const pivot = arr[Math.floor((lo + hi) / 2)].value;
+          let i = lo, j = hi;
+          while (i <= j) {
+            while (arr[i].value < pivot) i++;
+            while (arr[j].value > pivot) j--;
+            if (i <= j) {
+              const tmp = arr[i];
+              arr[i] = arr[j];
+              arr[j] = tmp;
+              i++;
+              j--;
+            }
+          }
+          if (k <= j) hi = j;
+          else if (k >= i) lo = i;
+          else break;
+        }
+      };
+
+      nth(indices, kth, 0, axisLen - 1);
+
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        result[idx] = indices[i].origIdx;
+      }
+    }
+
+    return this.array(Array.from(result), arr.shape);
+  }
+
+  lexsort(keys: IFaceNDArray[]): IFaceNDArray {
+    if (keys.length === 0) {
+      return this.array([], [0]);
+    }
+
+    const n = keys[0].data.length;
+    for (const key of keys) {
+      if (key.data.length !== n) {
+        throw new Error('all keys must have the same length');
+      }
+    }
+
+    const indices = Array.from({ length: n }, (_, i) => i);
+
+    indices.sort((a, b) => {
+      for (let k = keys.length - 1; k >= 0; k--) {
+        const va = keys[k].data[a];
+        const vb = keys[k].data[b];
+        if (va < vb) return -1;
+        if (va > vb) return 1;
+      }
+      return 0;
+    });
+
+    return this.array(indices, [n]);
+  }
+
+  compress(condition: IFaceNDArray, arr: IFaceNDArray, axis?: number): IFaceNDArray {
+    const condFlat = this.flatten(condition).data;
+
+    if (axis === undefined) {
+      const arrFlat = this.flatten(arr).data;
+      const result: number[] = [];
+      const len = Math.min(condFlat.length, arrFlat.length);
+      for (let i = 0; i < len; i++) {
+        if (condFlat[i] !== 0) {
+          result.push(arrFlat[i]);
+        }
+      }
+      return this.array(result, [result.length]);
+    }
+
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds`);
+    }
+
+    let trueCount = 0;
+    const axisLen = arr.shape[axis];
+    for (let i = 0; i < Math.min(condFlat.length, axisLen); i++) {
+      if (condFlat[i] !== 0) trueCount++;
+    }
+
+    const outShape = [...arr.shape];
+    outShape[axis] = trueCount;
+    const outSize = outShape.reduce((a, b) => a * b, 1);
+    const result = new Float64Array(outSize);
+
+    const srcStrides = this._computeStrides(arr.shape);
+    const dstStrides = this._computeStrides(outShape);
+
+    const mapping: number[] = [];
+    for (let i = 0; i < Math.min(condFlat.length, axisLen); i++) {
+      if (condFlat[i] !== 0) mapping.push(i);
+    }
+
+    for (let dstIdx = 0; dstIdx < outSize; dstIdx++) {
+      const coords = new Array(ndim);
+      let remaining = dstIdx;
+      for (let d = 0; d < ndim; d++) {
+        coords[d] = Math.floor(remaining / dstStrides[d]);
+        remaining = remaining % dstStrides[d];
+      }
+
+      coords[axis] = mapping[coords[axis]];
+
+      let srcIdx = 0;
+      for (let d = 0; d < ndim; d++) {
+        srcIdx += coords[d] * srcStrides[d];
+      }
+
+      result[dstIdx] = arr.data[srcIdx];
+    }
+
+    return this.array(Array.from(result), outShape);
+  }
+
+  extract(condition: IFaceNDArray, arr: IFaceNDArray): IFaceNDArray {
+    const condFlat = this.flatten(condition).data;
+    const arrFlat = this.flatten(arr).data;
+    const result: number[] = [];
+
+    const len = Math.min(condFlat.length, arrFlat.length);
+    for (let i = 0; i < len; i++) {
+      if (condFlat[i] !== 0) {
+        result.push(arrFlat[i]);
+      }
+    }
+
+    return this.array(result, [result.length]);
+  }
+
+  place(arr: IFaceNDArray, mask: IFaceNDArray, vals: IFaceNDArray): void {
+    const maskFlat = this.flatten(mask).data;
+    const valsFlat = this.flatten(vals).data;
+
+    let valIdx = 0;
+    for (let i = 0; i < arr.data.length && i < maskFlat.length; i++) {
+      if (maskFlat[i] !== 0) {
+        arr.data[i] = valsFlat[valIdx % valsFlat.length];
+        valIdx++;
+      }
+    }
+  }
+
+  select(condlist: IFaceNDArray[], choicelist: IFaceNDArray[], defaultVal: number = 0): IFaceNDArray {
+    if (condlist.length !== choicelist.length) {
+      throw new Error('condlist and choicelist must have same length');
+    }
+    if (condlist.length === 0) {
+      throw new Error('condlist and choicelist must not be empty');
+    }
+
+    const allArrays = [...condlist, ...choicelist];
+    const broadcasted = this.broadcastArrays(...allArrays);
+    const shape = broadcasted[0].shape;
+    const size = broadcasted[0].data.length;
+
+    const conditions = broadcasted.slice(0, condlist.length);
+    const choices = broadcasted.slice(condlist.length);
+
+    const result = new Float64Array(size).fill(defaultVal);
+
+    const selected = new Uint8Array(size);
+    for (let c = 0; c < condlist.length; c++) {
+      for (let i = 0; i < size; i++) {
+        if (!selected[i] && conditions[c].data[i] !== 0) {
+          result[i] = choices[c].data[i];
+          selected[i] = 1;
+        }
+      }
+    }
+
+    return this.array(Array.from(result), shape);
   }
 
   // ============ Batched Operations ============
@@ -2041,6 +2707,11 @@ export class WasmBackend implements Backend {
     });
 
     return this.array(result, [result.length]);
+  }
+
+  // No-op for WASM backend (all data is already on CPU)
+  async materializeAll(): Promise<void> {
+    // Nothing to do
   }
 }
 

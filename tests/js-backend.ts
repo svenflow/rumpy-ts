@@ -719,6 +719,50 @@ export class JsBackend implements Backend {
     return new JsNDArray(result, outShape);
   }
 
+  cond(arr: NDArray, p: number | 'fro' = 2): number {
+    if (arr.shape.length !== 2) {
+      throw new Error('cond requires a 2D matrix');
+    }
+    // Compute condition number using SVD
+    const { s } = this.svd(arr);
+    const sData = s.data;
+    const sMax = Math.max(...sData);
+    const sMin = Math.min(...sData.filter(v => v > 0)); // Exclude zeros
+    if (sMin === 0 || sData.length === 0) {
+      return Infinity;
+    }
+    return sMax / sMin;
+  }
+
+  slogdet(arr: NDArray): { sign: number; logabsdet: number } {
+    if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
+      throw new Error('slogdet requires a square 2D matrix');
+    }
+    const det = this.det(arr);
+    if (det === 0) {
+      return { sign: 0, logabsdet: -Infinity };
+    }
+    return {
+      sign: det > 0 ? 1 : -1,
+      logabsdet: Math.log(Math.abs(det)),
+    };
+  }
+
+  multiDot(arrays: NDArray[]): NDArray {
+    if (arrays.length === 0) {
+      throw new Error('multiDot requires at least one array');
+    }
+    if (arrays.length === 1) {
+      return new JsNDArray(arrays[0].data.slice(), arrays[0].shape);
+    }
+    // Simple left-to-right multiplication (could optimize with dynamic programming)
+    let result = arrays[0];
+    for (let i = 1; i < arrays.length; i++) {
+      result = this.matmul(result, arrays[i]);
+    }
+    return result;
+  }
+
   // ============ Polynomial ============
 
   polyval(p: NDArray, x: NDArray): NDArray {
@@ -757,6 +801,218 @@ export class JsBackend implements Backend {
       }
     }
     return new JsNDArray(result, [resultLen]);
+  }
+
+  polyfit(x: NDArray, y: NDArray, deg: number): NDArray {
+    // Least squares polynomial fit
+    // Build Vandermonde matrix for x: [[x_i^deg, x_i^(deg-1), ..., x_i^0], ...]
+    const xData = this.flatten(x).data;
+    const yData = this.flatten(y).data;
+    const n = xData.length;
+    const m = deg + 1;
+
+    // Vandermonde matrix V[i,j] = x[i]^(deg-j)
+    const V = new Float64Array(n * m);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < m; j++) {
+        V[i * m + j] = Math.pow(xData[i], deg - j);
+      }
+    }
+
+    // Solve least squares using normal equations: (V^T V) c = V^T y
+    // V^T V is (m x m), V^T y is (m x 1)
+    const VtV = new Float64Array(m * m);
+    const Vty = new Float64Array(m);
+
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < m; j++) {
+        let sum = 0;
+        for (let k = 0; k < n; k++) {
+          sum += V[k * m + i] * V[k * m + j];
+        }
+        VtV[i * m + j] = sum;
+      }
+      let sum = 0;
+      for (let k = 0; k < n; k++) {
+        sum += V[k * m + i] * yData[k];
+      }
+      Vty[i] = sum;
+    }
+
+    // Solve VtV * c = Vty using Gaussian elimination
+    const A = Array.from(VtV);
+    const b = Array.from(Vty);
+
+    // Forward elimination with partial pivoting
+    for (let k = 0; k < m; k++) {
+      // Find pivot
+      let maxVal = Math.abs(A[k * m + k]);
+      let maxRow = k;
+      for (let i = k + 1; i < m; i++) {
+        if (Math.abs(A[i * m + k]) > maxVal) {
+          maxVal = Math.abs(A[i * m + k]);
+          maxRow = i;
+        }
+      }
+      // Swap rows
+      if (maxRow !== k) {
+        for (let j = 0; j < m; j++) {
+          const tmp = A[k * m + j];
+          A[k * m + j] = A[maxRow * m + j];
+          A[maxRow * m + j] = tmp;
+        }
+        const tmp = b[k];
+        b[k] = b[maxRow];
+        b[maxRow] = tmp;
+      }
+      // Eliminate
+      for (let i = k + 1; i < m; i++) {
+        const factor = A[i * m + k] / A[k * m + k];
+        for (let j = k; j < m; j++) {
+          A[i * m + j] -= factor * A[k * m + j];
+        }
+        b[i] -= factor * b[k];
+      }
+    }
+
+    // Back substitution
+    const c = new Float64Array(m);
+    for (let i = m - 1; i >= 0; i--) {
+      let sum = b[i];
+      for (let j = i + 1; j < m; j++) {
+        sum -= A[i * m + j] * c[j];
+      }
+      c[i] = sum / A[i * m + i];
+    }
+
+    return new JsNDArray(c, [m]);
+  }
+
+  roots(p: NDArray): NDArray {
+    // Find roots of polynomial using companion matrix eigenvalues
+    const coeffs = Array.from(this.flatten(p).data);
+
+    // Remove leading zeros
+    while (coeffs.length > 0 && coeffs[0] === 0) {
+      coeffs.shift();
+    }
+
+    if (coeffs.length === 0) {
+      return new JsNDArray(new Float64Array(0), [0]);
+    }
+    if (coeffs.length === 1) {
+      return new JsNDArray(new Float64Array(0), [0]);
+    }
+
+    const n = coeffs.length - 1;
+
+    // Normalize by leading coefficient
+    const a0 = coeffs[0];
+    for (let i = 0; i < coeffs.length; i++) {
+      coeffs[i] /= a0;
+    }
+
+    // Build companion matrix
+    // [0, 0, ..., 0, -c_n]
+    // [1, 0, ..., 0, -c_{n-1}]
+    // [0, 1, ..., 0, -c_{n-2}]
+    // ...
+    // [0, 0, ..., 1, -c_1]
+    const C = new Float64Array(n * n);
+    for (let i = 1; i < n; i++) {
+      C[i * n + (i - 1)] = 1;
+    }
+    for (let i = 0; i < n; i++) {
+      C[i * n + (n - 1)] = -coeffs[n - i];
+    }
+
+    // Use QR iteration to find eigenvalues (simplified for real roots)
+    // This is a basic implementation - for complex roots, would need complex arithmetic
+    const maxIter = 100;
+    const tol = 1e-10;
+    const roots: number[] = [];
+
+    // Create a working copy
+    const H = Array.from(C);
+
+    // Use deflation and QR iteration
+    let size = n;
+    for (let deflation = 0; deflation < n; deflation++) {
+      if (size === 0) break;
+
+      if (size === 1) {
+        roots.push(H[0]);
+        break;
+      }
+
+      // Simple QR iteration with shifts
+      for (let iter = 0; iter < maxIter; iter++) {
+        // Check for convergence (bottom-left element near zero)
+        const bottomLeft = Math.abs(H[(size - 1) * n + (size - 2)]);
+        const diag1 = Math.abs(H[(size - 2) * n + (size - 2)]);
+        const diag2 = Math.abs(H[(size - 1) * n + (size - 1)]);
+
+        if (bottomLeft < tol * (diag1 + diag2 + tol)) {
+          // Eigenvalue found
+          roots.push(H[(size - 1) * n + (size - 1)]);
+          size--;
+          break;
+        }
+
+        // Wilkinson shift
+        const d = (H[(size - 2) * n + (size - 2)] - H[(size - 1) * n + (size - 1)]) / 2;
+        const bElem = H[(size - 1) * n + (size - 2)];
+        const shift = H[(size - 1) * n + (size - 1)] -
+          (bElem * bElem) / (d + Math.sign(d || 1) * Math.sqrt(d * d + bElem * bElem));
+
+        // Apply shift
+        for (let i = 0; i < size; i++) {
+          H[i * n + i] -= shift;
+        }
+
+        // QR step via Givens rotations
+        for (let i = 0; i < size - 1; i++) {
+          const a = H[i * n + i];
+          const b = H[(i + 1) * n + i];
+          const r = Math.sqrt(a * a + b * b);
+          if (r < tol) continue;
+          const c = a / r;
+          const s = b / r;
+
+          // Apply rotation to H from left
+          for (let j = 0; j < size; j++) {
+            const t1 = H[i * n + j];
+            const t2 = H[(i + 1) * n + j];
+            H[i * n + j] = c * t1 + s * t2;
+            H[(i + 1) * n + j] = -s * t1 + c * t2;
+          }
+
+          // Apply rotation to H from right
+          for (let j = 0; j < size; j++) {
+            const t1 = H[j * n + i];
+            const t2 = H[j * n + (i + 1)];
+            H[j * n + i] = c * t1 + s * t2;
+            H[j * n + (i + 1)] = -s * t1 + c * t2;
+          }
+        }
+
+        // Remove shift
+        for (let i = 0; i < size; i++) {
+          H[i * n + i] += shift;
+        }
+      }
+
+      if (roots.length === deflation) {
+        // Did not converge - use diagonal element as approximation
+        roots.push(H[(size - 1) * n + (size - 1)]);
+        size--;
+      }
+    }
+
+    // Sort roots
+    roots.sort((a, b) => b - a);
+
+    return new JsNDArray(new Float64Array(roots), [roots.length]);
   }
 
   // ============ Interpolation ============
@@ -806,6 +1062,349 @@ export class JsBackend implements Backend {
     }
 
     return new JsNDArray(result, [outLen]);
+  }
+
+  // ============ Advanced Indexing ============
+
+  partition(arr: NDArray, kth: number, axis: number = -1): NDArray {
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
+    }
+
+    const result = new Float64Array(arr.data);
+    const strides = this._computeStrides(arr.shape);
+    const axisLen = arr.shape[axis];
+
+    if (kth < 0 || kth >= axisLen) {
+      throw new Error(`kth(=${kth}) out of bounds (${axisLen})`);
+    }
+
+    const outerShape = arr.shape.filter((_, i) => i !== axis);
+    const outerStrides = outerShape.length > 0 ? this._computeStrides(outerShape) : [1];
+    const outerSize = outerShape.reduce((a, b) => a * b, 1) || 1;
+
+    for (let outerIdx = 0; outerIdx < outerSize; outerIdx++) {
+      const outerCoords = new Array(outerShape.length);
+      let remaining = outerIdx;
+      for (let d = 0; d < outerShape.length; d++) {
+        outerCoords[d] = Math.floor(remaining / outerStrides[d]);
+        remaining = remaining % outerStrides[d];
+      }
+
+      const baseCoords = new Array(ndim);
+      let outerD = 0;
+      for (let d = 0; d < ndim; d++) {
+        if (d === axis) {
+          baseCoords[d] = 0;
+        } else {
+          baseCoords[d] = outerCoords[outerD++];
+        }
+      }
+
+      // Extract slice along axis
+      const slice: { value: number; idx: number }[] = [];
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        slice.push({ value: arr.data[idx], idx });
+      }
+
+      // Quickselect-style partition
+      const nth = (arr: { value: number; idx: number }[], k: number, lo: number, hi: number) => {
+        while (lo < hi) {
+          const pivot = arr[Math.floor((lo + hi) / 2)].value;
+          let i = lo, j = hi;
+          while (i <= j) {
+            while (arr[i].value < pivot) i++;
+            while (arr[j].value > pivot) j--;
+            if (i <= j) {
+              const tmp = arr[i];
+              arr[i] = arr[j];
+              arr[j] = tmp;
+              i++;
+              j--;
+            }
+          }
+          if (k <= j) hi = j;
+          else if (k >= i) lo = i;
+          else break;
+        }
+      };
+
+      nth(slice, kth, 0, axisLen - 1);
+
+      // Write back partitioned values
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        result[idx] = slice[i].value;
+      }
+    }
+
+    return new JsNDArray(result, arr.shape);
+  }
+
+  argpartition(arr: NDArray, kth: number, axis: number = -1): NDArray {
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
+    }
+
+    const result = new Float64Array(arr.data.length);
+    const strides = this._computeStrides(arr.shape);
+    const axisLen = arr.shape[axis];
+
+    if (kth < 0 || kth >= axisLen) {
+      throw new Error(`kth(=${kth}) out of bounds (${axisLen})`);
+    }
+
+    const outerShape = arr.shape.filter((_, i) => i !== axis);
+    const outerStrides = outerShape.length > 0 ? this._computeStrides(outerShape) : [1];
+    const outerSize = outerShape.reduce((a, b) => a * b, 1) || 1;
+
+    for (let outerIdx = 0; outerIdx < outerSize; outerIdx++) {
+      const outerCoords = new Array(outerShape.length);
+      let remaining = outerIdx;
+      for (let d = 0; d < outerShape.length; d++) {
+        outerCoords[d] = Math.floor(remaining / outerStrides[d]);
+        remaining = remaining % outerStrides[d];
+      }
+
+      const baseCoords = new Array(ndim);
+      let outerD = 0;
+      for (let d = 0; d < ndim; d++) {
+        if (d === axis) {
+          baseCoords[d] = 0;
+        } else {
+          baseCoords[d] = outerCoords[outerD++];
+        }
+      }
+
+      // Extract slice indices along axis
+      const indices: { value: number; origIdx: number }[] = [];
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        indices.push({ value: arr.data[idx], origIdx: i });
+      }
+
+      // Quickselect-style partition
+      const nth = (arr: { value: number; origIdx: number }[], k: number, lo: number, hi: number) => {
+        while (lo < hi) {
+          const pivot = arr[Math.floor((lo + hi) / 2)].value;
+          let i = lo, j = hi;
+          while (i <= j) {
+            while (arr[i].value < pivot) i++;
+            while (arr[j].value > pivot) j--;
+            if (i <= j) {
+              const tmp = arr[i];
+              arr[i] = arr[j];
+              arr[j] = tmp;
+              i++;
+              j--;
+            }
+          }
+          if (k <= j) hi = j;
+          else if (k >= i) lo = i;
+          else break;
+        }
+      };
+
+      nth(indices, kth, 0, axisLen - 1);
+
+      // Write back indices
+      for (let i = 0; i < axisLen; i++) {
+        const coords = [...baseCoords];
+        coords[axis] = i;
+        let idx = 0;
+        for (let d = 0; d < ndim; d++) {
+          idx += coords[d] * strides[d];
+        }
+        result[idx] = indices[i].origIdx;
+      }
+    }
+
+    return new JsNDArray(result, arr.shape);
+  }
+
+  lexsort(keys: NDArray[]): NDArray {
+    // Sort by multiple keys - last key is primary sort key
+    if (keys.length === 0) {
+      return new JsNDArray(new Float64Array(0), [0]);
+    }
+
+    const n = keys[0].data.length;
+    for (const key of keys) {
+      if (key.data.length !== n) {
+        throw new Error('all keys must have the same length');
+      }
+    }
+
+    // Create indices array
+    const indices = Array.from({ length: n }, (_, i) => i);
+
+    // Sort indices using lexicographic comparison (last key is primary)
+    indices.sort((a, b) => {
+      for (let k = keys.length - 1; k >= 0; k--) {
+        const va = keys[k].data[a];
+        const vb = keys[k].data[b];
+        if (va < vb) return -1;
+        if (va > vb) return 1;
+      }
+      return 0;
+    });
+
+    return new JsNDArray(new Float64Array(indices), [n]);
+  }
+
+  compress(condition: NDArray, arr: NDArray, axis?: number): NDArray {
+    const condFlat = this.flatten(condition).data;
+
+    if (axis === undefined) {
+      // Compress flattened array
+      const arrFlat = this.flatten(arr).data;
+      const result: number[] = [];
+      const len = Math.min(condFlat.length, arrFlat.length);
+      for (let i = 0; i < len; i++) {
+        if (condFlat[i] !== 0) {
+          result.push(arrFlat[i]);
+        }
+      }
+      return new JsNDArray(new Float64Array(result), [result.length]);
+    }
+
+    const ndim = arr.shape.length;
+    axis = axis < 0 ? axis + ndim : axis;
+    if (axis < 0 || axis >= ndim) {
+      throw new Error(`axis ${axis} is out of bounds`);
+    }
+
+    // Count true conditions
+    let trueCount = 0;
+    const axisLen = arr.shape[axis];
+    for (let i = 0; i < Math.min(condFlat.length, axisLen); i++) {
+      if (condFlat[i] !== 0) trueCount++;
+    }
+
+    const outShape = [...arr.shape];
+    outShape[axis] = trueCount;
+    const outSize = outShape.reduce((a, b) => a * b, 1);
+    const result = new Float64Array(outSize);
+
+    const srcStrides = this._computeStrides(arr.shape);
+    const dstStrides = this._computeStrides(outShape);
+
+    // Build mapping from compressed index to original index
+    const mapping: number[] = [];
+    for (let i = 0; i < Math.min(condFlat.length, axisLen); i++) {
+      if (condFlat[i] !== 0) mapping.push(i);
+    }
+
+    for (let dstIdx = 0; dstIdx < outSize; dstIdx++) {
+      const coords = new Array(ndim);
+      let remaining = dstIdx;
+      for (let d = 0; d < ndim; d++) {
+        coords[d] = Math.floor(remaining / dstStrides[d]);
+        remaining = remaining % dstStrides[d];
+      }
+
+      // Map compressed axis coordinate to original
+      coords[axis] = mapping[coords[axis]];
+
+      let srcIdx = 0;
+      for (let d = 0; d < ndim; d++) {
+        srcIdx += coords[d] * srcStrides[d];
+      }
+
+      result[dstIdx] = arr.data[srcIdx];
+    }
+
+    return new JsNDArray(result, outShape);
+  }
+
+  extract(condition: NDArray, arr: NDArray): NDArray {
+    const condFlat = this.flatten(condition).data;
+    const arrFlat = this.flatten(arr).data;
+    const result: number[] = [];
+
+    const len = Math.min(condFlat.length, arrFlat.length);
+    for (let i = 0; i < len; i++) {
+      if (condFlat[i] !== 0) {
+        result.push(arrFlat[i]);
+      }
+    }
+
+    return new JsNDArray(new Float64Array(result), [result.length]);
+  }
+
+  place(arr: NDArray, mask: NDArray, vals: NDArray): void {
+    const maskFlat = this.flatten(mask).data;
+    const valsFlat = this.flatten(vals).data;
+
+    let valIdx = 0;
+    for (let i = 0; i < arr.data.length && i < maskFlat.length; i++) {
+      if (maskFlat[i] !== 0) {
+        arr.data[i] = valsFlat[valIdx % valsFlat.length];
+        valIdx++;
+      }
+    }
+  }
+
+  select(condlist: NDArray[], choicelist: NDArray[], defaultVal: number = 0): NDArray {
+    if (condlist.length !== choicelist.length) {
+      throw new Error('condlist and choicelist must have same length');
+    }
+    if (condlist.length === 0) {
+      throw new Error('condlist and choicelist must not be empty');
+    }
+
+    // All arrays must be broadcastable to same shape
+    const allArrays = [...condlist, ...choicelist];
+    const broadcasted = this.broadcastArrays(...allArrays);
+    const shape = broadcasted[0].shape;
+    const size = broadcasted[0].data.length;
+
+    const conditions = broadcasted.slice(0, condlist.length);
+    const choices = broadcasted.slice(condlist.length);
+
+    const result = new Float64Array(size).fill(defaultVal);
+
+    // Process conditions in reverse order (last condition has highest priority)
+    for (let c = condlist.length - 1; c >= 0; c--) {
+      for (let i = 0; i < size; i++) {
+        if (conditions[c].data[i] !== 0) {
+          result[i] = choices[c].data[i];
+        }
+      }
+    }
+
+    // Now process in forward order so first true condition wins
+    const selected = new Uint8Array(size);
+    for (let c = 0; c < condlist.length; c++) {
+      for (let i = 0; i < size; i++) {
+        if (!selected[i] && conditions[c].data[i] !== 0) {
+          result[i] = choices[c].data[i];
+          selected[i] = 1;
+        }
+      }
+    }
+
+    return new JsNDArray(result, shape);
   }
 
   // ============ Math - Binary ============
@@ -2805,6 +3404,11 @@ export class JsBackend implements Backend {
     });
 
     return new JsNDArray(new Float64Array(result), [result.length]);
+  }
+
+  // No-op for JS backend (all data is already on CPU)
+  async materializeAll(): Promise<void> {
+    // Nothing to do
   }
 }
 

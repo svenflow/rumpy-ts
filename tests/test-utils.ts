@@ -24,11 +24,45 @@ export function arraysApproxEq(
   return true;
 }
 
-/** Default tolerance for floating point comparisons */
+/** Default tolerance for floating point comparisons (f64) */
 export const DEFAULT_TOL = 1e-10;
 
 /** Relaxed tolerance for operations with accumulated error */
 export const RELAXED_TOL = 1e-6;
+
+/** WebGPU tolerance - f32 has ~6-7 decimal digits of precision */
+export const WEBGPU_TOL = 1e-5;
+
+/** Get tolerance appropriate for backend precision */
+export function getTol(backend: Backend, relaxed: boolean = false): number {
+  if (backend.name === 'webgpu') {
+    // WebGPU uses f32 which has ~6-7 decimal digits precision
+    return relaxed ? 1e-4 : WEBGPU_TOL;
+  }
+  return relaxed ? RELAXED_TOL : DEFAULT_TOL;
+}
+
+/**
+ * Get array data, materializing GPU tensors if needed.
+ * For non-GPU backends, returns data immediately.
+ * For GPU backends, awaits materialization first.
+ */
+export async function getData(arr: NDArray, backend: Backend): Promise<number[]> {
+  if (backend.materializeAll) {
+    await backend.materializeAll();
+  }
+  return arr.toArray();
+}
+
+/**
+ * Same as getData but for multiple arrays at once (more efficient for GPU)
+ */
+export async function getDataMany(arrays: NDArray[], backend: Backend): Promise<number[][]> {
+  if (backend.materializeAll) {
+    await backend.materializeAll();
+  }
+  return arrays.map(arr => arr.toArray());
+}
 
 /** NDArray interface */
 export interface NDArray {
@@ -137,17 +171,31 @@ export interface Backend {
   // ============ Advanced Linalg ============
   matrixPower(arr: NDArray, n: number): NDArray;
   kron(a: NDArray, b: NDArray): NDArray;
+  cond(arr: NDArray, p?: number | 'fro'): number;
+  slogdet(arr: NDArray): { sign: number; logabsdet: number };
+  multiDot(arrays: NDArray[]): NDArray;
 
   // ============ Polynomial ============
   polyval(p: NDArray, x: NDArray): NDArray;
   polyadd(a: NDArray, b: NDArray): NDArray;
   polymul(a: NDArray, b: NDArray): NDArray;
+  polyfit(x: NDArray, y: NDArray, deg: number): NDArray;
+  roots(p: NDArray): NDArray;
 
   // ============ Interpolation ============
   interp(x: NDArray, xp: NDArray, fp: NDArray): NDArray;
 
   // ============ Histogram ============
   bincount(x: NDArray, weights?: NDArray, minlength?: number): NDArray;
+
+  // ============ Advanced Indexing ============
+  partition(arr: NDArray, kth: number, axis?: number): NDArray;
+  argpartition(arr: NDArray, kth: number, axis?: number): NDArray;
+  lexsort(keys: NDArray[]): NDArray;
+  compress(condition: NDArray, arr: NDArray, axis?: number): NDArray;
+  extract(condition: NDArray, arr: NDArray): NDArray;
+  place(arr: NDArray, mask: NDArray, vals: NDArray): void;
+  select(condlist: NDArray[], choicelist: NDArray[], defaultVal?: number): NDArray;
 
   // ============ Math - Binary ============
   add(a: NDArray, b: NDArray): NDArray;
@@ -283,4 +331,9 @@ export interface Backend {
   argsort(arr: NDArray, axis?: number): NDArray;
   searchsorted(arr: NDArray, v: number | NDArray, side?: 'left' | 'right'): NDArray | number;
   unique(arr: NDArray): NDArray;
+
+  // ============ GPU Materialization ============
+  // For GPU backends: batch-read all pending GPU data before sync access
+  // For non-GPU backends: no-op
+  materializeAll?(): Promise<void>;
 }
