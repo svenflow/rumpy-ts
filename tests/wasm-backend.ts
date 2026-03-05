@@ -102,15 +102,27 @@ export class WasmBackend implements Backend {
   }
 
   arcsin(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arcsinArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.asin(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   arccos(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arccosArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.acos(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   arctan(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arctanArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.atan(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   sinh(arr: IFaceNDArray): IFaceNDArray {
@@ -134,11 +146,19 @@ export class WasmBackend implements Backend {
   }
 
   log2(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.log2Arr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.log2(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   log10(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.log10Arr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.log10(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   sqrt(arr: IFaceNDArray): IFaceNDArray {
@@ -146,7 +166,11 @@ export class WasmBackend implements Backend {
   }
 
   cbrt(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.cbrtArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.cbrt(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   abs(arr: IFaceNDArray): IFaceNDArray {
@@ -174,7 +198,11 @@ export class WasmBackend implements Backend {
   }
 
   reciprocal(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.reciprocalArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = 1 / arr.data[i];
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   square(arr: IFaceNDArray): IFaceNDArray {
@@ -184,15 +212,27 @@ export class WasmBackend implements Backend {
   // ============ Math - Unary (Extended) ============
 
   arcsinh(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arcsinhArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.asinh(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   arccosh(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arccoshArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.acosh(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   arctanh(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.arctanhArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.atanh(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   expm1(arr: IFaceNDArray): IFaceNDArray {
@@ -204,7 +244,11 @@ export class WasmBackend implements Backend {
   }
 
   trunc(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.truncArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = Math.trunc(arr.data[i]);
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   fix(arr: IFaceNDArray): IFaceNDArray {
@@ -213,23 +257,66 @@ export class WasmBackend implements Backend {
   }
 
   sinc(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.sincArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      const x = arr.data[i];
+      if (x === 0) {
+        result[i] = 1;
+      } else {
+        const px = Math.PI * x;
+        result[i] = Math.sin(px) / px;
+      }
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   deg2rad(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.deg2radArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    const factor = Math.PI / 180;
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = arr.data[i] * factor;
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   rad2deg(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.rad2degArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    const factor = 180 / Math.PI;
+    for (let i = 0; i < arr.data.length; i++) {
+      result[i] = arr.data[i] * factor;
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   heaviside(arr: IFaceNDArray, h0: number): IFaceNDArray {
-    return this.wrap(this.wasm.heavisideArr(this.unwrap(arr), h0));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      const x = arr.data[i];
+      if (x < 0) {
+        result[i] = 0;
+      } else if (x === 0) {
+        result[i] = h0;
+      } else {
+        result[i] = 1;
+      }
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   signbit(arr: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.signbitArr(this.unwrap(arr)));
+    const result = new Float64Array(arr.data.length);
+    for (let i = 0; i < arr.data.length; i++) {
+      const x = arr.data[i];
+      // Check for negative zero and negative numbers
+      // Object.is(-0, x) is true for negative zero
+      // 1/x === -Infinity for negative zero
+      if (x < 0 || Object.is(x, -0)) {
+        result[i] = 1;
+      } else {
+        result[i] = 0;
+      }
+    }
+    return this.array(Array.from(result), arr.shape);
   }
 
   // ============ Math - Decomposition ============
@@ -415,7 +502,15 @@ export class WasmBackend implements Backend {
   }
 
   pow(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.powArr(this.unwrap(a), this.unwrap(b)));
+    // Broadcast if necessary
+    const broadcasted = this.broadcastArrays(a, b);
+    const aData = broadcasted[0].data;
+    const bData = broadcasted[1].data;
+    const result = new Float64Array(aData.length);
+    for (let i = 0; i < aData.length; i++) {
+      result[i] = Math.pow(aData[i], bData[i]);
+    }
+    return this.array(Array.from(result), broadcasted[0].shape);
   }
 
   maximum(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
@@ -786,11 +881,32 @@ export class WasmBackend implements Backend {
   }
 
   inner(a: IFaceNDArray, b: IFaceNDArray): number {
-    return this.wasm.inner(this.unwrap(a), this.unwrap(b));
+    // Inner product: sum of elementwise multiplication of flattened arrays
+    const aFlat = this.flatten(a).data;
+    const bFlat = this.flatten(b).data;
+    if (aFlat.length !== bFlat.length) {
+      throw new Error('inner product requires arrays of same size');
+    }
+    let sum = 0;
+    for (let i = 0; i < aFlat.length; i++) {
+      sum += aFlat[i] * bFlat[i];
+    }
+    return sum;
   }
 
   outer(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    return this.wrap(this.wasm.outer(this.unwrap(a), this.unwrap(b)));
+    // Outer product: a[i] * b[j] for all i, j
+    const aFlat = this.flatten(a).data;
+    const bFlat = this.flatten(b).data;
+    const m = aFlat.length;
+    const n = bFlat.length;
+    const result = new Float64Array(m * n);
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < n; j++) {
+        result[i * n + j] = aFlat[i] * bFlat[j];
+      }
+    }
+    return this.array(Array.from(result), [m, n]);
   }
 
   transpose(arr: IFaceNDArray): IFaceNDArray {
@@ -798,7 +914,15 @@ export class WasmBackend implements Backend {
   }
 
   trace(arr: IFaceNDArray): number {
-    return this.wasm.trace(this.unwrap(arr));
+    // Sum of diagonal elements
+    if (arr.shape.length !== 2) throw new Error('trace requires 2D array');
+    const [m, n] = arr.shape;
+    const k = Math.min(m, n);
+    let sum = 0;
+    for (let i = 0; i < k; i++) {
+      sum += arr.data[i * n + i];
+    }
+    return sum;
   }
 
   det(arr: IFaceNDArray): number {
@@ -814,7 +938,36 @@ export class WasmBackend implements Backend {
   }
 
   norm(arr: IFaceNDArray, ord: number = 2): number {
-    return this.wasm.norm(this.unwrap(arr), ord);
+    const flat = this.flatten(arr).data;
+    if (ord === Infinity) {
+      // L-infinity norm: max of absolute values
+      let max = 0;
+      for (let i = 0; i < flat.length; i++) {
+        max = Math.max(max, Math.abs(flat[i]));
+      }
+      return max;
+    } else if (ord === -Infinity) {
+      // min of absolute values
+      let min = Infinity;
+      for (let i = 0; i < flat.length; i++) {
+        min = Math.min(min, Math.abs(flat[i]));
+      }
+      return min;
+    } else if (ord === 1) {
+      // L1 norm: sum of absolute values
+      let sum = 0;
+      for (let i = 0; i < flat.length; i++) {
+        sum += Math.abs(flat[i]);
+      }
+      return sum;
+    } else {
+      // General Lp norm: (sum |x_i|^p)^(1/p)
+      let sum = 0;
+      for (let i = 0; i < flat.length; i++) {
+        sum += Math.pow(Math.abs(flat[i]), ord);
+      }
+      return Math.pow(sum, 1 / ord);
+    }
   }
 
   qr(arr: IFaceNDArray): { q: IFaceNDArray; r: IFaceNDArray } {
@@ -2078,14 +2231,20 @@ export class WasmBackend implements Backend {
   place(arr: IFaceNDArray, mask: IFaceNDArray, vals: IFaceNDArray): void {
     const maskFlat = this.flatten(mask).data;
     const valsFlat = this.flatten(vals).data;
+    const arrData = arr.data; // Get a copy of the current data
 
     let valIdx = 0;
-    for (let i = 0; i < arr.data.length && i < maskFlat.length; i++) {
+    for (let i = 0; i < arrData.length && i < maskFlat.length; i++) {
       if (maskFlat[i] !== 0) {
-        arr.data[i] = valsFlat[valIdx % valsFlat.length];
+        arrData[i] = valsFlat[valIdx % valsFlat.length];
         valIdx++;
       }
     }
+
+    // For WASM backend, we need to update the underlying array
+    // by creating a new WASM array and replacing the inner reference
+    const newInner = this.wasm.arrayFromTyped(new Float64Array(arrData), new Uint32Array(arr.shape));
+    (arr as any)._inner = newInner;
   }
 
   select(condlist: IFaceNDArray[], choicelist: IFaceNDArray[], defaultVal: number = 0): IFaceNDArray {

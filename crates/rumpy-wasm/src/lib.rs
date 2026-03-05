@@ -1160,6 +1160,195 @@ pub fn cosh_arr(arr: &NDArray) -> NDArray {
     NDArray::new(CpuBackend::cosh(&arr.inner))
 }
 
+// Inverse trigonometric
+#[wasm_bindgen(js_name = arcsinArr)]
+pub fn arcsin_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::arcsin(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = arccosArr)]
+pub fn arccos_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::arccos(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = arctanArr)]
+pub fn arctan_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::arctan(&arr.inner))
+}
+
+// Inverse hyperbolic
+#[wasm_bindgen(js_name = arcsinhArr)]
+pub fn arcsinh_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| x.asinh());
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+#[wasm_bindgen(js_name = arccoshArr)]
+pub fn arccosh_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| x.acosh());
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+#[wasm_bindgen(js_name = arctanhArr)]
+pub fn arctanh_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| x.atanh());
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+// Logarithms
+#[wasm_bindgen(js_name = log2Arr)]
+pub fn log2_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::log2(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = log10Arr)]
+pub fn log10_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::log10(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = log1pArr)]
+pub fn log1p_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::log1p(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = expm1Arr)]
+pub fn expm1_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::expm1(&arr.inner))
+}
+
+// Roots and powers
+#[wasm_bindgen(js_name = cbrtArr)]
+pub fn cbrt_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::cbrt(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = reciprocalArr)]
+pub fn reciprocal_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::reciprocal(&arr.inner))
+}
+
+// Angle conversions
+#[wasm_bindgen(js_name = deg2radArr)]
+pub fn deg2rad_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::deg2rad(&arr.inner))
+}
+
+#[wasm_bindgen(js_name = rad2degArr)]
+pub fn rad2deg_arr(arr: &NDArray) -> NDArray {
+    NDArray::new(CpuBackend::rad2deg(&arr.inner))
+}
+
+// Truncation
+#[wasm_bindgen(js_name = truncArr)]
+pub fn trunc_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| x.trunc());
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+// Special functions
+#[wasm_bindgen(js_name = sincArr)]
+pub fn sinc_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| {
+        if x == 0.0 {
+            1.0
+        } else {
+            let pi_x = std::f64::consts::PI * x;
+            pi_x.sin() / pi_x
+        }
+    });
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+#[wasm_bindgen(js_name = heavisideArr)]
+pub fn heaviside_arr(arr: &NDArray, h0: f64) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| {
+        if x < 0.0 {
+            0.0
+        } else if x == 0.0 {
+            h0
+        } else {
+            1.0
+        }
+    });
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+#[wasm_bindgen(js_name = signbitArr)]
+pub fn signbit_arr(arr: &NDArray) -> NDArray {
+    let data = arr.inner.as_ndarray();
+    let result = data.mapv(|x| if x.is_sign_negative() { 1.0 } else { 0.0 });
+    NDArray::new(rumpy_cpu::CpuArray::from_ndarray(result))
+}
+
+// Element-wise power
+#[wasm_bindgen(js_name = powArr)]
+pub fn pow_arr(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
+    CpuBackend::pow(&a.inner, &b.inner)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// Linear algebra helpers
+#[wasm_bindgen]
+pub fn inner(a: &NDArray, b: &NDArray) -> Result<f64, JsValue> {
+    CpuBackend::inner(&a.inner, &b.inner)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn outer(a: &NDArray, b: &NDArray) -> Result<NDArray, JsValue> {
+    CpuBackend::outer(&a.inner, &b.inner)
+        .map(NDArray::new)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn trace(arr: &NDArray) -> Result<f64, JsValue> {
+    CpuBackend::trace(&arr.inner)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub fn norm(arr: &NDArray, ord: Option<f64>) -> Result<f64, JsValue> {
+    CpuBackend::norm(&arr.inner, ord)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// Histogram
+#[wasm_bindgen]
+pub fn bincount(x: &NDArray, weights: Option<NDArray>, minlength: Option<usize>) -> Result<NDArray, JsValue> {
+    let x_data = x.inner.as_f64_slice();
+    let weights_data = weights.as_ref().map(|w| w.inner.as_f64_slice());
+    let minlen = minlength.unwrap_or(0);
+
+    // Find max value to determine output size
+    let mut max_val: usize = 0;
+    for &v in &x_data {
+        if v < 0.0 || v.fract() != 0.0 {
+            return Err(JsValue::from_str("bincount requires non-negative integers"));
+        }
+        max_val = max_val.max(v as usize);
+    }
+    let n = max_val.saturating_add(1).max(minlen);
+
+    let mut counts = vec![0.0; n];
+    for (i, &v) in x_data.iter().enumerate() {
+        let idx = v as usize;
+        if idx < n {
+            let w = weights_data.as_ref().map_or(1.0, |w| w[i]);
+            counts[idx] += w;
+        }
+    }
+
+    Ok(NDArray::new(rumpy_cpu::CpuArray::from_f64_vec(counts, vec![n]).unwrap()))
+}
+
 // ============ Linear algebra ============
 
 #[wasm_bindgen]
