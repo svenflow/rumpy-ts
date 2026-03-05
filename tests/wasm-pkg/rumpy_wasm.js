@@ -181,6 +181,27 @@ export class NDArray {
         return ret >>> 0;
     }
     /**
+     * @returns {NDArray}
+     */
+    argsort() {
+        const ret = wasm.ndarray_argsort(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return NDArray.__wrap(ret[0]);
+    }
+    /**
+     * @param {number} axis
+     * @returns {NDArray}
+     */
+    argsortAxis(axis) {
+        const ret = wasm.ndarray_argsortAxis(this.__wbg_ptr, axis);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return NDArray.__wrap(ret[0]);
+    }
+    /**
      * @param {string} dtype
      * @returns {NDArray}
      */
@@ -1196,6 +1217,27 @@ export class NDArray {
         return NDArray.__wrap(ret[0]);
     }
     /**
+     * @returns {NDArray}
+     */
+    sort() {
+        const ret = wasm.ndarray_sort(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return NDArray.__wrap(ret[0]);
+    }
+    /**
+     * @param {number} axis
+     * @returns {NDArray}
+     */
+    sortAxis(axis) {
+        const ret = wasm.ndarray_sortAxis(this.__wbg_ptr, axis);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return NDArray.__wrap(ret[0]);
+    }
+    /**
      * @param {number} num_splits
      * @param {number} axis
      * @returns {Array<any>}
@@ -1352,6 +1394,13 @@ export class NDArray {
         return NDArray.__wrap(ret[0]);
     }
     /**
+     * @returns {NDArray}
+     */
+    unique() {
+        const ret = wasm.ndarray_unique(this.__wbg_ptr);
+        return NDArray.__wrap(ret);
+    }
+    /**
      * @returns {number}
      */
     var() {
@@ -1407,6 +1456,66 @@ export function arange(start, stop, step) {
 }
 
 /**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arccosArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arccosArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arccoshArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arccoshArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arcsinArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arcsinArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arcsinhArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arcsinhArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arctanArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arctanArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function arctanhArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.arctanhArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
  * @param {Float64Array} data
  * @param {Uint32Array} shape
  * @returns {NDArray}
@@ -1442,6 +1551,26 @@ export function atan2Arr(y, x) {
 }
 
 /**
+ * @param {NDArray} x
+ * @param {NDArray | null} [weights]
+ * @param {number | null} [minlength]
+ * @returns {NDArray}
+ */
+export function bincount(x, weights, minlength) {
+    _assertClass(x, NDArray);
+    let ptr0 = 0;
+    if (!isLikeNone(weights)) {
+        _assertClass(weights, NDArray);
+        ptr0 = weights.__destroy_into_raw();
+    }
+    const ret = wasm.bincount(x.__wbg_ptr, ptr0, isLikeNone(minlength) ? 0x100000001 : (minlength) >>> 0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
+}
+
+/**
  * Create a causal attention mask (lower triangular matrix of -inf and 0)
  *
  * Returns a mask where positions that can attend are 0, others are -inf.
@@ -1454,6 +1583,16 @@ export function atan2Arr(y, x) {
  */
 export function causalMask(size) {
     const ret = wasm.causalMask(size);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function cbrtArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.cbrtArr(arr.__wbg_ptr);
     return NDArray.__wrap(ret);
 }
 
@@ -1511,6 +1650,21 @@ export function concatenate3(a, b, c, axis) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return NDArray.__wrap(ret[0]);
+}
+
+/**
+ * Condition number of a matrix (using SVD)
+ * Returns max(singular_values) / min(singular_values)
+ * @param {NDArray} arr
+ * @returns {number}
+ */
+export function cond(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.cond(arr.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
 }
 
 /**
@@ -1605,6 +1759,16 @@ export function coshArr(arr) {
 
 /**
  * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function deg2radArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.deg2radArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
  * @returns {number}
  */
 export function det(arr) {
@@ -1683,10 +1847,6 @@ export function expArr(arr) {
 }
 
 /**
- * Element-wise exp(x) - 1
- *
- * Computes exp(x) - 1 with better precision for small x.
- * Equivalent to numpy.expm1(x).
  * @param {NDArray} arr
  * @returns {NDArray}
  */
@@ -1712,6 +1872,70 @@ export function eye(n) {
 export function floorArr(arr) {
     _assertClass(arr, NDArray);
     const ret = wasm.floorArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * Element-wise fmax of two arrays (NaN-ignoring)
+ *
+ * Like maximum, but ignores NaN values - returns non-NaN when one is NaN.
+ * Equivalent to numpy.fmax(a, b).
+ * NOTE: Rust function name is fmax_op to avoid collision with C stdlib fmax()
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function fmaxArr(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.fmaxArr(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
+}
+
+/**
+ * Element-wise fmax with a scalar (NaN-ignoring)
+ * @param {NDArray} arr
+ * @param {number} scalar
+ * @returns {NDArray}
+ */
+export function fmaxScalar(arr, scalar) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.fmaxScalar(arr.__wbg_ptr, scalar);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * Element-wise fmin of two arrays (NaN-ignoring)
+ *
+ * Like minimum, but ignores NaN values - returns non-NaN when one is NaN.
+ * Equivalent to numpy.fmin(a, b).
+ * NOTE: Rust function name is fmin_op to avoid collision with C stdlib fmin()
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function fminArr(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.fminArr(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
+}
+
+/**
+ * Element-wise fmin with a scalar (NaN-ignoring)
+ * @param {NDArray} arr
+ * @param {number} scalar
+ * @returns {NDArray}
+ */
+export function fminScalar(arr, scalar) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.fminScalar(arr.__wbg_ptr, scalar);
     return NDArray.__wrap(ret);
 }
 
@@ -1749,6 +1973,17 @@ export function hasSharedArrayBuffer() {
 }
 
 /**
+ * @param {NDArray} arr
+ * @param {number} h0
+ * @returns {NDArray}
+ */
+export function heavisideArr(arr, h0) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.heavisideArr(arr.__wbg_ptr, h0);
+    return NDArray.__wrap(ret);
+}
+
+/**
  * Horizontal stack (concatenate along axis 1 for 2D+, axis 0 for 1D)
  * @param {NDArray} a
  * @param {NDArray} b
@@ -1781,6 +2016,21 @@ export function initThreadPool(num_threads) {
 }
 
 /**
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {number}
+ */
+export function inner(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.inner(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
+}
+
+/**
  * @param {NDArray} arr
  * @returns {NDArray}
  */
@@ -1805,10 +2055,16 @@ export function linspace(start, stop, num) {
 }
 
 /**
- * Element-wise log(1 + x)
- *
- * Computes log(1 + x) with better precision for small x.
- * Equivalent to numpy.log1p(x).
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function log10Arr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.log10Arr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
  * @param {NDArray} arr
  * @returns {NDArray}
  */
@@ -1822,10 +2078,58 @@ export function log1pArr(arr) {
  * @param {NDArray} arr
  * @returns {NDArray}
  */
+export function log2Arr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.log2Arr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
 export function logArr(arr) {
     _assertClass(arr, NDArray);
     const ret = wasm.logArr(arr.__wbg_ptr);
     return NDArray.__wrap(ret);
+}
+
+/**
+ * Element-wise log2(2^x1 + 2^x2) computed in a numerically stable way.
+ *
+ * Equivalent to numpy.logaddexp2(x1, x2).
+ * Useful for log2-space probability computations.
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function logaddexp2Arr(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.logaddexp2Arr(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
+}
+
+/**
+ * Element-wise log(exp(x1) + exp(x2)) computed in a numerically stable way.
+ *
+ * Equivalent to numpy.logaddexp(x1, x2).
+ * Useful for log-space probability computations.
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function logaddexpArr(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.logaddexpArr(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
 }
 
 /**
@@ -2423,7 +2727,8 @@ export function maxAbsDiff(a, b) {
  *
  * Compares two arrays element-by-element and returns the maximum values.
  * Equivalent to numpy.maximum(a, b).
- * Supports broadcasting.
+ * Supports broadcasting. NaN propagates: if either value is NaN, result is NaN.
+ * For NaN-ignoring behavior, use fmax instead.
  * @param {NDArray} a
  * @param {NDArray} b
  * @returns {NDArray}
@@ -2439,7 +2744,7 @@ export function maximum(a, b) {
 }
 
 /**
- * Element-wise maximum with a scalar
+ * Element-wise maximum with a scalar (NaN propagates)
  * @param {NDArray} arr
  * @param {number} scalar
  * @returns {NDArray}
@@ -2455,7 +2760,8 @@ export function maximumScalar(arr, scalar) {
  *
  * Compares two arrays element-by-element and returns the minimum values.
  * Equivalent to numpy.minimum(a, b).
- * Supports broadcasting.
+ * Supports broadcasting. NaN propagates: if either value is NaN, result is NaN.
+ * For NaN-ignoring behavior, use fmin instead.
  * @param {NDArray} a
  * @param {NDArray} b
  * @returns {NDArray}
@@ -2471,7 +2777,7 @@ export function minimum(a, b) {
 }
 
 /**
- * Element-wise minimum with a scalar
+ * Element-wise minimum with a scalar (NaN propagates)
  * @param {NDArray} arr
  * @param {number} scalar
  * @returns {NDArray}
@@ -2493,6 +2799,20 @@ export function negArr(arr) {
 }
 
 /**
+ * @param {NDArray} arr
+ * @param {number | null} [ord]
+ * @returns {number}
+ */
+export function norm(arr, ord) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.norm(arr.__wbg_ptr, !isLikeNone(ord), isLikeNone(ord) ? 0 : ord);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
+}
+
+/**
  * @param {Uint32Array} shape
  * @returns {NDArray}
  */
@@ -2501,6 +2821,21 @@ export function ones(shape) {
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.ones(ptr0, len0);
     return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function outer(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.outer(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
 }
 
 /**
@@ -2600,6 +2935,21 @@ export function packedBSize(k, n) {
 }
 
 /**
+ * @param {NDArray} a
+ * @param {NDArray} b
+ * @returns {NDArray}
+ */
+export function powArr(a, b) {
+    _assertClass(a, NDArray);
+    _assertClass(b, NDArray);
+    const ret = wasm.powArr(a.__wbg_ptr, b.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NDArray.__wrap(ret[0]);
+}
+
+/**
  * DEBUG: probe whether rayon workers are actually executing in parallel.
  *
  * Spawns N tasks, each recording its rayon thread index and spinning for
@@ -2649,6 +2999,31 @@ export function probeV3Path(m, n, k) {
     var v1 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v1;
+}
+
+/**
+ * QR decomposition: A = Q * R
+ * Returns [Q, R] where Q is orthogonal and R is upper triangular
+ * @param {NDArray} arr
+ * @returns {Array<any>}
+ */
+export function qr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.qr(arr.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function rad2degArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.rad2degArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
 }
 
 /**
@@ -2710,6 +3085,16 @@ export function randomUniform(low, high, shape) {
  * @param {NDArray} arr
  * @returns {NDArray}
  */
+export function reciprocalArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.reciprocalArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
 export function roundArr(arr) {
     _assertClass(arr, NDArray);
     const ret = wasm.roundArr(arr.__wbg_ptr);
@@ -2719,7 +3104,7 @@ export function roundArr(arr) {
 /**
  * Element-wise sign function
  *
- * Returns -1 for negative, 0 for zero, 1 for positive values.
+ * Returns -1 for negative, 0 for zero, 1 for positive values, NaN for NaN.
  * Equivalent to numpy.sign(x).
  * @param {NDArray} arr
  * @returns {NDArray}
@@ -2734,9 +3119,29 @@ export function signArr(arr) {
  * @param {NDArray} arr
  * @returns {NDArray}
  */
+export function signbitArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.signbitArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
 export function sinArr(arr) {
     _assertClass(arr, NDArray);
     const ret = wasm.sinArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function sincArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.sincArr(arr.__wbg_ptr);
     return NDArray.__wrap(ret);
 }
 
@@ -2826,6 +3231,21 @@ export function stack3(a, b, c, axis) {
 }
 
 /**
+ * SVD decomposition: A = U * diag(S) * Vt
+ * Returns [U, S, Vt] where U and Vt are orthogonal, S is singular values
+ * @param {NDArray} arr
+ * @returns {Array<any>}
+ */
+export function svd(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.svd(arr.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {NDArray} arr
  * @returns {NDArray}
  */
@@ -2842,6 +3262,29 @@ export function tanArr(arr) {
 export function tanhArr(arr) {
     _assertClass(arr, NDArray);
     const ret = wasm.tanhArr(arr.__wbg_ptr);
+    return NDArray.__wrap(ret);
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {number}
+ */
+export function trace(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.trace(arr.__wbg_ptr);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0];
+}
+
+/**
+ * @param {NDArray} arr
+ * @returns {NDArray}
+ */
+export function truncArr(arr) {
+    _assertClass(arr, NDArray);
+    const ret = wasm.truncArr(arr.__wbg_ptr);
     return NDArray.__wrap(ret);
 }
 
@@ -2964,19 +3407,19 @@ export function zeros(shape) {
 function __wbg_get_imports(memory) {
     const import0 = {
         __proto__: null,
-        __wbg___wbindgen_is_undefined_c18285b9fc34cb7d: function(arg0) {
+        __wbg___wbindgen_is_undefined_52709e72fb9f179c: function(arg0) {
             const ret = arg0 === undefined;
             return ret;
         },
-        __wbg___wbindgen_memory_f1258f0b3cab52b2: function() {
+        __wbg___wbindgen_memory_edb3f01e3930bbf6: function() {
             const ret = wasm.memory;
             return ret;
         },
-        __wbg___wbindgen_module_39ff3d28752148a9: function() {
+        __wbg___wbindgen_module_bf945c07123bafe2: function() {
             const ret = wasmModule;
             return ret;
         },
-        __wbg___wbindgen_throw_39bc967c0e5a9b58: function(arg0, arg1) {
+        __wbg___wbindgen_throw_6ddd609b62940d55: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_error_a6fa202b58aa1cd3: function(arg0, arg1) {
@@ -2993,11 +3436,11 @@ function __wbg_get_imports(memory) {
         __wbg_getRandomValues_b2176991427f6db8: function() { return handleError(function (arg0) {
             globalThis.crypto.getRandomValues(arg0);
         }, arguments); },
-        __wbg_has_14f08fae2dc367dc: function() { return handleError(function (arg0, arg1) {
+        __wbg_has_926ef2ff40b308cf: function() { return handleError(function (arg0, arg1) {
             const ret = Reflect.has(arg0, arg1);
             return ret;
         }, arguments); },
-        __wbg_instanceof_Window_4aba49e4d1a12365: function(arg0) {
+        __wbg_instanceof_Window_23e677d2c6843922: function(arg0) {
             let result;
             try {
                 result = arg0 instanceof Window;
@@ -3007,15 +3450,15 @@ function __wbg_get_imports(memory) {
             const ret = result;
             return ret;
         },
-        __wbg_length_326999dcd07f2163: function(arg0) {
+        __wbg_length_259ee9d041e381ad: function(arg0) {
             const ret = arg0.length;
             return ret;
         },
-        __wbg_length_5855c1f289dfffc1: function(arg0) {
+        __wbg_length_550d8a396009cd38: function(arg0) {
             const ret = arg0.length;
             return ret;
         },
-        __wbg_length_c2e7f800270db256: function(arg0) {
+        __wbg_length_ea16607d7b61445b: function(arg0) {
             const ret = arg0.length;
             return ret;
         },
@@ -3027,47 +3470,47 @@ function __wbg_get_imports(memory) {
             const ret = new Error();
             return ret;
         },
-        __wbg_new_cbee8c0d5c479eac: function() {
+        __wbg_new_a70fbab9066b301f: function() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_from_slice_b1617cc9f69683c5: function(arg0, arg1) {
-            const ret = new Float64Array(getArrayF64FromWasm0(arg0, arg1));
-            return ret;
-        },
-        __wbg_new_from_slice_e21686f285806d67: function(arg0, arg1) {
+        __wbg_new_from_slice_ff2c15e8e05ffdfc: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
         },
-        __wbg_new_with_length_c8449d782396d344: function(arg0) {
+        __wbg_new_from_slice_ff94ab4827a1a00b: function(arg0, arg1) {
+            const ret = new Float64Array(getArrayF64FromWasm0(arg0, arg1));
+            return ret;
+        },
+        __wbg_new_with_length_825018a1616e9e55: function(arg0) {
             const ret = new Uint8Array(arg0 >>> 0);
             return ret;
         },
-        __wbg_now_edd718b3004d8631: function() {
+        __wbg_now_16f0c993d5dd6c27: function() {
             const ret = Date.now();
             return ret;
         },
-        __wbg_prototypesetcall_0d860ddc26c33f4b: function(arg0, arg1, arg2) {
-            Float64Array.prototype.set.call(getArrayF64FromWasm0(arg0, arg1), arg2);
-        },
-        __wbg_prototypesetcall_75794f1851d5d9c5: function(arg0, arg1, arg2) {
+        __wbg_prototypesetcall_247ac4333d4d3cb4: function(arg0, arg1, arg2) {
             Float32Array.prototype.set.call(getArrayF32FromWasm0(arg0, arg1), arg2);
         },
-        __wbg_prototypesetcall_f034d444741426c3: function(arg0, arg1, arg2) {
+        __wbg_prototypesetcall_79daf97fb14c7a19: function(arg0, arg1, arg2) {
+            Float64Array.prototype.set.call(getArrayF64FromWasm0(arg0, arg1), arg2);
+        },
+        __wbg_prototypesetcall_d62e5099504357e6: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
         },
-        __wbg_push_a6f9488ffd3fae3b: function(arg0, arg1) {
+        __wbg_push_e87b0e732085a946: function(arg0, arg1) {
             const ret = arg0.push(arg1);
             return ret;
         },
-        __wbg_random_2b7bed8995d680fb: function() {
+        __wbg_random_5bb86cae65a45bf6: function() {
             const ret = Math.random();
             return ret;
         },
-        __wbg_set_15686f5d9ca06dee: function(arg0, arg1, arg2) {
+        __wbg_set_361bc2460da3016f: function(arg0, arg1, arg2) {
             arg0.set(getArrayF32FromWasm0(arg1, arg2));
         },
-        __wbg_slice_be0f51f7e6b41197: function(arg0, arg1, arg2) {
+        __wbg_slice_6bceeac5cf195c6d: function(arg0, arg1, arg2) {
             const ret = arg0.slice(arg1 >>> 0, arg2 >>> 0);
             return ret;
         },
@@ -3082,27 +3525,27 @@ function __wbg_get_imports(memory) {
             const ret = startWorkers(arg0, arg1, wbg_rayon_PoolBuilder.__wrap(arg2));
             return ret;
         },
-        __wbg_static_accessor_GLOBAL_THIS_14325d8cca34bb77: function() {
-            const ret = typeof globalThis === 'undefined' ? null : globalThis;
-            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
-        },
-        __wbg_static_accessor_GLOBAL_f3a1e69f9c5a7e8e: function() {
+        __wbg_static_accessor_GLOBAL_8adb955bd33fac2f: function() {
             const ret = typeof global === 'undefined' ? null : global;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_static_accessor_SELF_50cdb5b517789aca: function() {
+        __wbg_static_accessor_GLOBAL_THIS_ad356e0db91c7913: function() {
+            const ret = typeof globalThis === 'undefined' ? null : globalThis;
+            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_static_accessor_SELF_f207c857566db248: function() {
             const ret = typeof self === 'undefined' ? null : self;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_static_accessor_WINDOW_d6c4126e4c244380: function() {
+        __wbg_static_accessor_WINDOW_bb9f1ba69d61b386: function() {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
-        __wbg_subarray_082d802304b82ac3: function(arg0, arg1, arg2) {
+        __wbg_subarray_83c62ede8b8ce5cd: function(arg0, arg1, arg2) {
             const ret = arg0.subarray(arg1 >>> 0, arg2 >>> 0);
             return ret;
         },
-        __wbg_subarray_7ad5f01d4a9c1c4d: function(arg0, arg1, arg2) {
+        __wbg_subarray_a068d24e39478a8a: function(arg0, arg1, arg2) {
             const ret = arg0.subarray(arg1 >>> 0, arg2 >>> 0);
             return ret;
         },

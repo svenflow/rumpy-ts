@@ -80,6 +80,8 @@ export class NDArray {
      * Argmin - index of minimum value (flattened)
      */
     argmin(): number;
+    argsort(): NDArray;
+    argsortAxis(axis: number): NDArray;
     asType(dtype: string): NDArray;
     /**
      * Average pooling 2D
@@ -347,6 +349,8 @@ export class NDArray {
      * softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))
      */
     softmax(axis: number): NDArray;
+    sort(): NDArray;
+    sortAxis(axis: number): NDArray;
     split(num_splits: number, axis: number): Array<any>;
     /**
      * Squeeze - remove axes of length 1
@@ -378,6 +382,7 @@ export class NDArray {
     transpose(): NDArray;
     tril(k: number): NDArray;
     triu(k: number): NDArray;
+    unique(): NDArray;
     var(): number;
     /**
      * Variance with degrees of freedom adjustment
@@ -412,6 +417,18 @@ export function allocF32(len: number): F32Buffer;
 
 export function arange(start: number, stop: number, step: number): NDArray;
 
+export function arccosArr(arr: NDArray): NDArray;
+
+export function arccoshArr(arr: NDArray): NDArray;
+
+export function arcsinArr(arr: NDArray): NDArray;
+
+export function arcsinhArr(arr: NDArray): NDArray;
+
+export function arctanArr(arr: NDArray): NDArray;
+
+export function arctanhArr(arr: NDArray): NDArray;
+
 export function arrayFromTyped(data: Float64Array, shape: Uint32Array): NDArray;
 
 /**
@@ -423,6 +440,8 @@ export function arrayFromTyped(data: Float64Array, shape: Uint32Array): NDArray;
  */
 export function atan2Arr(y: NDArray, x: NDArray): NDArray;
 
+export function bincount(x: NDArray, weights?: NDArray | null, minlength?: number | null): NDArray;
+
 /**
  * Create a causal attention mask (lower triangular matrix of -inf and 0)
  *
@@ -433,6 +452,8 @@ export function atan2Arr(y: NDArray, x: NDArray): NDArray;
  * * `size` - Sequence length (creates size x size mask)
  */
 export function causalMask(size: number): NDArray;
+
+export function cbrtArr(arr: NDArray): NDArray;
 
 export function ceilArr(arr: NDArray): NDArray;
 
@@ -450,6 +471,12 @@ export function concatenate2(a: NDArray, b: NDArray, axis: number): NDArray;
  * Concatenate three arrays along an axis
  */
 export function concatenate3(a: NDArray, b: NDArray, c: NDArray, axis: number): NDArray;
+
+/**
+ * Condition number of a matrix (using SVD)
+ * Returns max(singular_values) / min(singular_values)
+ */
+export function cond(arr: NDArray): number;
 
 /**
  * 2D Convolution
@@ -488,6 +515,8 @@ export function cosArr(arr: NDArray): NDArray;
 
 export function coshArr(arr: NDArray): NDArray;
 
+export function deg2radArr(arr: NDArray): NDArray;
+
 export function det(arr: NDArray): number;
 
 export function dot(a: NDArray, b: NDArray): NDArray;
@@ -517,17 +546,39 @@ export function einsum(subscripts: string, a: NDArray, b?: NDArray | null): NDAr
 
 export function expArr(arr: NDArray): NDArray;
 
-/**
- * Element-wise exp(x) - 1
- *
- * Computes exp(x) - 1 with better precision for small x.
- * Equivalent to numpy.expm1(x).
- */
 export function expm1Arr(arr: NDArray): NDArray;
 
 export function eye(n: number): NDArray;
 
 export function floorArr(arr: NDArray): NDArray;
+
+/**
+ * Element-wise fmax of two arrays (NaN-ignoring)
+ *
+ * Like maximum, but ignores NaN values - returns non-NaN when one is NaN.
+ * Equivalent to numpy.fmax(a, b).
+ * NOTE: Rust function name is fmax_op to avoid collision with C stdlib fmax()
+ */
+export function fmaxArr(a: NDArray, b: NDArray): NDArray;
+
+/**
+ * Element-wise fmax with a scalar (NaN-ignoring)
+ */
+export function fmaxScalar(arr: NDArray, scalar: number): NDArray;
+
+/**
+ * Element-wise fmin of two arrays (NaN-ignoring)
+ *
+ * Like minimum, but ignores NaN values - returns non-NaN when one is NaN.
+ * Equivalent to numpy.fmin(a, b).
+ * NOTE: Rust function name is fmin_op to avoid collision with C stdlib fmin()
+ */
+export function fminArr(a: NDArray, b: NDArray): NDArray;
+
+/**
+ * Element-wise fmin with a scalar (NaN-ignoring)
+ */
+export function fminScalar(arr: NDArray, scalar: number): NDArray;
 
 export function full(shape: Uint32Array, value: number): NDArray;
 
@@ -544,6 +595,8 @@ export function getNumThreads(): number;
  */
 export function hasSharedArrayBuffer(): boolean;
 
+export function heavisideArr(arr: NDArray, h0: number): NDArray;
+
 /**
  * Horizontal stack (concatenate along axis 1 for 2D+, axis 0 for 1D)
  */
@@ -556,19 +609,35 @@ export function init(): void;
 
 export function initThreadPool(num_threads: number): Promise<any>;
 
+export function inner(a: NDArray, b: NDArray): number;
+
 export function inv(arr: NDArray): NDArray;
 
 export function linspace(start: number, stop: number, num: number): NDArray;
 
-/**
- * Element-wise log(1 + x)
- *
- * Computes log(1 + x) with better precision for small x.
- * Equivalent to numpy.log1p(x).
- */
+export function log10Arr(arr: NDArray): NDArray;
+
 export function log1pArr(arr: NDArray): NDArray;
 
+export function log2Arr(arr: NDArray): NDArray;
+
 export function logArr(arr: NDArray): NDArray;
+
+/**
+ * Element-wise log2(2^x1 + 2^x2) computed in a numerically stable way.
+ *
+ * Equivalent to numpy.logaddexp2(x1, x2).
+ * Useful for log2-space probability computations.
+ */
+export function logaddexp2Arr(a: NDArray, b: NDArray): NDArray;
+
+/**
+ * Element-wise log(exp(x1) + exp(x2)) computed in a numerically stable way.
+ *
+ * Equivalent to numpy.logaddexp(x1, x2).
+ * Useful for log-space probability computations.
+ */
+export function logaddexpArr(a: NDArray, b: NDArray): NDArray;
 
 /**
  * Element-wise logical AND
@@ -914,12 +983,13 @@ export function maxAbsDiff(a: Float32Array, b: Float32Array): number;
  *
  * Compares two arrays element-by-element and returns the maximum values.
  * Equivalent to numpy.maximum(a, b).
- * Supports broadcasting.
+ * Supports broadcasting. NaN propagates: if either value is NaN, result is NaN.
+ * For NaN-ignoring behavior, use fmax instead.
  */
 export function maximum(a: NDArray, b: NDArray): NDArray;
 
 /**
- * Element-wise maximum with a scalar
+ * Element-wise maximum with a scalar (NaN propagates)
  */
 export function maximumScalar(arr: NDArray, scalar: number): NDArray;
 
@@ -928,18 +998,23 @@ export function maximumScalar(arr: NDArray, scalar: number): NDArray;
  *
  * Compares two arrays element-by-element and returns the minimum values.
  * Equivalent to numpy.minimum(a, b).
- * Supports broadcasting.
+ * Supports broadcasting. NaN propagates: if either value is NaN, result is NaN.
+ * For NaN-ignoring behavior, use fmin instead.
  */
 export function minimum(a: NDArray, b: NDArray): NDArray;
 
 /**
- * Element-wise minimum with a scalar
+ * Element-wise minimum with a scalar (NaN propagates)
  */
 export function minimumScalar(arr: NDArray, scalar: number): NDArray;
 
 export function negArr(arr: NDArray): NDArray;
 
+export function norm(arr: NDArray, ord?: number | null): number;
+
 export function ones(shape: Uint32Array): NDArray;
+
+export function outer(a: NDArray, b: NDArray): NDArray;
 
 /**
  * XNNPACK-style f32 GEMM with pre-packed B matrix (LEGACY, single-threaded)
@@ -1002,6 +1077,8 @@ export function packBInPlace(b: F32Buffer, packed_b: F32Buffer, k: number, n: nu
  */
 export function packedBSize(k: number, n: number): number;
 
+export function powArr(a: NDArray, b: NDArray): NDArray;
+
 /**
  * DEBUG: probe whether rayon workers are actually executing in parallel.
  *
@@ -1029,6 +1106,14 @@ export function probeV3Dispatch(n_tiles: number, work_ms_per_tile: number): Floa
  */
 export function probeV3Path(m: number, n: number, k: number): Uint32Array;
 
+/**
+ * QR decomposition: A = Q * R
+ * Returns [Q, R] where Q is orthogonal and R is upper triangular
+ */
+export function qr(arr: NDArray): Array<any>;
+
+export function rad2degArr(arr: NDArray): NDArray;
+
 export function randomNormal(loc: number, scale: number, shape: Uint32Array): NDArray;
 
 export function randomRand(shape: Uint32Array): NDArray;
@@ -1039,17 +1124,23 @@ export function randomSeed(seed: bigint): void;
 
 export function randomUniform(low: number, high: number, shape: Uint32Array): NDArray;
 
+export function reciprocalArr(arr: NDArray): NDArray;
+
 export function roundArr(arr: NDArray): NDArray;
 
 /**
  * Element-wise sign function
  *
- * Returns -1 for negative, 0 for zero, 1 for positive values.
+ * Returns -1 for negative, 0 for zero, 1 for positive values, NaN for NaN.
  * Equivalent to numpy.sign(x).
  */
 export function signArr(arr: NDArray): NDArray;
 
+export function signbitArr(arr: NDArray): NDArray;
+
 export function sinArr(arr: NDArray): NDArray;
+
+export function sincArr(arr: NDArray): NDArray;
 
 export function sinhArr(arr: NDArray): NDArray;
 
@@ -1075,9 +1166,19 @@ export function stack2(a: NDArray, b: NDArray, axis: number): NDArray;
  */
 export function stack3(a: NDArray, b: NDArray, c: NDArray, axis: number): NDArray;
 
+/**
+ * SVD decomposition: A = U * diag(S) * Vt
+ * Returns [U, S, Vt] where U and Vt are orthogonal, S is singular values
+ */
+export function svd(arr: NDArray): Array<any>;
+
 export function tanArr(arr: NDArray): NDArray;
 
 export function tanhArr(arr: NDArray): NDArray;
+
+export function trace(arr: NDArray): number;
+
+export function truncArr(arr: NDArray): NDArray;
 
 /**
  * Vertical stack (concatenate along axis 0)
@@ -1132,17 +1233,27 @@ export interface InitOutput {
     readonly absArr: (a: number) => number;
     readonly allocF32: (a: number) => number;
     readonly arange: (a: number, b: number, c: number) => [number, number, number];
+    readonly arccosArr: (a: number) => number;
+    readonly arccoshArr: (a: number) => number;
+    readonly arcsinArr: (a: number) => number;
+    readonly arcsinhArr: (a: number) => number;
+    readonly arctanArr: (a: number) => number;
+    readonly arctanhArr: (a: number) => number;
     readonly arrayFromTyped: (a: any, b: number, c: number) => [number, number, number];
     readonly atan2Arr: (a: number, b: number) => [number, number, number];
+    readonly bincount: (a: number, b: number, c: number) => [number, number, number];
     readonly causalMask: (a: number) => number;
+    readonly cbrtArr: (a: number) => number;
     readonly ceilArr: (a: number) => number;
     readonly checksum: (a: any) => number;
     readonly concatenate2: (a: number, b: number, c: number) => [number, number, number];
     readonly concatenate3: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly cond: (a: number) => [number, number, number];
     readonly conv2d: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly convTranspose2d: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly cosArr: (a: number) => number;
     readonly coshArr: (a: number) => number;
+    readonly deg2radArr: (a: number) => number;
     readonly det: (a: number) => [number, number, number];
     readonly dot: (a: number, b: number) => [number, number, number];
     readonly einsum: (a: number, b: number, c: number, d: number) => [number, number, number];
@@ -1155,13 +1266,23 @@ export interface InitOutput {
     readonly f32buffer_len: (a: number) => number;
     readonly f32buffer_ptr: (a: number) => number;
     readonly floorArr: (a: number) => number;
+    readonly fmaxArr: (a: number, b: number) => [number, number, number];
+    readonly fmaxScalar: (a: number, b: number) => number;
+    readonly fminArr: (a: number, b: number) => [number, number, number];
+    readonly fminScalar: (a: number, b: number) => number;
     readonly full: (a: number, b: number, c: number) => number;
     readonly hasSharedArrayBuffer: () => number;
+    readonly heavisideArr: (a: number, b: number) => number;
     readonly hstack2: (a: number, b: number) => [number, number, number];
+    readonly inner: (a: number, b: number) => [number, number, number];
     readonly inv: (a: number) => [number, number, number];
     readonly linspace: (a: number, b: number, c: number) => number;
+    readonly log10Arr: (a: number) => number;
     readonly log1pArr: (a: number) => number;
+    readonly log2Arr: (a: number) => number;
     readonly logArr: (a: number) => number;
+    readonly logaddexp2Arr: (a: number, b: number) => [number, number, number];
+    readonly logaddexpArr: (a: number, b: number) => [number, number, number];
     readonly logicalAnd: (a: number, b: number) => [number, number, number];
     readonly logicalNot: (a: number) => number;
     readonly logicalOr: (a: number, b: number) => [number, number, number];
@@ -1198,6 +1319,8 @@ export interface InitOutput {
     readonly ndarray_anyAxis: (a: number, b: number, c: number) => [number, number, number];
     readonly ndarray_argmax: (a: number) => number;
     readonly ndarray_argmin: (a: number) => number;
+    readonly ndarray_argsort: (a: number) => [number, number, number];
+    readonly ndarray_argsortAxis: (a: number, b: number) => [number, number, number];
     readonly ndarray_asType: (a: number, b: number, c: number) => [number, number, number];
     readonly ndarray_avgPool2d: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly ndarray_batchNorm: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
@@ -1281,6 +1404,8 @@ export interface InitOutput {
     readonly ndarray_slice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly ndarray_sliceAxis: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly ndarray_softmax: (a: number, b: number) => [number, number, number];
+    readonly ndarray_sort: (a: number) => [number, number, number];
+    readonly ndarray_sortAxis: (a: number, b: number) => [number, number, number];
     readonly ndarray_split: (a: number, b: number, c: number) => [number, number, number];
     readonly ndarray_squeeze: (a: number) => number;
     readonly ndarray_std: (a: number) => number;
@@ -1295,39 +1420,51 @@ export interface InitOutput {
     readonly ndarray_transpose: (a: number) => number;
     readonly ndarray_tril: (a: number, b: number) => [number, number, number];
     readonly ndarray_triu: (a: number, b: number) => [number, number, number];
+    readonly ndarray_unique: (a: number) => number;
     readonly ndarray_var: (a: number) => number;
     readonly ndarray_varDdof: (a: number, b: number) => number;
     readonly negArr: (a: number) => number;
+    readonly norm: (a: number, b: number, c: number) => [number, number, number];
     readonly ones: (a: number, b: number) => number;
+    readonly outer: (a: number, b: number) => [number, number, number];
     readonly packB: (a: any, b: number, c: number) => any;
     readonly packBForGemm: (a: any, b: number, c: number) => any;
     readonly packBFull: (a: any, b: number, c: number) => any;
     readonly packBInPlace: (a: number, b: number, c: number, d: number) => void;
     readonly packedBSize: (a: number, b: number) => number;
+    readonly powArr: (a: number, b: number) => [number, number, number];
     readonly probeRayonParallelism: (a: number, b: number) => [number, number];
     readonly probeV3Dispatch: (a: number, b: number) => [number, number];
     readonly probeV3Path: (a: number, b: number, c: number) => [number, number];
+    readonly qr: (a: number) => [number, number, number];
+    readonly rad2degArr: (a: number) => number;
     readonly randomNormal: (a: number, b: number, c: number, d: number) => number;
     readonly randomRand: (a: number, b: number) => number;
     readonly randomRandn: (a: number, b: number) => number;
     readonly randomUniform: (a: number, b: number, c: number, d: number) => number;
+    readonly reciprocalArr: (a: number) => number;
     readonly roundArr: (a: number) => number;
     readonly signArr: (a: number) => number;
+    readonly signbitArr: (a: number) => number;
     readonly sinArr: (a: number) => number;
+    readonly sincArr: (a: number) => number;
     readonly sinhArr: (a: number) => number;
     readonly solve: (a: number, b: number) => [number, number, number];
     readonly sqrtArr: (a: number) => number;
     readonly squareArr: (a: number) => number;
     readonly stack2: (a: number, b: number, c: number) => [number, number, number];
     readonly stack3: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly svd: (a: number) => [number, number, number];
     readonly tanArr: (a: number) => number;
     readonly tanhArr: (a: number) => number;
+    readonly trace: (a: number) => [number, number, number];
+    readonly truncArr: (a: number) => number;
     readonly vstack2: (a: number, b: number) => [number, number, number];
     readonly where_: (a: number, b: number, c: number) => [number, number, number];
     readonly zeros: (a: number, b: number) => number;
-    readonly init: () => void;
     readonly ndarray_size: (a: number) => number;
     readonly ndarray_take: (a: number, b: number, c: number) => [number, number, number];
+    readonly init: () => void;
     readonly randomSeed: (a: bigint) => void;
     readonly ndarray_resize: (a: number, b: number, c: number) => [number, number, number];
     readonly getNumThreads: () => number;

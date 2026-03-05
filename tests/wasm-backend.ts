@@ -102,27 +102,15 @@ export class WasmBackend implements Backend {
   }
 
   arcsin(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.asin(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arcsinArr(this.unwrap(arr)));
   }
 
   arccos(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.acos(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arccosArr(this.unwrap(arr)));
   }
 
   arctan(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.atan(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arctanArr(this.unwrap(arr)));
   }
 
   sinh(arr: IFaceNDArray): IFaceNDArray {
@@ -146,19 +134,11 @@ export class WasmBackend implements Backend {
   }
 
   log2(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.log2(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.log2Arr(this.unwrap(arr)));
   }
 
   log10(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.log10(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.log10Arr(this.unwrap(arr)));
   }
 
   sqrt(arr: IFaceNDArray): IFaceNDArray {
@@ -166,11 +146,7 @@ export class WasmBackend implements Backend {
   }
 
   cbrt(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.cbrt(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.cbrtArr(this.unwrap(arr)));
   }
 
   abs(arr: IFaceNDArray): IFaceNDArray {
@@ -198,11 +174,7 @@ export class WasmBackend implements Backend {
   }
 
   reciprocal(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = 1 / arr.data[i];
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.reciprocalArr(this.unwrap(arr)));
   }
 
   square(arr: IFaceNDArray): IFaceNDArray {
@@ -212,27 +184,15 @@ export class WasmBackend implements Backend {
   // ============ Math - Unary (Extended) ============
 
   arcsinh(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.asinh(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arcsinhArr(this.unwrap(arr)));
   }
 
   arccosh(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.acosh(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arccoshArr(this.unwrap(arr)));
   }
 
   arctanh(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.atanh(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.arctanhArr(this.unwrap(arr)));
   }
 
   expm1(arr: IFaceNDArray): IFaceNDArray {
@@ -244,11 +204,7 @@ export class WasmBackend implements Backend {
   }
 
   trunc(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = Math.trunc(arr.data[i]);
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.truncArr(this.unwrap(arr)));
   }
 
   fix(arr: IFaceNDArray): IFaceNDArray {
@@ -257,66 +213,23 @@ export class WasmBackend implements Backend {
   }
 
   sinc(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      const x = arr.data[i];
-      if (x === 0) {
-        result[i] = 1;
-      } else {
-        const px = Math.PI * x;
-        result[i] = Math.sin(px) / px;
-      }
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.sincArr(this.unwrap(arr)));
   }
 
   deg2rad(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    const factor = Math.PI / 180;
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = arr.data[i] * factor;
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.deg2radArr(this.unwrap(arr)));
   }
 
   rad2deg(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    const factor = 180 / Math.PI;
-    for (let i = 0; i < arr.data.length; i++) {
-      result[i] = arr.data[i] * factor;
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.rad2degArr(this.unwrap(arr)));
   }
 
   heaviside(arr: IFaceNDArray, h0: number): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      const x = arr.data[i];
-      if (x < 0) {
-        result[i] = 0;
-      } else if (x === 0) {
-        result[i] = h0;
-      } else {
-        result[i] = 1;
-      }
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.heavisideArr(this.unwrap(arr), h0));
   }
 
   signbit(arr: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(arr.data.length);
-    for (let i = 0; i < arr.data.length; i++) {
-      const x = arr.data[i];
-      // Check for negative zero and negative numbers
-      // Object.is(-0, x) is true for negative zero
-      // 1/x === -Infinity for negative zero
-      if (x < 0 || Object.is(x, -0)) {
-        result[i] = 1;
-      } else {
-        result[i] = 0;
-      }
-    }
-    return this.array(Array.from(result), arr.shape);
+    return this.wrap(this.wasm.signbitArr(this.unwrap(arr)));
   }
 
   // ============ Math - Decomposition ============
@@ -429,58 +342,24 @@ export class WasmBackend implements Backend {
   }
 
   arctan2(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(a.data.length);
-    for (let i = 0; i < a.data.length; i++) {
-      result[i] = Math.atan2(a.data[i], b.data[i]);
-    }
-    return this.array(Array.from(result), a.shape);
+    // Note: WASM export is atan2Arr with args (y, x) - same as Math.atan2(y, x)
+    return this.wrap(this.wasm.atan2Arr(this.unwrap(a), this.unwrap(b)));
   }
 
   logaddexp(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(a.data.length);
-    for (let i = 0; i < a.data.length; i++) {
-      const mx = Math.max(a.data[i], b.data[i]);
-      if (mx === -Infinity) {
-        result[i] = -Infinity;
-      } else {
-        result[i] = mx + Math.log(Math.exp(a.data[i] - mx) + Math.exp(b.data[i] - mx));
-      }
-    }
-    return this.array(Array.from(result), a.shape);
+    return this.wrap(this.wasm.logaddexpArr(this.unwrap(a), this.unwrap(b)));
   }
 
   logaddexp2(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(a.data.length);
-    const log2 = Math.log(2);
-    for (let i = 0; i < a.data.length; i++) {
-      const mx = Math.max(a.data[i], b.data[i]);
-      if (mx === -Infinity) {
-        result[i] = -Infinity;
-      } else {
-        result[i] = mx + Math.log(Math.pow(2, a.data[i] - mx) + Math.pow(2, b.data[i] - mx)) / log2;
-      }
-    }
-    return this.array(Array.from(result), a.shape);
+    return this.wrap(this.wasm.logaddexp2Arr(this.unwrap(a), this.unwrap(b)));
   }
 
   fmax(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(a.data.length);
-    for (let i = 0; i < a.data.length; i++) {
-      if (Number.isNaN(a.data[i])) result[i] = b.data[i];
-      else if (Number.isNaN(b.data[i])) result[i] = a.data[i];
-      else result[i] = Math.max(a.data[i], b.data[i]);
-    }
-    return this.array(Array.from(result), a.shape);
+    return this.wrap(this.wasm.fmaxArr(this.unwrap(a), this.unwrap(b)));
   }
 
   fmin(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    const result = new Float64Array(a.data.length);
-    for (let i = 0; i < a.data.length; i++) {
-      if (Number.isNaN(a.data[i])) result[i] = b.data[i];
-      else if (Number.isNaN(b.data[i])) result[i] = a.data[i];
-      else result[i] = Math.min(a.data[i], b.data[i]);
-    }
-    return this.array(Array.from(result), a.shape);
+    return this.wrap(this.wasm.fminArr(this.unwrap(a), this.unwrap(b)));
   }
 
   // ============ Math - Binary ============
@@ -502,15 +381,7 @@ export class WasmBackend implements Backend {
   }
 
   pow(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
-    // Broadcast if necessary
-    const broadcasted = this.broadcastArrays(a, b);
-    const aData = broadcasted[0].data;
-    const bData = broadcasted[1].data;
-    const result = new Float64Array(aData.length);
-    for (let i = 0; i < aData.length; i++) {
-      result[i] = Math.pow(aData[i], bData[i]);
-    }
-    return this.array(Array.from(result), broadcasted[0].shape);
+    return this.wrap(this.wasm.powArr(this.unwrap(a), this.unwrap(b)));
   }
 
   maximum(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
