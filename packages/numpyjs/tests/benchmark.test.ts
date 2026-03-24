@@ -14,8 +14,8 @@ import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 
 // Benchmark configuration
-const WARMUP_RUNS = 3;
-const BENCHMARK_RUNS = 10;
+const WARMUP_RUNS = 5;
+const BENCHMARK_RUNS = 20;
 const MATRIX_SIZES = [64, 128, 256, 512, 1024, 2048, 4096, 8192];
 
 interface BenchmarkResult {
@@ -57,6 +57,21 @@ describe('benchmarks', () => {
     console.log('\n' + '='.repeat(70));
     console.log('MATMUL BENCHMARK: numpyjs WebGPU vs TensorFlow.js WebGPU (f32)');
     console.log('='.repeat(70) + '\n');
+
+    // Global GPU warmup: run a small matmul to ensure pipeline/device is hot
+    {
+      const warmData = new Float32Array(64 * 64);
+      const wA = numpyjsWebgpuBackend.createAlignedTensor(warmData, [64, 64], true, true);
+      const wB = numpyjsWebgpuBackend.createAlignedTensor(warmData, [64, 64], false, true);
+      for (let i = 0; i < 10; i++) {
+        const c = numpyjsWebgpuBackend.matmulTensor(wA, wB);
+        c.destroy();
+      }
+      await numpyjsWebgpuBackend.device.queue.onSubmittedWorkDone();
+      wA.destroy();
+      wB.destroy();
+      await sleep(50);
+    }
 
     for (const size of MATRIX_SIZES) {
       console.log(`\n=== ${size}x${size} matrices ===\n`);

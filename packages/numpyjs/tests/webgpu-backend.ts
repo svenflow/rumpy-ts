@@ -3679,6 +3679,240 @@ const MATMUL_BCACHE_FIT_SHADER = `
   }
 `;
 
+// ============ BCACHE-WIDE KERNEL (32×64 output tile, 128 threads) ============
+// Wider output tile = more A data reuse per workgroup.
+// [16,8] workgroup: 16 threads × 4 cols = 64 N columns, 8 threads × 4 rows = 32 M rows.
+// Still only 4 vec4 accumulators per thread (low register pressure).
+// A tile: 32×32 (4KB), B tile: 32×64 (8KB) → 12KB shared memory total.
+const MATMUL_BCACHE_WIDE_SHADER = `
+  struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+  @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+  @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+  @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+  @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+  var<workgroup> mm_Asub: array<array<vec4<f32>, 8>, 32>;   // [32 rows][8 vec4s] = 32×32 tile of A
+  var<workgroup> mm_Bsub: array<array<vec4<f32>, 16>, 32>;  // [32 K rows][16 vec4s] = 32×64 tile of B
+
+  @compute @workgroup_size(16, 8, 1)
+  fn main(@builtin(local_invocation_id) localId: vec3<u32>,
+          @builtin(workgroup_id) wgId: vec3<u32>) {
+    let K = i32(uniforms.K);
+    let N = i32(uniforms.N);
+    let KVec4 = K / 4;
+    let NVec4 = N / 4;
+
+    let localX = i32(localId.x);  // 0-15 (N direction)
+    let localY = i32(localId.y);  // 0-7 (M direction)
+    let tileRow = localY * 4;     // This thread's 4 output rows within tile (0,4,8,...,28)
+    let tileCol = localX;         // This thread's vec4 column within tile (0-15)
+
+    // Global output position
+    let globalRow = i32(wgId.y) * 32 + localY * 4;
+    let globalCol = i32(wgId.x) * 64 + localX * 4;
+
+    var acc: array<vec4<f32>, 4>;
+    acc[0] = vec4<f32>(0.0); acc[1] = vec4<f32>(0.0);
+    acc[2] = vec4<f32>(0.0); acc[3] = vec4<f32>(0.0);
+
+    let numTiles = K / 32;
+    let threadIdx = localY * 16 + localX;  // Linear thread index 0-127
+
+    for (var t = 0; t < numTiles; t++) {
+      let kStart = t * 32;
+
+      // LOAD A TILE: 32 rows × 8 vec4s = 256 vec4s, 128 threads → 2 vec4s each
+      {
+        let loadIdx0 = threadIdx * 2;
+        let loadIdx1 = loadIdx0 + 1;
+        let aRow0 = loadIdx0 / 8;
+        let aCol0 = loadIdx0 % 8;
+        let aRow1 = loadIdx1 / 8;
+        let aCol1 = loadIdx1 % 8;
+        let gRow0 = i32(wgId.y) * 32 + aRow0;
+        let gRow1 = i32(wgId.y) * 32 + aRow1;
+        let gCol0 = (kStart + aCol0 * 4) / 4;
+        let gCol1 = (kStart + aCol1 * 4) / 4;
+        mm_Asub[aRow0][aCol0] = A[gRow0 * KVec4 + gCol0];
+        mm_Asub[aRow1][aCol1] = A[gRow1 * KVec4 + gCol1];
+      }
+
+      // LOAD B TILE: 32 K rows × 16 vec4s = 512 vec4s, 128 threads → 4 vec4s each
+      {
+        let loadIdx0 = threadIdx * 4;
+        let bRow0 = loadIdx0 / 16;  let bCol0 = loadIdx0 % 16;
+        let bRow1 = (loadIdx0+1) / 16;  let bCol1 = (loadIdx0+1) % 16;
+        let bRow2 = (loadIdx0+2) / 16;  let bCol2 = (loadIdx0+2) % 16;
+        let bRow3 = (loadIdx0+3) / 16;  let bCol3 = (loadIdx0+3) % 16;
+        let bGCol = i32(wgId.x) * 64 / 4;
+        mm_Bsub[bRow0][bCol0] = B[(kStart + bRow0) * NVec4 + bGCol + bCol0];
+        mm_Bsub[bRow1][bCol1] = B[(kStart + bRow1) * NVec4 + bGCol + bCol1];
+        mm_Bsub[bRow2][bCol2] = B[(kStart + bRow2) * NVec4 + bGCol + bCol2];
+        mm_Bsub[bRow3][bCol3] = B[(kStart + bRow3) * NVec4 + bGCol + bCol3];
+      }
+
+      workgroupBarrier();
+
+      // COMPUTE: same B-caching pattern, but now reads from wider B tile
+      for (var k = 0; k < 8; k++) {
+        let BCached0 = mm_Bsub[k * 4 + 0][tileCol];
+        let BCached1 = mm_Bsub[k * 4 + 1][tileCol];
+        let BCached2 = mm_Bsub[k * 4 + 2][tileCol];
+        let BCached3 = mm_Bsub[k * 4 + 3][tileCol];
+
+        for (var i = 0; i < 4; i++) {
+          let ACached = mm_Asub[tileRow + i][k];
+          acc[i] = fma(BCached0, vec4<f32>(ACached[0]), acc[i]);
+          acc[i] = fma(BCached1, vec4<f32>(ACached[1]), acc[i]);
+          acc[i] = fma(BCached2, vec4<f32>(ACached[2]), acc[i]);
+          acc[i] = fma(BCached3, vec4<f32>(ACached[3]), acc[i]);
+        }
+      }
+      workgroupBarrier();
+    }
+
+    // WRITE OUTPUT
+    for (var innerRow = 0; innerRow < 4; innerRow++) {
+      let outRow = globalRow + innerRow;
+      let outColVec4 = globalCol / 4;
+      C[outRow * NVec4 + outColVec4] = acc[innerRow];
+    }
+  }
+`;
+
+// ============ BCACHE-TALL KERNEL (8 rows × 4 cols per thread, 64×32 tile) ============
+// Middle ground between BCACHE (4×4, 4 accumulators) and 8X8-MEGA (8×8, 16 accumulators).
+// 8 vec4 accumulators per thread → 2x compute per thread vs BCACHE without register spilling.
+// 64×32 output tile with [8,8] workgroup. Each Y-thread covers 8 rows.
+// A tile: 64×8 vec4 = 8KB, B tile: 32×8 vec4 = 4KB → 12KB shared memory.
+const MATMUL_BCACHE_TALL_SHADER = `
+  struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+  @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+  @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+  @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+  @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+  var<workgroup> mm_Asub: array<array<vec4<f32>, 8>, 64>;  // [64 rows][8 vec4s]
+  var<workgroup> mm_Bsub: array<array<vec4<f32>, 8>, 32>;  // [32 K rows][8 vec4s]
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(local_invocation_id) localId: vec3<u32>,
+          @builtin(workgroup_id) wgId: vec3<u32>) {
+    let K = i32(uniforms.K);
+    let N = i32(uniforms.N);
+    let KVec4 = K / 4;
+    let NVec4 = N / 4;
+
+    let localX = i32(localId.x);
+    let localY = i32(localId.y);
+    let tileRow = localY * 8;   // 8 output rows per thread
+    let tileCol = localX;
+
+    let globalRow = i32(wgId.y) * 64 + localY * 8;
+    let globalCol = i32(wgId.x) * 32 + localX * 4;
+
+    // 8 vec4 accumulators (one per output row)
+    var acc0 = vec4<f32>(0.0); var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0); var acc3 = vec4<f32>(0.0);
+    var acc4 = vec4<f32>(0.0); var acc5 = vec4<f32>(0.0);
+    var acc6 = vec4<f32>(0.0); var acc7 = vec4<f32>(0.0);
+
+    let numTiles = K / 32;
+    let threadIdx = localY * 8 + localX;  // 0-63
+
+    for (var t = 0; t < numTiles; t++) {
+      let kStart = t * 32;
+
+      // LOAD A TILE: 64 rows × 8 vec4s = 512 vec4s, 64 threads → 8 each
+      for (var li = 0; li < 8; li++) {
+        let loadIdx = threadIdx * 8 + li;
+        let aRow = loadIdx / 8;
+        let aCol = loadIdx % 8;
+        let gRow = i32(wgId.y) * 64 + aRow;
+        let gCol = (kStart + aCol * 4) / 4;
+        mm_Asub[aRow][aCol] = A[gRow * KVec4 + gCol];
+      }
+
+      // LOAD B TILE: 32 × 8 = 256 vec4s, 64 threads → 4 each
+      for (var li = 0; li < 4; li++) {
+        let loadIdx = threadIdx * 4 + li;
+        let bRow = loadIdx / 8;
+        let bCol = loadIdx % 8;
+        let bGCol = i32(wgId.x) * 32 / 4;
+        mm_Bsub[bRow][bCol] = B[(kStart + bRow) * NVec4 + bGCol + bCol];
+      }
+
+      workgroupBarrier();
+
+      // COMPUTE: 8 rows × B-caching, fully unrolled rows
+      for (var k = 0; k < 8; k++) {
+        let BCached0 = mm_Bsub[k * 4 + 0][tileCol];
+        let BCached1 = mm_Bsub[k * 4 + 1][tileCol];
+        let BCached2 = mm_Bsub[k * 4 + 2][tileCol];
+        let BCached3 = mm_Bsub[k * 4 + 3][tileCol];
+
+        let a0 = mm_Asub[tileRow + 0][k];
+        acc0 = fma(BCached0, vec4<f32>(a0[0]), acc0);
+        acc0 = fma(BCached1, vec4<f32>(a0[1]), acc0);
+        acc0 = fma(BCached2, vec4<f32>(a0[2]), acc0);
+        acc0 = fma(BCached3, vec4<f32>(a0[3]), acc0);
+
+        let a1 = mm_Asub[tileRow + 1][k];
+        acc1 = fma(BCached0, vec4<f32>(a1[0]), acc1);
+        acc1 = fma(BCached1, vec4<f32>(a1[1]), acc1);
+        acc1 = fma(BCached2, vec4<f32>(a1[2]), acc1);
+        acc1 = fma(BCached3, vec4<f32>(a1[3]), acc1);
+
+        let a2 = mm_Asub[tileRow + 2][k];
+        acc2 = fma(BCached0, vec4<f32>(a2[0]), acc2);
+        acc2 = fma(BCached1, vec4<f32>(a2[1]), acc2);
+        acc2 = fma(BCached2, vec4<f32>(a2[2]), acc2);
+        acc2 = fma(BCached3, vec4<f32>(a2[3]), acc2);
+
+        let a3 = mm_Asub[tileRow + 3][k];
+        acc3 = fma(BCached0, vec4<f32>(a3[0]), acc3);
+        acc3 = fma(BCached1, vec4<f32>(a3[1]), acc3);
+        acc3 = fma(BCached2, vec4<f32>(a3[2]), acc3);
+        acc3 = fma(BCached3, vec4<f32>(a3[3]), acc3);
+
+        let a4 = mm_Asub[tileRow + 4][k];
+        acc4 = fma(BCached0, vec4<f32>(a4[0]), acc4);
+        acc4 = fma(BCached1, vec4<f32>(a4[1]), acc4);
+        acc4 = fma(BCached2, vec4<f32>(a4[2]), acc4);
+        acc4 = fma(BCached3, vec4<f32>(a4[3]), acc4);
+
+        let a5 = mm_Asub[tileRow + 5][k];
+        acc5 = fma(BCached0, vec4<f32>(a5[0]), acc5);
+        acc5 = fma(BCached1, vec4<f32>(a5[1]), acc5);
+        acc5 = fma(BCached2, vec4<f32>(a5[2]), acc5);
+        acc5 = fma(BCached3, vec4<f32>(a5[3]), acc5);
+
+        let a6 = mm_Asub[tileRow + 6][k];
+        acc6 = fma(BCached0, vec4<f32>(a6[0]), acc6);
+        acc6 = fma(BCached1, vec4<f32>(a6[1]), acc6);
+        acc6 = fma(BCached2, vec4<f32>(a6[2]), acc6);
+        acc6 = fma(BCached3, vec4<f32>(a6[3]), acc6);
+
+        let a7 = mm_Asub[tileRow + 7][k];
+        acc7 = fma(BCached0, vec4<f32>(a7[0]), acc7);
+        acc7 = fma(BCached1, vec4<f32>(a7[1]), acc7);
+        acc7 = fma(BCached2, vec4<f32>(a7[2]), acc7);
+        acc7 = fma(BCached3, vec4<f32>(a7[3]), acc7);
+      }
+      workgroupBarrier();
+    }
+
+    // WRITE OUTPUT: 8 rows
+    let outColVec4 = globalCol / 4;
+    C[(globalRow + 0) * NVec4 + outColVec4] = acc0;
+    C[(globalRow + 1) * NVec4 + outColVec4] = acc1;
+    C[(globalRow + 2) * NVec4 + outColVec4] = acc2;
+    C[(globalRow + 3) * NVec4 + outColVec4] = acc3;
+    C[(globalRow + 4) * NVec4 + outColVec4] = acc4;
+    C[(globalRow + 5) * NVec4 + outColVec4] = acc5;
+    C[(globalRow + 6) * NVec4 + outColVec4] = acc6;
+    C[(globalRow + 7) * NVec4 + outColVec4] = acc7;
+  }
+`;
+
 // ============ 8x8 MEGA KERNEL (Nussbaum-style, target: 1+ TFLOP) ============
 //
 // Each thread computes 8×8 = 64 output elements. With an [8,8] workgroup that's
@@ -5187,6 +5421,34 @@ const SHADER_CONFIGS: ShaderConfig[] = [
     maxSize: -1, // Works for all sizes
   },
   {
+    name: 'BCACHE-WIDE',
+    shader: MATMUL_BCACHE_WIDE_SHADER,
+    tileM: 32,
+    tileN: 64,
+    tileK: 32,
+    workgroupSize: [16, 8],
+    requiresFit: true, // No bounds checking
+    usesVec4B: true,
+    usesVec4C: true,
+    usesVec4A: true,
+    minSize: 128,
+    maxSize: -1,
+  },
+  {
+    name: 'BCACHE-TALL',
+    shader: MATMUL_BCACHE_TALL_SHADER,
+    tileM: 64,
+    tileN: 32,
+    tileK: 32,
+    workgroupSize: [8, 8],
+    requiresFit: true, // Requires M%64==0, N%32==0, K%32==0
+    usesVec4B: true,
+    usesVec4C: true,
+    usesVec4A: true,
+    minSize: 128,
+    maxSize: -1,
+  },
+  {
     name: 'FIT-64x64',
     shader: MATMUL_FIT_SHADER,
     tileM: 64,
@@ -5253,15 +5515,15 @@ const autotuneCache = new Map<string, string>();
 // The 8×8 kernel's extra register pressure causes spills that negate its
 // higher compute-per-thread advantage.
 const PRESET_CONFIGS: Record<string, string> = {
-  '8192x8192x8192': 'TFJS-BCACHE',
-  '4096x4096x4096': 'TFJS-BCACHE',
-  '2048x2048x2048': 'TFJS-BCACHE',
-  '1024x1024x1024': '8X8-MEGA-FIT', // Autotuned: wins by slim margin over BCACHE at 1024
-  '512x512x512': 'BCACHE-FIT', // FIT wins at 512 (no bounds checking helps)
+  '8192x8192x8192': 'BCACHE-TALL',
+  '4096x4096x4096': 'BCACHE-TALL', // Autotuned: 336ms vs TFJS-BCACHE 340ms
+  '2048x2048x2048': 'BCACHE-TALL', // Autotuned: 82ms vs TFJS-BCACHE 87ms
+  '1024x1024x1024': 'BCACHE-TALL', // Autotuned: within noise of TFJS-BCACHE, try it
+  '512x512x512': 'BCACHE-FIT', // FIT wins at 512 (no bounds checking)
   '256x256x256': 'BCACHE-FIT',
   '128x128x128': 'BCACHE-FIT',
-  // Small matrices: simpler shader with lower overhead
-  '64x64x64': 'REGISTER-BLOCKED',
+  // Small matrices: TFJS-BCACHE wins at 64 (bounds-checking overhead negligible at this size)
+  '64x64x64': 'TFJS-BCACHE',
 };
 
 // Initialize preset configs into cache
@@ -5303,14 +5565,21 @@ function getBestConfig(m: number, k: number, n: number): ShaderConfig | null {
     return SHADER_CONFIGS.find(c => c.name === 'TFJS-VEC4-INNER') || null;
   }
 
-  // Prefer TFJS-BCACHE: lower register pressure, best on Apple GPUs at all sizes
-  // 4×4 output/thread with B-caching pattern wins over 8×8 due to register spills
+  // For large aligned matrices (1024+), prefer BCACHE-TALL: 8 rows × 4 cols per thread
+  // 8 vec4 accumulators = sweet spot between BCACHE (4) and 8X8-MEGA (16) on Apple GPUs
+  if (minDim >= 1024) {
+    const tall = validConfigs.find(c => c.name === 'BCACHE-TALL');
+    if (tall) return tall;
+  }
+
+  // For medium/small: TFJS-BCACHE (4×4 output, low register pressure)
   const bcache = validConfigs.find(c => c.name === 'TFJS-BCACHE');
   if (bcache && minDim >= 64) return bcache;
 
   // Fallback for small matrices
   if (maxDim <= 256) {
-    return validConfigs.find(c => c.name === 'REGISTER-BLOCKED') || validConfigs[0];
+    const bcacheFallback = validConfigs.find(c => c.name === 'TFJS-BCACHE');
+    return bcacheFallback || validConfigs[0];
   }
 
   // Generic fallback
@@ -8509,52 +8778,83 @@ export class WebGPUBackend implements Backend {
    * For maximum performance benchmarking.
    * Input: WebGPUTensor (f32 on GPU), Output: WebGPUTensor (f32 on GPU)
    */
+  // Cache for pre-created uniform buffers and pipeline configs per dimension
+  private uniformCache = new Map<string, GPUBuffer>();
+  private matmulConfigCache = new Map<
+    string,
+    {
+      config: ShaderConfig;
+      pipeline: GPUComputePipeline;
+      wgX: number;
+      wgY: number;
+      kPadded: number;
+      nPadded: number;
+      aBufferSize: number;
+      bBufferSize: number;
+      outputSize: number;
+    }
+  >();
+
   matmulTensor(a: WebGPUTensor, b: WebGPUTensor): WebGPUTensor {
     const [m, k1] = a.shape;
     const [k2, n] = b.shape;
     if (k1 !== k2) throw new Error(`Dimension mismatch: ${k1} vs ${k2}`);
     const k = k1;
 
-    const config = getBestConfig(m, k, n);
-    if (!config) throw new Error('No suitable matmul config');
+    const dimKey = `${m}x${k}x${n}`;
+    let cached = this.matmulConfigCache.get(dimKey);
 
-    // Determine padded dimensions
-    const kPadded = config.usesVec4A ? Math.ceil(k / 4) * 4 : k;
-    const nPadded = config.usesVec4B ? Math.ceil(n / 4) * 4 : n;
+    if (!cached) {
+      // Cold path: first time for this dimension — compute and cache everything
+      const config = getBestConfig(m, k, n);
+      if (!config) throw new Error('No suitable matmul config');
 
-    // Prepare A buffer: if vec4A, need to repack with K-padding
-    // For now, assume inputs are already properly aligned (pad in createTensorF32)
-    // TODO: handle non-aligned inputs via a repack compute shader
-    const aBufferSize = m * kPadded * 4;
-    const bBufferSize = k * nPadded * 4;
-    const outputSize = config.usesVec4C ? m * nPadded * 4 : m * n * 4;
+      const kPadded = config.usesVec4A ? Math.ceil(k / 4) * 4 : k;
+      const nPadded = config.usesVec4B ? Math.ceil(n / 4) * 4 : n;
 
-    // Allocate buffers from pool
-    const uniformBuffer = this.bufferManager.acquire(
-      16,
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-    );
+      const cacheKey = `matmul-${config.name}`;
+      let pipeline = shaderCache.get(cacheKey);
+      if (!pipeline) {
+        const shaderModule = this.device.createShaderModule({ code: config.shader });
+        pipeline = this.device.createComputePipeline({
+          layout: 'auto',
+          compute: { module: shaderModule, entryPoint: 'main' },
+        });
+        shaderCache.set(cacheKey, pipeline);
+      }
+
+      // Create and cache uniform buffer (written once, reused forever)
+      const uniformBuffer = this.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([m, k, n, nPadded]));
+      this.uniformCache.set(dimKey, uniformBuffer);
+
+      cached = {
+        config,
+        pipeline,
+        wgX: Math.ceil(n / config.tileN),
+        wgY: Math.ceil(m / config.tileM),
+        kPadded,
+        nPadded,
+        aBufferSize: m * kPadded * 4,
+        bBufferSize: k * nPadded * 4,
+        outputSize: config.usesVec4C ? m * nPadded * 4 : m * n * 4,
+      };
+      this.matmulConfigCache.set(dimKey, cached);
+    }
+
+    const { config, pipeline, wgX, wgY, aBufferSize, bBufferSize, outputSize, nPadded } = cached;
+    const uniformBuffer = this.uniformCache.get(dimKey)!;
+
+    // Allocate fresh output buffer (must be new each call since caller takes ownership)
     const outputBuffer = this.bufferManager.acquire(
       outputSize,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
     );
 
-    // Write uniforms
-    this.device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([m, k, n, nPadded]));
-
-    // Get or create compute pipeline
-    const cacheKey = `matmul-${config.name}`;
-    let pipeline = shaderCache.get(cacheKey);
-    if (!pipeline) {
-      const shaderModule = this.device.createShaderModule({ code: config.shader });
-      pipeline = this.device.createComputePipeline({
-        layout: 'auto',
-        compute: { module: shaderModule, entryPoint: 'main' },
-      });
-      shaderCache.set(cacheKey, pipeline);
-    }
-
-    // Create bind group using tensor GPU buffers directly
+    // Create bind group (must be new each call since output buffer differs)
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -8570,12 +8870,11 @@ export class WebGPUBackend implements Backend {
     const passEncoder = commandEncoder.beginComputePass();
     passEncoder.setPipeline(pipeline);
     passEncoder.setBindGroup(0, bindGroup);
-    passEncoder.dispatchWorkgroups(Math.ceil(n / config.tileN), Math.ceil(m / config.tileM));
+    passEncoder.dispatchWorkgroups(wgX, wgY);
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
 
-    // Release uniform buffer
-    this.bufferManager.release(uniformBuffer);
+    // Uniform buffer is now cached, not released
 
     // Create output tensor (data stays on GPU)
     const outShape = config.usesVec4C && nPadded !== n ? [m, nPadded] : [m, n];
