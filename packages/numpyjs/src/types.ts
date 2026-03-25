@@ -323,7 +323,13 @@ export interface Backend {
   nanpercentile(arr: NDArray, q: number, axis?: number): number | NDArray;
 
   // ============ Histogram ============
-  histogram(arr: NDArray, bins?: number): { hist: NDArray; binEdges: NDArray };
+  histogram(
+    arr: NDArray,
+    bins?: number,
+    range?: [number, number] | null,
+    density?: boolean,
+    weights?: NDArray
+  ): { hist: NDArray; binEdges: NDArray };
   histogramBinEdges(arr: NDArray, bins?: number): NDArray;
 
   // ============ Linalg ============
@@ -352,12 +358,12 @@ export interface Backend {
 
   // ============ Shape Manipulation ============
   swapaxes(arr: NDArray, axis1: number, axis2: number): NDArray;
-  moveaxis(arr: NDArray, source: number, destination: number): NDArray;
-  squeeze(arr: NDArray, axis?: number): NDArray;
+  moveaxis(arr: NDArray, source: number | number[], destination: number | number[]): NDArray;
+  squeeze(arr: NDArray, axis?: number | number[]): NDArray;
   expandDims(arr: NDArray, axis: number): NDArray;
   reshape(arr: NDArray, shape: number[]): NDArray;
   flatten(arr: NDArray): NDArray;
-  concatenate(arrays: NDArray[], axis?: number): NDArray;
+  concatenate(arrays: NDArray[], axis?: number | null): NDArray;
   stack(arrays: NDArray[], axis?: number): NDArray;
   split(arr: NDArray, indices: number | number[], axis?: number): NDArray[];
 
@@ -388,8 +394,8 @@ export interface Backend {
   cross(a: NDArray, b: NDArray): NDArray;
 
   // ============ Statistics ============
-  cov(x: NDArray, y?: NDArray): NDArray;
-  corrcoef(x: NDArray, y?: NDArray): NDArray;
+  cov(x: NDArray, y?: NDArray, rowvar?: boolean, bias?: boolean, ddof?: number | null): NDArray;
+  corrcoef(x: NDArray, y?: NDArray, rowvar?: boolean): NDArray;
 
   // ============ Convolution ============
   convolve(a: NDArray, v: NDArray, mode?: 'full' | 'same' | 'valid'): NDArray | Promise<NDArray>;
@@ -472,13 +478,22 @@ export interface Backend {
   flip(arr: NDArray, axis?: number): NDArray;
   fliplr(arr: NDArray): NDArray;
   flipud(arr: NDArray): NDArray;
-  roll(arr: NDArray, shift: number, axis?: number): NDArray;
-  rot90(arr: NDArray, k?: number): NDArray;
+  roll(arr: NDArray, shift: number | number[], axis?: number | number[]): NDArray;
+  rot90(arr: NDArray, k?: number, axes?: [number, number]): NDArray;
   ravel(arr: NDArray): NDArray;
   pad(
     arr: NDArray,
     padWidth: number | [number, number],
-    mode?: 'constant' | 'edge' | 'reflect' | 'wrap',
+    mode?:
+      | 'constant'
+      | 'edge'
+      | 'reflect'
+      | 'wrap'
+      | 'symmetric'
+      | 'linear_ramp'
+      | 'mean'
+      | 'minimum'
+      | 'maximum',
     constantValue?: number
   ): NDArray;
   columnStack(arrays: NDArray[]): NDArray;
@@ -525,6 +540,16 @@ export interface Backend {
   multivariateNormal(mean: NDArray, cov: NDArray, size?: number): NDArray;
   geometric(p: number, shape: number[]): NDArray;
   weibull(a: number, shape: number[]): NDArray;
+  /** np.random.standard_normal — alias for randn */
+  standardNormal(shape: number[]): NDArray;
+  /** np.random.standard_cauchy — standard Cauchy distribution */
+  standardCauchy(shape: number[]): NDArray;
+  /** np.random.multinomial — multinomial distribution */
+  multinomial(n: number, pvals: number[], size?: number): NDArray;
+  /** np.random.dirichlet — Dirichlet distribution */
+  dirichlet(alpha: number[], size?: number): NDArray;
+  /** np.random.random — alias for rand */
+  random(shape: number[]): NDArray;
 
   // ============ Additional Stats ============
   average(arr: NDArray, weights?: NDArray, axis?: number): number | NDArray;

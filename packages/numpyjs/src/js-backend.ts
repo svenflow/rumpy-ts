@@ -3042,24 +3042,32 @@ export class JsBackend implements Backend {
     return this._transposeGeneral(arr, perm, newShape);
   }
 
-  moveaxis(arr: NDArray, source: number, destination: number): NDArray {
+  moveaxis(arr: NDArray, source: number | number[], destination: number | number[]): NDArray {
     const ndim = arr.shape.length;
-    source = this._normalizeAxis(source, ndim);
-    destination = this._normalizeAxis(destination, ndim);
+    const srcArr = Array.isArray(source) ? source : [source];
+    const dstArr = Array.isArray(destination) ? destination : [destination];
 
-    if (source === destination) {
-      return new JsNDArray(arr.data.slice(), arr.shape);
+    if (srcArr.length !== dstArr.length) {
+      throw new Error(`source and destination must have the same number of elements`);
     }
 
-    // Build permutation
-    const perm: number[] = [];
+    const normSrc = srcArr.map(s => this._normalizeAxis(s, ndim));
+    const normDst = dstArr.map(d => this._normalizeAxis(d, ndim));
+
+    // Build permutation: start with axes not in source, in order
+    const order: number[] = [];
     for (let i = 0; i < ndim; i++) {
-      if (i !== source) perm.push(i);
+      if (!normSrc.includes(i)) order.push(i);
     }
-    perm.splice(destination, 0, source);
+    // Insert source axes at destination positions (process in sorted dst order)
+    const pairs = normDst.map((d, i) => ({ dst: d, src: normSrc[i] }));
+    pairs.sort((a, b) => a.dst - b.dst);
+    for (const { dst, src } of pairs) {
+      order.splice(dst, 0, src);
+    }
 
-    const newShape = perm.map(i => arr.shape[i]);
-    return this._transposeGeneral(arr, perm, newShape);
+    const newShape = order.map(i => arr.shape[i]);
+    return this._transposeGeneral(arr, order, newShape);
   }
 
   private _transposeGeneral(arr: NDArray, perm: number[], newShape: number[]): NDArray {
@@ -3090,13 +3098,16 @@ export class JsBackend implements Backend {
     return new JsNDArray(result, newShape);
   }
 
-  squeeze(arr: NDArray, axis?: number): NDArray {
+  squeeze(arr: NDArray, axis?: number | number[]): NDArray {
     if (axis !== undefined) {
-      const normalizedAxis = this._normalizeAxis(axis, arr.shape.length);
-      if (arr.shape[normalizedAxis] !== 1) {
-        throw new Error(`cannot squeeze axis ${axis} with size ${arr.shape[normalizedAxis]}`);
+      const axes = Array.isArray(axis) ? axis : [axis];
+      const normalizedAxes = axes.map(a => this._normalizeAxis(a, arr.shape.length));
+      for (const na of normalizedAxes) {
+        if (arr.shape[na] !== 1) {
+          throw new Error(`cannot squeeze axis ${na} with size ${arr.shape[na]}`);
+        }
       }
-      const newShape = arr.shape.filter((_, i) => i !== normalizedAxis);
+      const newShape = arr.shape.filter((_, i) => !normalizedAxes.includes(i));
       return new JsNDArray(arr.data.slice(), newShape.length === 0 ? [1] : newShape);
     }
 
@@ -3147,8 +3158,22 @@ export class JsBackend implements Backend {
     return new JsNDArray(arr.data.slice(), [arr.data.length]);
   }
 
-  concatenate(arrays: NDArray[], axis: number = 0): NDArray {
+  concatenate(arrays: NDArray[], axis: number | null = 0): NDArray {
     if (arrays.length === 0) throw new Error('need at least one array to concatenate');
+
+    // axis=null: flatten all arrays then concatenate as 1D
+    if (axis === null || axis === undefined) {
+      const flattened = arrays.map(a => this.flatten(a));
+      const totalLen = flattened.reduce((sum, a) => sum + a.data.length, 0);
+      const result = new Float64Array(totalLen);
+      let offset = 0;
+      for (const a of flattened) {
+        result.set(a.data, offset);
+        offset += a.data.length;
+      }
+      return new JsNDArray(result, [totalLen]);
+    }
+
     if (arrays.length === 1) return new JsNDArray(arrays[0].data.slice(), arrays[0].shape);
 
     const ndim = arrays[0].shape.length;
@@ -3767,13 +3792,41 @@ export class JsBackend implements Backend {
 
   // ============ Statistics ============
 
-  cov(x: NDArray, y?: NDArray): NDArray {
+  cov(
+    x: NDArray,
+    y?: NDArray,
+    rowvar: boolean = true,
+    bias: boolean = false,
+    ddof?: number | null
+  ): NDArray {
+    // Determine normalization factor
+    // ddof overrides bias: if ddof is given, use N - ddof
+    // if bias=true, use N (equivalent to ddof=0)
+    // if bias=false (default), use N-1 (equivalent to ddof=1)
+    const getDivisor = (nObs: number) => {
+      if (ddof != null) return nObs - ddof;
+      return bias ? nObs : nObs - 1;
+    };
+
     if (y === undefined) {
-      // Compute covariance matrix for rows of x
-      if (x.shape.length !== 2) {
-        throw new Error('cov requires 2D array when y is not provided');
+      // Compute covariance matrix for rows (or columns) of x
+      let data2d: NDArray;
+      if (x.shape.length === 1) {
+        // 1D: treat as single variable (1 row of observations)
+        data2d = this.reshape(x, [1, x.data.length]);
+      } else if (x.shape.length === 2) {
+        data2d = x;
+      } else {
+        throw new Error('cov requires 1D or 2D array when y is not provided');
       }
-      const [nVars, nObs] = x.shape;
+
+      // If rowvar=false, transpose so rows become variables
+      if (!rowvar) {
+        data2d = this.transpose(data2d);
+      }
+
+      const [nVars, nObs] = data2d.shape;
+      const divisor = getDivisor(nObs);
       const result = new Float64Array(nVars * nVars);
 
       // Compute means for each row
@@ -3781,7 +3834,7 @@ export class JsBackend implements Backend {
       for (let i = 0; i < nVars; i++) {
         let sum = 0;
         for (let j = 0; j < nObs; j++) {
-          sum += x.data[i * nObs + j];
+          sum += data2d.data[i * nObs + j];
         }
         means[i] = sum / nObs;
       }
@@ -3791,9 +3844,9 @@ export class JsBackend implements Backend {
         for (let j = 0; j < nVars; j++) {
           let cov = 0;
           for (let k = 0; k < nObs; k++) {
-            cov += (x.data[i * nObs + k] - means[i]) * (x.data[j * nObs + k] - means[j]);
+            cov += (data2d.data[i * nObs + k] - means[i]) * (data2d.data[j * nObs + k] - means[j]);
           }
-          result[i * nVars + j] = cov / (nObs - 1);
+          result[i * nVars + j] = divisor > 0 ? cov / divisor : 0;
         }
       }
 
@@ -3808,25 +3861,28 @@ export class JsBackend implements Backend {
       }
 
       const n = xFlat.data.length;
+      const divisor = getDivisor(n);
       const xMean = this.mean(xFlat) as number;
       const yMean = this.mean(yFlat) as number;
 
-      let cov = 0;
+      let covXY = 0;
+      let varX = 0;
+      let varY = 0;
       for (let i = 0; i < n; i++) {
-        cov += (xFlat.data[i] - xMean) * (yFlat.data[i] - yMean);
+        const dx = xFlat.data[i] - xMean;
+        const dy = yFlat.data[i] - yMean;
+        covXY += dx * dy;
+        varX += dx * dx;
+        varY += dy * dy;
       }
-      cov /= n - 1;
 
-      // Return 2x2 covariance matrix
-      const xVar = this.var(xFlat, null, 1) as number;
-      const yVar = this.var(yFlat, null, 1) as number;
-
-      return new JsNDArray(new Float64Array([xVar, cov, cov, yVar]), [2, 2]);
+      const d = divisor > 0 ? divisor : 1;
+      return new JsNDArray(new Float64Array([varX / d, covXY / d, covXY / d, varY / d]), [2, 2]);
     }
   }
 
-  corrcoef(x: NDArray, y?: NDArray): NDArray {
-    const covMatrix = this.cov(x, y);
+  corrcoef(x: NDArray, y?: NDArray, rowvar: boolean = true): NDArray {
+    const covMatrix = this.cov(x, y, rowvar);
     const n = covMatrix.shape[0];
     const result = new Float64Array(n * n);
 
@@ -4811,36 +4867,65 @@ export class JsBackend implements Backend {
 
   // ============ Histogram ============
 
-  histogram(arr: NDArray, bins: number = 10): { hist: NDArray; binEdges: NDArray } {
+  histogram(
+    arr: NDArray,
+    bins: number = 10,
+    range?: [number, number] | null,
+    density?: boolean,
+    weights?: NDArray
+  ): { hist: NDArray; binEdges: NDArray } {
     const data = arr.data;
-    let min = Infinity,
+    let min: number, max: number;
+
+    if (range != null) {
+      [min, max] = range;
+    } else {
+      min = Infinity;
       max = -Infinity;
-    for (let i = 0; i < data.length; i++) {
-      if (!Number.isNaN(data[i])) {
-        if (data[i] < min) min = data[i];
-        if (data[i] > max) max = data[i];
+      for (let i = 0; i < data.length; i++) {
+        if (!Number.isNaN(data[i])) {
+          if (data[i] < min) min = data[i];
+          if (data[i] > max) max = data[i];
+        }
       }
     }
-    if (min === Infinity) {
-      // All NaN
-      return {
-        hist: new JsNDArray(new Float64Array(bins), [bins]),
-        binEdges: new JsNDArray(new Float64Array(bins + 1), [bins + 1]),
-      };
+
+    if (min === Infinity || (min === max && range == null)) {
+      if (min === Infinity) {
+        // All NaN
+        return {
+          hist: new JsNDArray(new Float64Array(bins), [bins]),
+          binEdges: new JsNDArray(new Float64Array(bins + 1), [bins + 1]),
+        };
+      }
     }
 
-    const range = max - min;
-    const binWidth = range / bins || 1;
+    const rangeSpan = max - min;
+    const binWidth = rangeSpan / bins || 1;
     const edges = new Float64Array(bins + 1);
     for (let i = 0; i <= bins; i++) edges[i] = min + i * binWidth;
 
     const hist = new Float64Array(bins);
     for (let i = 0; i < data.length; i++) {
       if (Number.isNaN(data[i])) continue;
+      // Skip values outside range when range is specified
+      if (range != null && (data[i] < min || data[i] > max)) continue;
       let binIdx = Math.floor((data[i] - min) / binWidth);
       if (binIdx >= bins) binIdx = bins - 1;
       if (binIdx < 0) binIdx = 0;
-      hist[binIdx]++;
+      const w = weights ? weights.data[i] : 1;
+      hist[binIdx] += w;
+    }
+
+    // Apply density normalization: normalize so integral over bins equals 1
+    if (density) {
+      let totalWeight = 0;
+      for (let i = 0; i < bins; i++) totalWeight += hist[i];
+      if (totalWeight > 0) {
+        for (let i = 0; i < bins; i++) {
+          hist[i] = hist[i] / (totalWeight * binWidth);
+        }
+      }
     }
 
     return {
@@ -5180,53 +5265,80 @@ export class JsBackend implements Backend {
     return this.flip(arr, 0);
   }
 
-  roll(arr: NDArray, shift: number, axis?: number): NDArray {
+  roll(arr: NDArray, shift: number | number[], axis?: number | number[]): NDArray {
     if (axis === undefined) {
-      // Roll flat
+      // Roll flat — if shift is array, sum the shifts
+      const totalShift = Array.isArray(shift) ? shift.reduce((a, b) => a + b, 0) : shift;
       const n = arr.data.length;
-      const s = ((shift % n) + n) % n;
+      const s = ((totalShift % n) + n) % n;
       const data = new Float64Array(n);
       for (let i = 0; i < n; i++) {
         data[(i + s) % n] = arr.data[i];
       }
       return new JsNDArray(data, [...arr.shape]);
     }
-    const ndim = arr.shape.length;
-    const ax = axis < 0 ? axis + ndim : axis;
-    const axLen = arr.shape[ax];
-    const s = ((shift % axLen) + axLen) % axLen;
-    const data = new Float64Array(arr.data.length);
-    const strides = this._computeStrides(arr.shape);
-    const totalSize = arr.data.length;
 
-    for (let idx = 0; idx < totalSize; idx++) {
-      let rem = idx;
-      const multiIdx: number[] = [];
-      for (let d = 0; d < ndim; d++) {
-        multiIdx.push(Math.floor(rem / strides[d]));
-        rem = rem % strides[d];
-      }
-      const srcMultiIdx = [...multiIdx];
-      srcMultiIdx[ax] = (multiIdx[ax] - s + axLen) % axLen;
-      let srcIdx = 0;
-      for (let d = 0; d < ndim; d++) {
-        srcIdx += srcMultiIdx[d] * strides[d];
-      }
-      data[idx] = arr.data[srcIdx];
+    // Normalize to arrays
+    const shifts = Array.isArray(shift) ? shift : [shift];
+    const axes = Array.isArray(axis) ? axis : [axis];
+    if (shifts.length !== axes.length) {
+      throw new Error('shift and axis must have the same length');
     }
-    return new JsNDArray(data, [...arr.shape]);
+
+    // Apply rolls sequentially for each axis
+    let result = arr;
+    for (let k = 0; k < shifts.length; k++) {
+      const ndim = result.shape.length;
+      const ax = axes[k] < 0 ? axes[k] + ndim : axes[k];
+      const axLen = result.shape[ax];
+      const s = ((shifts[k] % axLen) + axLen) % axLen;
+      const data = new Float64Array(result.data.length);
+      const strides = this._computeStrides(result.shape);
+      const totalSize = result.data.length;
+
+      for (let idx = 0; idx < totalSize; idx++) {
+        let rem = idx;
+        const multiIdx: number[] = [];
+        for (let d = 0; d < ndim; d++) {
+          multiIdx.push(Math.floor(rem / strides[d]));
+          rem = rem % strides[d];
+        }
+        const srcMultiIdx = [...multiIdx];
+        srcMultiIdx[ax] = (multiIdx[ax] - s + axLen) % axLen;
+        let srcIdx = 0;
+        for (let d = 0; d < ndim; d++) {
+          srcIdx += srcMultiIdx[d] * strides[d];
+        }
+        data[idx] = result.data[srcIdx];
+      }
+      result = new JsNDArray(data, [...result.shape]);
+    }
+    return result;
   }
 
-  rot90(arr: NDArray, k: number = 1): NDArray {
+  rot90(arr: NDArray, k: number = 1, axes?: [number, number]): NDArray {
     if (arr.shape.length < 2) throw new Error('rot90 requires at least 2D');
+    const [ax0, ax1] = axes
+      ? [
+          this._normalizeAxis(axes[0], arr.shape.length),
+          this._normalizeAxis(axes[1], arr.shape.length),
+        ]
+      : [0, 1];
+    if (ax0 === ax1) throw new Error('axes must be different');
+
     const nk = ((k % 4) + 4) % 4;
     if (nk === 0) return this.copy(arr);
 
     let result = arr;
     for (let i = 0; i < nk; i++) {
-      // Rotate 90 degrees counterclockwise: transpose then flip along axis 0
-      result = this.transpose(result);
-      result = this.flip(result, 0);
+      // Rotate 90 degrees counterclockwise in the plane (ax0, ax1):
+      // 1. Swap ax0 and ax1 via transpose
+      const perm = Array.from({ length: result.shape.length }, (_, j) => j);
+      perm[ax0] = ax1;
+      perm[ax1] = ax0;
+      result = this.transpose(result, perm);
+      // 2. Flip along ax0
+      result = this.flip(result, ax0);
     }
     return result;
   }
@@ -5235,10 +5347,35 @@ export class JsBackend implements Backend {
     return new JsNDArray(new Float64Array(arr.data), [arr.data.length]);
   }
 
+  private _pad1dIndex(i: number, padBefore: number, n: number, mode: string): number {
+    if (mode === 'edge') return i < padBefore ? 0 : n - 1;
+    if (mode === 'reflect') {
+      // reflect does NOT include edge: [3,2, | 1,2,3, | 2,1]
+      return i < padBefore ? padBefore - i : n - 2 - (i - padBefore - n);
+    }
+    if (mode === 'symmetric') {
+      // symmetric INCLUDES edge: [2,1, | 1,2,3, | 3,2]
+      return i < padBefore ? padBefore - 1 - i : n - 1 - (i - padBefore - n);
+    }
+    if (mode === 'wrap') {
+      return i < padBefore ? (((n - padBefore + i) % n) + n) % n : (i - padBefore - n) % n;
+    }
+    return -1; // should not happen
+  }
+
   pad(
     arr: NDArray,
     padWidth: number | [number, number],
-    mode: 'constant' | 'edge' | 'reflect' | 'wrap' = 'constant',
+    mode:
+      | 'constant'
+      | 'edge'
+      | 'reflect'
+      | 'wrap'
+      | 'symmetric'
+      | 'linear_ramp'
+      | 'mean'
+      | 'minimum'
+      | 'maximum' = 'constant',
     constantValue: number = 0
   ): NDArray {
     const [padBefore, padAfter] = typeof padWidth === 'number' ? [padWidth, padWidth] : padWidth;
@@ -5253,18 +5390,53 @@ export class JsBackend implements Backend {
         data[padBefore + i] = arr.data[i];
       }
 
-      // Fill padding
-      for (let i = 0; i < padBefore; i++) {
-        if (mode === 'constant') data[i] = constantValue;
-        else if (mode === 'edge') data[i] = arr.data[0];
-        else if (mode === 'reflect') data[i] = arr.data[padBefore - i];
-        else if (mode === 'wrap') data[i] = arr.data[(n - padBefore + i) % n];
+      // Compute stat values for stat-based modes
+      let statVal = 0;
+      if (mode === 'mean' || mode === 'minimum' || mode === 'maximum') {
+        if (mode === 'mean') {
+          let sum = 0;
+          for (let i = 0; i < n; i++) sum += arr.data[i];
+          statVal = sum / n;
+        } else if (mode === 'minimum') {
+          statVal = arr.data[0];
+          for (let i = 1; i < n; i++) if (arr.data[i] < statVal) statVal = arr.data[i];
+        } else {
+          statVal = arr.data[0];
+          for (let i = 1; i < n; i++) if (arr.data[i] > statVal) statVal = arr.data[i];
+        }
       }
+
+      // Fill padding before
+      for (let i = 0; i < padBefore; i++) {
+        if (mode === 'constant') {
+          data[i] = constantValue;
+        } else if (mode === 'mean' || mode === 'minimum' || mode === 'maximum') {
+          data[i] = statVal;
+        } else if (mode === 'linear_ramp') {
+          // Linearly ramp from constantValue (at outermost) to edge value
+          const edgeVal = arr.data[0];
+          const t = padBefore > 1 ? (padBefore - 1 - i) / padBefore : 0;
+          data[i] = edgeVal + t * (constantValue - edgeVal);
+        } else {
+          const srcIdx = this._pad1dIndex(i, padBefore, n, mode);
+          data[i] = arr.data[Math.max(0, Math.min(n - 1, srcIdx))];
+        }
+      }
+      // Fill padding after
       for (let i = 0; i < padAfter; i++) {
-        if (mode === 'constant') data[padBefore + n + i] = constantValue;
-        else if (mode === 'edge') data[padBefore + n + i] = arr.data[n - 1];
-        else if (mode === 'reflect') data[padBefore + n + i] = arr.data[n - 2 - i];
-        else if (mode === 'wrap') data[padBefore + n + i] = arr.data[i % n];
+        const outIdx = padBefore + n + i;
+        if (mode === 'constant') {
+          data[outIdx] = constantValue;
+        } else if (mode === 'mean' || mode === 'minimum' || mode === 'maximum') {
+          data[outIdx] = statVal;
+        } else if (mode === 'linear_ramp') {
+          const edgeVal = arr.data[n - 1];
+          // fix: at i=0 we are at edge, ramp toward constantValue
+          data[outIdx] = edgeVal + ((i + 1) / padAfter) * (constantValue - edgeVal);
+        } else {
+          const srcIdx = this._pad1dIndex(padBefore + n + i, padBefore, n, mode);
+          data[outIdx] = arr.data[Math.max(0, Math.min(n - 1, srcIdx))];
+        }
       }
 
       return new JsNDArray(data, [newLen]);
@@ -5276,49 +5448,84 @@ export class JsBackend implements Backend {
       const newRows = rows + padBefore + padAfter;
       const newCols = cols + padBefore + padAfter;
       const data = new Float64Array(newRows * newCols);
-      if (mode === 'constant') data.fill(constantValue);
 
-      for (let i = 0; i < newRows; i++) {
-        for (let j = 0; j < newCols; j++) {
-          let srcRow: number, srcCol: number;
+      // For stat-based modes, compute the stat value
+      let statVal = 0;
+      if (mode === 'mean' || mode === 'minimum' || mode === 'maximum') {
+        if (mode === 'mean') {
+          let sum = 0;
+          for (let i = 0; i < arr.data.length; i++) sum += arr.data[i];
+          statVal = sum / arr.data.length;
+        } else if (mode === 'minimum') {
+          statVal = arr.data[0];
+          for (let i = 1; i < arr.data.length; i++)
+            if (arr.data[i] < statVal) statVal = arr.data[i];
+        } else {
+          statVal = arr.data[0];
+          for (let i = 1; i < arr.data.length; i++)
+            if (arr.data[i] > statVal) statVal = arr.data[i];
+        }
+      }
 
-          if (mode === 'constant') {
-            if (i >= padBefore && i < padBefore + rows && j >= padBefore && j < padBefore + cols) {
-              data[i * newCols + j] = arr.data[(i - padBefore) * cols + (j - padBefore)];
+      if (mode === 'constant') {
+        data.fill(constantValue);
+        for (let i = 0; i < rows; i++) {
+          for (let j = 0; j < cols; j++) {
+            data[(i + padBefore) * newCols + (j + padBefore)] = arr.data[i * cols + j];
+          }
+        }
+      } else if (mode === 'mean' || mode === 'minimum' || mode === 'maximum') {
+        data.fill(statVal);
+        for (let i = 0; i < rows; i++) {
+          for (let j = 0; j < cols; j++) {
+            data[(i + padBefore) * newCols + (j + padBefore)] = arr.data[i * cols + j];
+          }
+        }
+      } else {
+        // For reflect, symmetric, edge, wrap, linear_ramp on 2D
+        for (let i = 0; i < newRows; i++) {
+          for (let j = 0; j < newCols; j++) {
+            let srcRow: number, srcCol: number;
+
+            if (mode === 'linear_ramp') {
+              // For 2D linear_ramp, compute per-axis ramp factors and multiply
+              let rowFactor = 1.0;
+              let colFactor = 1.0;
+              if (i < padBefore) {
+                rowFactor = (i + 1) / (padBefore + 1);
+              } else if (i >= padBefore + rows) {
+                rowFactor = (newRows - i) / (padAfter + 1);
+              }
+              if (j < padBefore) {
+                colFactor = (j + 1) / (padBefore + 1);
+              } else if (j >= padBefore + cols) {
+                colFactor = (newCols - j) / (padAfter + 1);
+              }
+              srcRow = Math.max(0, Math.min(rows - 1, i - padBefore));
+              srcCol = Math.max(0, Math.min(cols - 1, j - padBefore));
+              const val = arr.data[srcRow * cols + srcCol];
+              data[i * newCols + j] = constantValue + (val - constantValue) * rowFactor * colFactor;
+              continue;
             }
-            continue;
-          }
 
-          // Compute source indices for non-constant modes
-          if (i < padBefore) {
-            if (mode === 'edge') srcRow = 0;
-            else if (mode === 'reflect') srcRow = padBefore - i;
-            else srcRow = (rows - padBefore + i) % rows;
-          } else if (i >= padBefore + rows) {
-            const di = i - padBefore - rows;
-            if (mode === 'edge') srcRow = rows - 1;
-            else if (mode === 'reflect') srcRow = rows - 2 - di;
-            else srcRow = di % rows;
-          } else {
-            srcRow = i - padBefore;
-          }
+            // Compute source row index
+            if (i >= padBefore && i < padBefore + rows) {
+              srcRow = i - padBefore;
+            } else {
+              srcRow = this._pad1dIndex(i, padBefore, rows, mode);
+            }
 
-          if (j < padBefore) {
-            if (mode === 'edge') srcCol = 0;
-            else if (mode === 'reflect') srcCol = padBefore - j;
-            else srcCol = (cols - padBefore + j) % cols;
-          } else if (j >= padBefore + cols) {
-            const dj = j - padBefore - cols;
-            if (mode === 'edge') srcCol = cols - 1;
-            else if (mode === 'reflect') srcCol = cols - 2 - dj;
-            else srcCol = dj % cols;
-          } else {
-            srcCol = j - padBefore;
-          }
+            // Compute source col index
+            if (j >= padBefore && j < padBefore + cols) {
+              srcCol = j - padBefore;
+            } else {
+              srcCol = this._pad1dIndex(j, padBefore, cols, mode);
+            }
 
-          srcRow = Math.max(0, Math.min(rows - 1, srcRow));
-          srcCol = Math.max(0, Math.min(cols - 1, srcCol));
-          data[i * newCols + j] = arr.data[srcRow * cols + srcCol];
+            srcRow = Math.max(0, Math.min(rows - 1, srcRow));
+            srcCol = Math.max(0, Math.min(cols - 1, srcCol));
+            data[i * newCols + j] = arr.data[srcRow * cols + srcCol];
+          }
         }
       }
       return new JsNDArray(data, [newRows, newCols]);
@@ -6158,6 +6365,63 @@ export class JsBackend implements Backend {
       data[i] = Math.pow(-Math.log(this._xorshift() || 1e-10), 1.0 / a);
     }
     return new JsNDArray(data, shape);
+  }
+
+  standardNormal(shape: number[]): NDArray {
+    return this.randn(shape);
+  }
+
+  standardCauchy(shape: number[]): NDArray {
+    const size = shape.reduce((a, b) => a * b, 1);
+    const data = new Float64Array(size);
+    for (let i = 0; i < size; i++) {
+      data[i] = Math.tan(Math.PI * (this._xorshift() - 0.5));
+    }
+    return new JsNDArray(data, shape);
+  }
+
+  multinomial(n: number, pvals: number[], size: number = 1): NDArray {
+    const k = pvals.length;
+    const data = new Float64Array(size * k);
+    for (let s = 0; s < size; s++) {
+      let remaining = n;
+      let pRemaining = 1.0;
+      for (let j = 0; j < k - 1; j++) {
+        // Each category is binomial(remaining, pvals[j] / pRemaining)
+        const p = pRemaining > 0 ? pvals[j] / pRemaining : 0;
+        let successes = 0;
+        for (let t = 0; t < remaining; t++) {
+          if (this._xorshift() < p) successes++;
+        }
+        data[s * k + j] = successes;
+        remaining -= successes;
+        pRemaining -= pvals[j];
+      }
+      data[s * k + (k - 1)] = remaining;
+    }
+    return new JsNDArray(data, size === 1 ? [k] : [size, k]);
+  }
+
+  dirichlet(alpha: number[], size: number = 1): NDArray {
+    const k = alpha.length;
+    const data = new Float64Array(size * k);
+    for (let s = 0; s < size; s++) {
+      let sum = 0;
+      for (let j = 0; j < k; j++) {
+        const g = this._gammaRandom(alpha[j]);
+        data[s * k + j] = g;
+        sum += g;
+      }
+      // Normalize
+      for (let j = 0; j < k; j++) {
+        data[s * k + j] /= sum;
+      }
+    }
+    return new JsNDArray(data, size === 1 ? [k] : [size, k]);
+  }
+
+  random(shape: number[]): NDArray {
+    return this.rand(shape);
   }
 
   // ============ Additional Stats ============
