@@ -16,17 +16,6 @@
  * - .data getter triggers async readback (via synchronous spinlock workaround)
  */
 
-function bankersRound(x: number): number {
-  if (!Number.isFinite(x)) return x;
-  const floor = Math.floor(x);
-  const frac = x - floor;
-  if (Math.abs(frac - 0.5) < Number.EPSILON * Math.max(1, Math.abs(x))) {
-    // Exactly halfway - round to even
-    return floor % 2 === 0 ? floor : floor + 1;
-  }
-  return Math.round(x);
-}
-
 import {
   Backend,
   NDArray as IFaceNDArray,
@@ -40,6 +29,8 @@ import {
   createTypedArrayFrom,
   promoteDTypes,
 } from './types.js';
+
+import { BaseBackend, bankersRound, flattenNestedArray } from './base-backend.js';
 
 // ============ GPU Device & Shader Cache ============
 
@@ -5872,39 +5863,13 @@ class BufferManager {
   }
 }
 
-function flattenNestedArray(data: any): { flat: number[]; shape: number[] } {
-  if (!Array.isArray(data)) return { flat: [data], shape: [] };
-  if (data.length === 0) return { flat: [], shape: [0] };
-  if (!Array.isArray(data[0])) return { flat: data, shape: [data.length] };
-
-  const shape: number[] = [];
-  let current: any = data;
-  while (Array.isArray(current)) {
-    shape.push(current.length);
-    current = current[0];
-  }
-
-  function flatten(arr: any): number[] {
-    if (!Array.isArray(arr)) return [arr];
-    return arr.reduce((acc: number[], item: any) => acc.concat(flatten(item)), []);
-  }
-
-  return { flat: flatten(data), shape };
-}
-
-export class WebGPUBackend implements Backend {
-  name = 'webgpu';
+export class WebGPUBackend extends BaseBackend {
+  override name = 'webgpu';
   readonly device: GPUDevice;
   private bufferManager: BufferManager;
 
-  // ============ Constants ============
-  pi = Math.PI;
-  e = Math.E;
-  inf = Infinity;
-  nan = NaN;
-  newaxis = null as any;
-
   constructor(device: GPUDevice) {
+    super();
     this.device = device;
     this.bufferManager = new BufferManager(device);
   }
@@ -6047,37 +6012,39 @@ export class WebGPUBackend implements Backend {
    * Materialize all pending GPU arrays.
    * Call this before accessing .data on GPU-backed arrays in tests.
    */
-  async materializeAll(): Promise<void> {
+  override async materializeAll(): Promise<void> {
     return materializeAll();
   }
 
   /**
    * Convert a scalar number to a 1-element NDArray
    */
-  private _toNDArray(x: ArrayOrScalar): IFaceNDArray {
+  protected override _toNDArray(x: ArrayOrScalar): IFaceNDArray {
     if (typeof x === 'number') {
       return this.createArray(new Float64Array([x]), [1]);
     }
     return x;
   }
 
-  /** Prepare two ArrayOrScalar args for GPU binary op, broadcasting scalars */
+  /** Prepare two ArrayOrScalar args for GPU binary op, with full N-D broadcasting */
   private _prepGpuBinaryArgs(a: ArrayOrScalar, b: ArrayOrScalar): [IFaceNDArray, IFaceNDArray] {
-    let arrA = this._toNDArray(a);
-    let arrB = this._toNDArray(b);
-    // Broadcast 1-element to match the other's shape
-    if (arrA.data.length === 1 && arrB.data.length > 1) {
-      arrA = this.broadcastTo(arrA, [...arrB.shape]);
-    } else if (arrB.data.length === 1 && arrA.data.length > 1) {
-      arrB = this.broadcastTo(arrB, [...arrA.shape]);
+    const arrA = this._toNDArray(a);
+    const arrB = this._toNDArray(b);
+    // If shapes already match, no broadcasting needed
+    const shapeA = arrA.shape;
+    const shapeB = arrB.shape;
+    if (shapeA.length === shapeB.length && shapeA.every((d, i) => d === shapeB[i])) {
+      return [arrA, arrB];
     }
-    return [arrA, arrB];
+    // Full N-D broadcast: compute output shape and broadcast both operands
+    const [broadA, broadB] = this.broadcastArrays(arrA, arrB);
+    return [broadA, broadB];
   }
 
   /**
    * CPU-side binary op with scalar broadcasting support
    */
-  private _binaryOp(
+  protected override _binaryOp(
     a: ArrayOrScalar,
     b: ArrayOrScalar,
     fn: (x: number, y: number) => number
@@ -7803,7 +7770,7 @@ export class WebGPUBackend implements Backend {
   }
 
   // Helper methods
-  private createArray(
+  override createArray(
     data: number[] | Float64Array | AnyTypedArray,
     shape: number[],
     dtype: DType = DEFAULT_DTYPE
@@ -7813,25 +7780,25 @@ export class WebGPUBackend implements Backend {
     return WebGPUNDArray.fromArray(f64, shape, this.device, dtype);
   }
 
-  private _shapeSize(shape: number[]): number {
+  protected override _shapeSize(shape: number[]): number {
     return shape.reduce((a, b) => a * b, 1);
   }
 
   // ============ Creation Operations ============
 
-  zeros(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override zeros(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     return this.createArray(new Float64Array(this._shapeSize(shape)), shape, dtype);
   }
 
-  ones(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override ones(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     return this.createArray(new Float64Array(this._shapeSize(shape)).fill(1), shape, dtype);
   }
 
-  full(shape: number[], value: number, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override full(shape: number[], value: number, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     return this.createArray(new Float64Array(this._shapeSize(shape)).fill(value), shape, dtype);
   }
 
-  arange(
+  override arange(
     startOrStop: number,
     stop?: number,
     step?: number,
@@ -7863,7 +7830,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [data.length], dtype);
   }
 
-  linspace(
+  override linspace(
     start: number,
     stop: number,
     num: number,
@@ -7884,7 +7851,12 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [num], dtype);
   }
 
-  eye(n: number, M?: number | DType, k: number = 0, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override eye(
+    n: number,
+    M?: number | DType,
+    k: number = 0,
+    dtype: DType = DEFAULT_DTYPE
+  ): IFaceNDArray {
     // Handle backward compat: eye(3, 'float32') where 2nd arg is dtype
     let m: number;
     if (typeof M === 'string') {
@@ -7903,7 +7875,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [n, m], dtype);
   }
 
-  diag(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
+  override diag(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
     const shape = arr.shape;
     const data = arr.data;
 
@@ -7929,7 +7901,7 @@ export class WebGPUBackend implements Backend {
     throw new Error('diag requires 1D or 2D array');
   }
 
-  array(
+  override array(
     data: number[] | number[][] | any[],
     shape?: number[],
     dtype: DType = DEFAULT_DTYPE
@@ -7948,7 +7920,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(flatData, inferredShape, dtype);
   }
 
-  asarray(a: IFaceNDArray | number[] | number, dtype?: DType): IFaceNDArray {
+  override asarray(a: IFaceNDArray | number[] | number, dtype?: DType): IFaceNDArray {
     if (typeof a === 'number') {
       const dt = dtype || DEFAULT_DTYPE;
       return this.createArray(new Float64Array([a]), [1], dt);
@@ -7966,7 +7938,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Creation (Additional) ============
 
-  fromfunction(
+  override fromfunction(
     fn: (...coords: number[]) => number,
     shape: number[],
     dtype: DType = DEFAULT_DTYPE
@@ -7988,7 +7960,11 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [...shape], dtype);
   }
 
-  fromiter(iter: Iterable<number>, count?: number, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override fromiter(
+    iter: Iterable<number>,
+    count?: number,
+    dtype: DType = DEFAULT_DTYPE
+  ): IFaceNDArray {
     const values: number[] = [];
     let n = 0;
     for (const v of iter) {
@@ -8001,7 +7977,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Type Casting ============
 
-  astype(arr: IFaceNDArray, dtype: DType): IFaceNDArray {
+  override astype(arr: IFaceNDArray, dtype: DType): IFaceNDArray {
     const data = createTypedArrayFrom(dtype, Array.from(arr.data));
     return new WebGPUNDArray(
       WebGPUTensor.fromArray(new Float64Array(Array.from(data)), [...arr.shape], this.device),
@@ -8011,120 +7987,120 @@ export class WebGPUBackend implements Backend {
 
   // ============ Complex Helpers ============
 
-  real(arr: IFaceNDArray): IFaceNDArray {
+  override real(arr: IFaceNDArray): IFaceNDArray {
     return this.createArray(new Float64Array(arr.data), [...arr.shape]);
   }
 
-  imag(arr: IFaceNDArray): IFaceNDArray {
+  override imag(arr: IFaceNDArray): IFaceNDArray {
     return this.createArray(new Float64Array(arr.data.length), [...arr.shape]);
   }
 
-  conj(arr: IFaceNDArray): IFaceNDArray {
+  override conj(arr: IFaceNDArray): IFaceNDArray {
     return this.createArray(new Float64Array(arr.data), [...arr.shape]);
   }
 
   // ============ Math - Unary Operations (GPU) ============
 
-  sin(arr: IFaceNDArray): IFaceNDArray {
+  override sin(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'sin'));
   }
 
-  cos(arr: IFaceNDArray): IFaceNDArray {
+  override cos(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'cos'));
   }
 
-  tan(arr: IFaceNDArray): IFaceNDArray {
+  override tan(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'tan'));
   }
 
-  arcsin(arr: IFaceNDArray): IFaceNDArray {
+  override arcsin(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'asin'));
   }
 
-  arccos(arr: IFaceNDArray): IFaceNDArray {
+  override arccos(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'acos'));
   }
 
-  arctan(arr: IFaceNDArray): IFaceNDArray {
+  override arctan(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'atan'));
   }
 
-  sinh(arr: IFaceNDArray): IFaceNDArray {
+  override sinh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'sinh'));
   }
 
-  cosh(arr: IFaceNDArray): IFaceNDArray {
+  override cosh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'cosh'));
   }
 
-  tanh(arr: IFaceNDArray): IFaceNDArray {
+  override tanh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'tanh'));
   }
 
-  exp(arr: IFaceNDArray): IFaceNDArray {
+  override exp(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'exp'));
   }
 
-  log(arr: IFaceNDArray): IFaceNDArray {
+  override log(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'log'));
   }
 
-  log2(arr: IFaceNDArray): IFaceNDArray {
+  override log2(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'log2'));
   }
 
-  log10(arr: IFaceNDArray): IFaceNDArray {
+  override log10(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'log10'));
   }
 
-  sqrt(arr: IFaceNDArray): IFaceNDArray {
+  override sqrt(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'sqrt'));
   }
 
-  cbrt(arr: IFaceNDArray): IFaceNDArray {
+  override cbrt(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'cbrt'));
   }
 
-  abs(arr: IFaceNDArray): IFaceNDArray {
+  override abs(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'abs'));
   }
 
-  absolute(arr: IFaceNDArray): IFaceNDArray {
+  override absolute(arr: IFaceNDArray): IFaceNDArray {
     return this.abs(arr);
   }
 
-  sign(arr: IFaceNDArray): IFaceNDArray {
+  override sign(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'sign'));
   }
 
-  floor(arr: IFaceNDArray): IFaceNDArray {
+  override floor(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'floor'));
   }
 
-  ceil(arr: IFaceNDArray): IFaceNDArray {
+  override ceil(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'ceil'));
   }
 
-  round(arr: IFaceNDArray, decimals: number = 0): IFaceNDArray {
+  override round(arr: IFaceNDArray, decimals: number = 0): IFaceNDArray {
     if (decimals === 0) {
       const tensor = this.toTensor(arr);
       return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'round'));
@@ -8137,91 +8113,91 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [...arr.shape]);
   }
 
-  negative(arr: IFaceNDArray): IFaceNDArray {
+  override negative(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'neg'));
   }
 
   /** @deprecated Use negative() instead */
-  neg(arr: IFaceNDArray): IFaceNDArray {
+  override neg(arr: IFaceNDArray): IFaceNDArray {
     return this.negative(arr);
   }
 
-  reciprocal(arr: IFaceNDArray): IFaceNDArray {
+  override reciprocal(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'reciprocal'));
   }
 
-  square(arr: IFaceNDArray): IFaceNDArray {
+  override square(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'square'));
   }
 
   // ============ Math - Unary (Extended) ============
 
-  arcsinh(arr: IFaceNDArray): IFaceNDArray {
+  override arcsinh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'asinh'));
   }
 
-  arccosh(arr: IFaceNDArray): IFaceNDArray {
+  override arccosh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'acosh'));
   }
 
-  arctanh(arr: IFaceNDArray): IFaceNDArray {
+  override arctanh(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'atanh'));
   }
 
-  expm1(arr: IFaceNDArray): IFaceNDArray {
+  override expm1(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'expm1'));
   }
 
-  log1p(arr: IFaceNDArray): IFaceNDArray {
+  override log1p(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'log1p'));
   }
 
-  trunc(arr: IFaceNDArray): IFaceNDArray {
+  override trunc(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'trunc'));
   }
 
-  fix(arr: IFaceNDArray): IFaceNDArray {
+  override fix(arr: IFaceNDArray): IFaceNDArray {
     // Same as trunc - round toward zero
     return this.trunc(arr);
   }
 
-  sinc(arr: IFaceNDArray): IFaceNDArray {
+  override sinc(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'sinc'));
   }
 
-  deg2rad(arr: IFaceNDArray): IFaceNDArray {
+  override deg2rad(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'deg2rad'));
   }
 
-  rad2deg(arr: IFaceNDArray): IFaceNDArray {
+  override rad2deg(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'rad2deg'));
   }
 
-  heaviside(arr: IFaceNDArray, h0: number): IFaceNDArray {
+  override heaviside(arr: IFaceNDArray, h0: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, h0, 'heaviside'));
   }
 
-  signbit(arr: IFaceNDArray): IFaceNDArray {
+  override signbit(arr: IFaceNDArray): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runUnaryOpOnTensor(tensor, 'signbit'));
   }
 
   // ============ Math - Decomposition ============
 
-  modf(arr: IFaceNDArray): { frac: IFaceNDArray; integ: IFaceNDArray } {
+  override modf(arr: IFaceNDArray): { frac: IFaceNDArray; integ: IFaceNDArray } {
     const tensor = this.toTensor(arr);
     const result = this.runModfOnTensor(tensor);
     return {
@@ -8230,7 +8206,7 @@ export class WebGPUBackend implements Backend {
     };
   }
 
-  frexp(arr: IFaceNDArray): { mantissa: IFaceNDArray; exponent: IFaceNDArray } {
+  override frexp(arr: IFaceNDArray): { mantissa: IFaceNDArray; exponent: IFaceNDArray } {
     const tensor = this.toTensor(arr);
     const result = this.runFrexpOnTensor(tensor);
     return {
@@ -8239,7 +8215,7 @@ export class WebGPUBackend implements Backend {
     };
   }
 
-  ldexp(arr: IFaceNDArray, exp: IFaceNDArray): IFaceNDArray {
+  override ldexp(arr: IFaceNDArray, exp: IFaceNDArray): IFaceNDArray {
     // ldexp(x, e) = x * 2^e
     // Use binary mul with exp2(e)
     const arrTensor = this.toTensor(arr);
@@ -8248,7 +8224,10 @@ export class WebGPUBackend implements Backend {
     return this.fromTensor(this.runBinaryOpOnTensor(arrTensor, exp2Tensor, 'mul'));
   }
 
-  divmod(a: ArrayOrScalar, b: ArrayOrScalar): { quotient: IFaceNDArray; remainder: IFaceNDArray } {
+  override divmod(
+    a: ArrayOrScalar,
+    b: ArrayOrScalar
+  ): { quotient: IFaceNDArray; remainder: IFaceNDArray } {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     const ta = this.toTensor(arrA);
     const tb = this.toTensor(arrB);
@@ -8261,14 +8240,14 @@ export class WebGPUBackend implements Backend {
 
   // ============ Math - Binary Operations (GPU) ============
 
-  add(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override add(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'add')
     );
   }
 
-  subtract(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override subtract(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'sub')
@@ -8276,11 +8255,11 @@ export class WebGPUBackend implements Backend {
   }
 
   /** @deprecated Use subtract() instead */
-  sub(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override sub(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.subtract(a, b);
   }
 
-  multiply(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override multiply(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'mul')
@@ -8288,11 +8267,11 @@ export class WebGPUBackend implements Backend {
   }
 
   /** @deprecated Use multiply() instead */
-  mul(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override mul(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.multiply(a, b);
   }
 
-  divide(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override divide(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'div')
@@ -8300,11 +8279,11 @@ export class WebGPUBackend implements Backend {
   }
 
   /** @deprecated Use divide() instead */
-  div(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override div(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.divide(a, b);
   }
 
-  power(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override power(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'pow')
@@ -8312,22 +8291,22 @@ export class WebGPUBackend implements Backend {
   }
 
   /** @deprecated Use power() instead */
-  pow(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override pow(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.power(a, b);
   }
 
-  floorDivide(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override floorDivide(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.floor(this.divide(a, b));
   }
 
-  maximum(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override maximum(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'maximum')
     );
   }
 
-  minimum(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override minimum(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'minimum')
@@ -8336,67 +8315,67 @@ export class WebGPUBackend implements Backend {
 
   // ============ Math - Binary (Extended) (GPU) ============
 
-  mod(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override mod(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'mod')
     );
   }
 
-  fmod(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override fmod(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'fmod')
     );
   }
 
-  remainder(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override remainder(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this.mod(a, b); // Same as mod in NumPy
   }
 
-  copysign(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override copysign(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'copysign')
     );
   }
 
-  hypot(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override hypot(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'hypot')
     );
   }
 
-  arctan2(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override arctan2(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'arctan2')
     );
   }
 
-  logaddexp(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override logaddexp(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'logaddexp')
     );
   }
 
-  logaddexp2(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override logaddexp2(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'logaddexp2')
     );
   }
 
-  fmax(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override fmax(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'fmax')
     );
   }
 
-  fmin(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override fmin(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const [arrA, arrB] = this._prepGpuBinaryArgs(a, b);
     return this.fromTensor(
       this.runBinaryOpOnTensor(this.toTensor(arrA), this.toTensor(arrB), 'fmin')
@@ -8405,32 +8384,32 @@ export class WebGPUBackend implements Backend {
 
   // ============ Math - Scalar Operations (GPU) ============
 
-  addScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
+  override addScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, scalar, 'addScalar'));
   }
 
-  subScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
+  override subScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, scalar, 'subScalar'));
   }
 
-  mulScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
+  override mulScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, scalar, 'mulScalar'));
   }
 
-  divScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
+  override divScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, scalar, 'divScalar'));
   }
 
-  powScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
+  override powScalar(arr: IFaceNDArray, scalar: number): IFaceNDArray {
     const tensor = this.toTensor(arr);
     return this.fromTensor(this.runScalarOpOnTensor(tensor, scalar, 'powScalar'));
   }
 
-  clip(arr: IFaceNDArray, min: number | null, max: number | null): IFaceNDArray {
+  override clip(arr: IFaceNDArray, min: number | null, max: number | null): IFaceNDArray {
     // clip = max(min, min(x, maxVal))
     // Use two scalar ops: first clamp to max, then clamp to min
     const tensor = this.toTensor(arr);
@@ -8446,7 +8425,12 @@ export class WebGPUBackend implements Backend {
 
   // ============ Stats Operations ============
 
-  sum(arr: IFaceNDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | IFaceNDArray {
+  override sum(
+    arr: IFaceNDArray,
+    axis?: number,
+    keepdims?: boolean,
+    dtype?: DType
+  ): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       let result = this.sumAxis(arr, axis);
@@ -8463,7 +8447,12 @@ export class WebGPUBackend implements Backend {
     return sum;
   }
 
-  prod(arr: IFaceNDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | IFaceNDArray {
+  override prod(
+    arr: IFaceNDArray,
+    axis?: number,
+    keepdims?: boolean,
+    dtype?: DType
+  ): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       let result = this.prodAxis(arr, axis);
@@ -8481,7 +8470,12 @@ export class WebGPUBackend implements Backend {
     return prod;
   }
 
-  mean(arr: IFaceNDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | IFaceNDArray {
+  override mean(
+    arr: IFaceNDArray,
+    axis?: number,
+    keepdims?: boolean,
+    dtype?: DType
+  ): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       let result = this.meanAxis(arr, axis);
@@ -8497,7 +8491,7 @@ export class WebGPUBackend implements Backend {
     return (this.sum(arr) as number) / arr.data.length;
   }
 
-  var(
+  override var(
     arr: IFaceNDArray,
     axis?: number | null,
     ddof: number = 0,
@@ -8524,7 +8518,7 @@ export class WebGPUBackend implements Backend {
     return sumSq / (n - ddof);
   }
 
-  std(
+  override std(
     arr: IFaceNDArray,
     axis?: number | null,
     ddof: number = 0,
@@ -8543,7 +8537,7 @@ export class WebGPUBackend implements Backend {
     return Math.sqrt(this.var(arr, undefined, ddof) as number);
   }
 
-  min(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override min(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.minAxis(arr, axis);
@@ -8563,7 +8557,7 @@ export class WebGPUBackend implements Backend {
     return m;
   }
 
-  max(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override max(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.maxAxis(arr, axis);
@@ -8583,7 +8577,7 @@ export class WebGPUBackend implements Backend {
     return m;
   }
 
-  argmin(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override argmin(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.argminAxis(arr, axis);
@@ -8602,7 +8596,7 @@ export class WebGPUBackend implements Backend {
     return minIdx;
   }
 
-  argmax(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override argmax(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.argmaxAxis(arr, axis);
@@ -8621,7 +8615,7 @@ export class WebGPUBackend implements Backend {
     return maxIdx;
   }
 
-  cumsum(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
+  override cumsum(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.cumsumAxis(arr, axis);
@@ -8639,7 +8633,7 @@ export class WebGPUBackend implements Backend {
     return dtype ? this.astype(result, dtype) : result;
   }
 
-  cumprod(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
+  override cumprod(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.cumprodAxis(arr, axis);
@@ -8656,7 +8650,7 @@ export class WebGPUBackend implements Backend {
     return dtype ? this.astype(result, dtype) : result;
   }
 
-  all(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+  override all(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.allAxis(arr, axis);
@@ -8673,7 +8667,7 @@ export class WebGPUBackend implements Backend {
     return true;
   }
 
-  any(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+  override any(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
     if (axis !== undefined) {
       axis = this._normalizeAxis(axis, arr.shape.length);
       const result = this.anyAxis(arr, axis);
@@ -8690,7 +8684,7 @@ export class WebGPUBackend implements Backend {
     return false;
   }
 
-  sumAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override sumAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let s = 0;
       for (let i = 0; i < vals.length; i++) s += vals[i];
@@ -8698,7 +8692,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  meanAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override meanAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let s = 0;
       for (let i = 0; i < vals.length; i++) s += vals[i];
@@ -8706,7 +8700,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  minAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override minAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let m = vals[0];
       for (let i = 1; i < vals.length; i++) {
@@ -8717,7 +8711,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  maxAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override maxAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let m = vals[0];
       for (let i = 1; i < vals.length; i++) {
@@ -8728,7 +8722,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  argminAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override argminAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let minIdx = 0;
       for (let i = 1; i < vals.length; i++) {
@@ -8738,7 +8732,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  argmaxAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override argmaxAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let maxIdx = 0;
       for (let i = 1; i < vals.length; i++) {
@@ -8748,7 +8742,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  varAxis(arr: IFaceNDArray, axis: number, ddof: number = 0): IFaceNDArray {
+  override varAxis(arr: IFaceNDArray, axis: number, ddof: number = 0): IFaceNDArray {
     const axisLen = arr.shape[axis];
     return this._reduceAlongAxis(arr, axis, vals => {
       let s = 0;
@@ -8763,12 +8757,12 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  stdAxis(arr: IFaceNDArray, axis: number, ddof: number = 0): IFaceNDArray {
+  override stdAxis(arr: IFaceNDArray, axis: number, ddof: number = 0): IFaceNDArray {
     const variance = this.varAxis(arr, axis, ddof);
     return this.createArray(variance.data.map(Math.sqrt), variance.shape);
   }
 
-  prodAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override prodAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       let p = 1;
       for (let i = 0; i < vals.length; i++) p *= vals[i];
@@ -8776,7 +8770,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  allAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override allAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       for (let i = 0; i < vals.length; i++) {
         if (vals[i] === 0) return 0;
@@ -8785,7 +8779,7 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  anyAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override anyAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._reduceAlongAxis(arr, axis, vals => {
       for (let i = 0; i < vals.length; i++) {
         if (vals[i] !== 0) return 1;
@@ -8794,11 +8788,11 @@ export class WebGPUBackend implements Backend {
     });
   }
 
-  cumsumAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override cumsumAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._cumAlongAxis(arr, axis, (prev, cur) => prev + cur);
   }
 
-  cumprodAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override cumprodAxis(arr: IFaceNDArray, axis: number): IFaceNDArray {
     return this._cumAlongAxis(arr, axis, (prev, cur) => prev * cur);
   }
 
@@ -8806,7 +8800,7 @@ export class WebGPUBackend implements Backend {
    * Generic cumulative operation along an axis for N-D arrays.
    * Returns an array with the same shape as the input.
    */
-  private _cumAlongAxis(
+  protected override _cumAlongAxis(
     arr: IFaceNDArray,
     axis: number,
     accumulate: (prev: number, cur: number) => number
@@ -8879,31 +8873,31 @@ export class WebGPUBackend implements Backend {
     }
   }
 
-  equal(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override equal(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x === y ? 1 : 0));
   }
 
-  notEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override notEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x !== y ? 1 : 0));
   }
 
-  less(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override less(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x < y ? 1 : 0));
   }
 
-  lessEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override lessEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x <= y ? 1 : 0));
   }
 
-  greater(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override greater(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x > y ? 1 : 0));
   }
 
-  greaterEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override greaterEqual(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x >= y ? 1 : 0));
   }
 
-  isnan(arr: IFaceNDArray): IFaceNDArray {
+  override isnan(arr: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(arr.data.length);
     for (let i = 0; i < arr.data.length; i++) {
       data[i] = Number.isNaN(arr.data[i]) ? 1 : 0;
@@ -8911,7 +8905,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, arr.shape);
   }
 
-  isinf(arr: IFaceNDArray): IFaceNDArray {
+  override isinf(arr: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(arr.data.length);
     for (let i = 0; i < arr.data.length; i++) {
       const x = arr.data[i];
@@ -8920,7 +8914,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, arr.shape);
   }
 
-  isfinite(arr: IFaceNDArray): IFaceNDArray {
+  override isfinite(arr: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(arr.data.length);
     for (let i = 0; i < arr.data.length; i++) {
       data[i] = Number.isFinite(arr.data[i]) ? 1 : 0;
@@ -8930,26 +8924,26 @@ export class WebGPUBackend implements Backend {
 
   // ============ Set Operations ============
 
-  setdiff1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override setdiff1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const setB = new Set(b.data);
     const result = Array.from(a.data).filter(x => !setB.has(x));
     const unique = [...new Set(result)].sort((x, y) => x - y);
     return this.createArray(new Float64Array(unique), [unique.length]);
   }
 
-  union1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override union1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const combined = new Set([...a.data, ...b.data]);
     const result = [...combined].sort((x, y) => x - y);
     return this.createArray(new Float64Array(result), [result.length]);
   }
 
-  intersect1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override intersect1d(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const setB = new Set(b.data);
     const result = [...new Set(Array.from(a.data).filter(x => setB.has(x)))].sort((x, y) => x - y);
     return this.createArray(new Float64Array(result), [result.length]);
   }
 
-  isin(element: IFaceNDArray, testElements: IFaceNDArray): IFaceNDArray {
+  override isin(element: IFaceNDArray, testElements: IFaceNDArray): IFaceNDArray {
     const testSet = new Set(testElements.data);
     const data = new Float64Array(element.data.length);
     for (let i = 0; i < element.data.length; i++) {
@@ -8960,7 +8954,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Extended Array Manipulation ============
 
-  insert(
+  override insert(
     arr: IFaceNDArray,
     index: number,
     values: IFaceNDArray | number,
@@ -8976,7 +8970,7 @@ export class WebGPUBackend implements Backend {
     throw new Error('insert with axis not yet implemented');
   }
 
-  deleteArr(arr: IFaceNDArray, index: number | number[], axis?: number): IFaceNDArray {
+  override deleteArr(arr: IFaceNDArray, index: number | number[], axis?: number): IFaceNDArray {
     if (axis === undefined) {
       const flat = Array.from(this.flatten(arr).data);
       const indices = Array.isArray(index) ? index : [index];
@@ -8989,7 +8983,7 @@ export class WebGPUBackend implements Backend {
     throw new Error('delete with axis not yet implemented');
   }
 
-  append(arr: IFaceNDArray, values: IFaceNDArray, axis?: number): IFaceNDArray {
+  override append(arr: IFaceNDArray, values: IFaceNDArray, axis?: number): IFaceNDArray {
     if (axis === undefined) {
       const flat1 = this.flatten(arr);
       const flat2 = this.flatten(values);
@@ -9001,14 +8995,14 @@ export class WebGPUBackend implements Backend {
     return this.concatenate([arr, values], axis);
   }
 
-  atleast1d(arr: IFaceNDArray): IFaceNDArray {
+  override atleast1d(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length === 0) {
       return this.createArray(new Float64Array(arr.data), [1]);
     }
     return arr;
   }
 
-  atleast2d(arr: IFaceNDArray): IFaceNDArray {
+  override atleast2d(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length === 0) {
       return this.createArray(new Float64Array(arr.data), [1, 1]);
     }
@@ -9018,7 +9012,7 @@ export class WebGPUBackend implements Backend {
     return arr;
   }
 
-  atleast3d(arr: IFaceNDArray): IFaceNDArray {
+  override atleast3d(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length === 0) {
       return this.createArray(new Float64Array(arr.data), [1, 1, 1]);
     }
@@ -9031,7 +9025,11 @@ export class WebGPUBackend implements Backend {
     return arr;
   }
 
-  countNonzero(arr: IFaceNDArray, axis?: number, keepdims?: boolean): IFaceNDArray | number {
+  override countNonzero(
+    arr: IFaceNDArray,
+    axis?: number,
+    keepdims?: boolean
+  ): IFaceNDArray | number {
     if (axis === undefined) {
       let count = 0;
       for (let i = 0; i < arr.data.length; i++) {
@@ -9087,7 +9085,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Linear Algebra - Sync (CPU) ============
 
-  matmul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override matmul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     if (a.shape.length !== 2 || b.shape.length !== 2) throw new Error('matmul requires 2D arrays');
     const [m, k1] = a.shape;
     const [k2, n] = b.shape;
@@ -9480,7 +9478,7 @@ export class WebGPUBackend implements Backend {
     return best.name;
   }
 
-  dot(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override dot(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     if (a.shape.length === 1 && b.shape.length === 1) {
       let sum = 0;
       for (let i = 0; i < a.data.length; i++) sum += a.data[i] * b.data[i];
@@ -9489,13 +9487,13 @@ export class WebGPUBackend implements Backend {
     return this.matmul(a, b);
   }
 
-  inner(a: IFaceNDArray, b: IFaceNDArray): number | IFaceNDArray {
+  override inner(a: IFaceNDArray, b: IFaceNDArray): number | IFaceNDArray {
     let sum = 0;
     for (let i = 0; i < a.data.length; i++) sum += a.data[i] * b.data[i];
     return sum;
   }
 
-  outer(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override outer(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const m = a.data.length;
     const n = b.data.length;
     const result = new Float64Array(m * n);
@@ -9507,7 +9505,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, [m, n]);
   }
 
-  transpose(arr: IFaceNDArray, axes?: number[]): IFaceNDArray {
+  override transpose(arr: IFaceNDArray, axes?: number[]): IFaceNDArray {
     const ndim = arr.shape.length;
     if (ndim === 1) return this.createArray(arr.data, arr.shape);
 
@@ -9551,7 +9549,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, newShape);
   }
 
-  trace(arr: IFaceNDArray): number {
+  override trace(arr: IFaceNDArray): number {
     if (arr.shape.length !== 2) throw new Error('trace requires 2D array');
     const n = Math.min(arr.shape[0], arr.shape[1]);
     let sum = 0;
@@ -9569,7 +9567,7 @@ export class WebGPUBackend implements Backend {
    *
    * For smaller matrices, CPU is faster due to kernel launch overhead.
    */
-  async det(arr: IFaceNDArray): Promise<number> {
+  override async det(arr: IFaceNDArray): Promise<number> {
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('det requires square matrix');
     }
@@ -9802,7 +9800,7 @@ export class WebGPUBackend implements Backend {
    *
    * For smaller matrices, CPU is faster due to kernel launch overhead.
    */
-  async inv(arr: IFaceNDArray): Promise<IFaceNDArray> {
+  override async inv(arr: IFaceNDArray): Promise<IFaceNDArray> {
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('inv requires square matrix');
     }
@@ -10040,7 +10038,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, [n, n]);
   }
 
-  async solve(a: IFaceNDArray, b: IFaceNDArray): Promise<IFaceNDArray> {
+  override async solve(a: IFaceNDArray, b: IFaceNDArray): Promise<IFaceNDArray> {
     // Solve Ax = b using LU decomposition with partial pivoting
     const n = a.shape[0];
     if (a.shape.length !== 2 || a.shape[0] !== a.shape[1])
@@ -10117,7 +10115,11 @@ export class WebGPUBackend implements Backend {
     return this.createArray(x, [n, nrhs]);
   }
 
-  norm(arr: IFaceNDArray, ord: number | 'fro' | 'nuc' = 2, axis?: number): number | IFaceNDArray {
+  override norm(
+    arr: IFaceNDArray,
+    ord: number | 'fro' | 'nuc' = 2,
+    axis?: number
+  ): number | IFaceNDArray {
     // Handle 'fro' (Frobenius norm) — sqrt of sum of squares
     if (ord === 'fro') {
       const data = arr.data;
@@ -10507,7 +10509,7 @@ export class WebGPUBackend implements Backend {
   /**
    * Sync QR wrapper - calls async version
    */
-  qr(
+  override qr(
     arr: IFaceNDArray,
     mode: 'reduced' | 'complete' = 'reduced'
   ): { q: IFaceNDArray; r: IFaceNDArray } {
@@ -10859,7 +10861,7 @@ export class WebGPUBackend implements Backend {
    * Sync SVD - full implementation with U and V matrices
    * Uses power iteration with convergence check and orthogonalization
    */
-  svd(
+  override svd(
     arr: IFaceNDArray,
     fullMatrices: boolean = true
   ): { u: IFaceNDArray; s: IFaceNDArray; vt: IFaceNDArray } {
@@ -11098,7 +11100,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Advanced Linalg ============
 
-  async matrixPower(arr: IFaceNDArray, n: number): Promise<IFaceNDArray> {
+  override async matrixPower(arr: IFaceNDArray, n: number): Promise<IFaceNDArray> {
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('matrixPower requires square 2D array');
     }
@@ -11121,7 +11123,7 @@ export class WebGPUBackend implements Backend {
     return result;
   }
 
-  kron(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override kron(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const aFlat = a.shape.length === 1 ? this.reshape(a, [a.shape[0], 1]) : a;
     const bFlat = b.shape.length === 1 ? this.reshape(b, [b.shape[0], 1]) : b;
 
@@ -11249,7 +11251,7 @@ export class WebGPUBackend implements Backend {
   /**
    * Sync condition number using CPU SVD
    */
-  cond(arr: IFaceNDArray, p: number | 'fro' = 2): number {
+  override cond(arr: IFaceNDArray, p: number | 'fro' = 2): number {
     if (arr.shape.length !== 2) {
       throw new Error('cond requires a 2D matrix');
     }
@@ -11290,7 +11292,7 @@ export class WebGPUBackend implements Backend {
     return sMax / sMin;
   }
 
-  async slogdet(arr: IFaceNDArray): Promise<{ sign: number; logabsdet: number }> {
+  override async slogdet(arr: IFaceNDArray): Promise<{ sign: number; logabsdet: number }> {
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('slogdet requires a square 2D matrix');
     }
@@ -11304,7 +11306,7 @@ export class WebGPUBackend implements Backend {
     };
   }
 
-  multiDot(arrays: IFaceNDArray[]): IFaceNDArray {
+  override multiDot(arrays: IFaceNDArray[]): IFaceNDArray {
     if (arrays.length === 0) {
       throw new Error('multiDot requires at least one array');
     }
@@ -11320,7 +11322,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Polynomial ============
 
-  polyval(p: IFaceNDArray, x: IFaceNDArray): IFaceNDArray {
+  override polyval(p: IFaceNDArray, x: IFaceNDArray): IFaceNDArray {
     const pFlat = this.flatten(p);
     const xFlat = this.flatten(x);
     const degree = pFlat.shape[0] - 1;
@@ -11375,7 +11377,7 @@ export class WebGPUBackend implements Backend {
     return new WebGPUTensor(outputBuffer, x.shape, this.device);
   }
 
-  polyadd(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override polyadd(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const aCoeffs = Array.from(this.flatten(a).data);
     const bCoeffs = Array.from(this.flatten(b).data);
     const maxLen = Math.max(aCoeffs.length, bCoeffs.length);
@@ -11388,7 +11390,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, [maxLen]);
   }
 
-  polymul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override polymul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const aCoeffs = Array.from(this.flatten(a).data);
     const bCoeffs = Array.from(this.flatten(b).data);
     const resultLen = aCoeffs.length + bCoeffs.length - 1;
@@ -11401,7 +11403,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, [resultLen]);
   }
 
-  polyfit(x: IFaceNDArray, y: IFaceNDArray, deg: number): IFaceNDArray {
+  override polyfit(x: IFaceNDArray, y: IFaceNDArray, deg: number): IFaceNDArray {
     const xData = this.flatten(x).data;
     const yData = this.flatten(y).data;
     const n = xData.length;
@@ -11475,7 +11477,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(c, [m]);
   }
 
-  roots(p: IFaceNDArray): IFaceNDArray {
+  override roots(p: IFaceNDArray): IFaceNDArray {
     const coeffs = Array.from(this.flatten(p).data);
 
     while (coeffs.length > 0 && coeffs[0] === 0) {
@@ -11578,7 +11580,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Interpolation ============
 
-  interp(x: IFaceNDArray, xp: IFaceNDArray, fp: IFaceNDArray): IFaceNDArray {
+  override interp(x: IFaceNDArray, xp: IFaceNDArray, fp: IFaceNDArray): IFaceNDArray {
     const xpData = this.flatten(xp).data;
     const fpData = this.flatten(fp).data;
 
@@ -11604,7 +11606,7 @@ export class WebGPUBackend implements Backend {
   // Native bincount implementation - uses atomic scatter pattern
   // For large arrays, use bincountAsync() which uses GPU atomics
 
-  bincount(x: IFaceNDArray, weights?: IFaceNDArray, minlength?: number): IFaceNDArray {
+  override bincount(x: IFaceNDArray, weights?: IFaceNDArray, minlength?: number): IFaceNDArray {
     const xFlat = this.flatten(x).data;
     const wFlat = weights ? this.flatten(weights).data : null;
 
@@ -11630,25 +11632,25 @@ export class WebGPUBackend implements Backend {
 
   // ============ Creation - Like Functions ============
 
-  zerosLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
+  override zerosLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
     return this.zeros(arr.shape, dtype ?? arr.dtype);
   }
 
-  onesLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
+  override onesLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
     return this.ones(arr.shape, dtype ?? arr.dtype);
   }
 
-  emptyLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
+  override emptyLike(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
     return this.zeros(arr.shape, dtype ?? arr.dtype);
   }
 
-  fullLike(arr: IFaceNDArray, value: number, dtype?: DType): IFaceNDArray {
+  override fullLike(arr: IFaceNDArray, value: number, dtype?: DType): IFaceNDArray {
     return this.full(arr.shape, value, dtype ?? arr.dtype);
   }
 
   // ============ Broadcasting ============
 
-  private _computeStrides(shape: number[]): number[] {
+  protected override _computeStrides(shape: number[]): number[] {
     const strides = new Array(shape.length);
     let stride = 1;
     for (let i = shape.length - 1; i >= 0; i--) {
@@ -11658,7 +11660,7 @@ export class WebGPUBackend implements Backend {
     return strides;
   }
 
-  private _computeBroadcastStrides(srcShape: number[], dstShape: number[]): number[] {
+  protected override _computeBroadcastStrides(srcShape: number[], dstShape: number[]): number[] {
     const strides = new Array(dstShape.length);
     let srcStride = 1;
     for (let i = srcShape.length - 1; i >= 0; i--) {
@@ -11668,7 +11670,7 @@ export class WebGPUBackend implements Backend {
     return strides;
   }
 
-  broadcastTo(arr: IFaceNDArray, shape: number[]): IFaceNDArray {
+  override broadcastTo(arr: IFaceNDArray, shape: number[]): IFaceNDArray {
     const arrShape = arr.shape;
     if (arrShape.length > shape.length) {
       throw new Error('Cannot broadcast to smaller number of dimensions');
@@ -11701,7 +11703,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, shape);
   }
 
-  broadcastArrays(...arrays: IFaceNDArray[]): IFaceNDArray[] {
+  override broadcastArrays(...arrays: IFaceNDArray[]): IFaceNDArray[] {
     if (arrays.length === 0) return [];
     if (arrays.length === 1) return [this.createArray(arrays[0].data.slice(), arrays[0].shape)];
 
@@ -11730,7 +11732,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Shape Manipulation ============
 
-  private _normalizeAxis(axis: number, ndim: number): number {
+  protected override _normalizeAxis(axis: number, ndim: number): number {
     if (axis < 0) axis += ndim;
     if (axis < 0 || axis >= ndim) {
       throw new Error(`axis ${axis} is out of bounds for array of dimension ${ndim}`);
@@ -11738,7 +11740,11 @@ export class WebGPUBackend implements Backend {
     return axis;
   }
 
-  private _transposeGeneral(arr: IFaceNDArray, perm: number[], newShape: number[]): IFaceNDArray {
+  protected override _transposeGeneral(
+    arr: IFaceNDArray,
+    perm: number[],
+    newShape: number[]
+  ): IFaceNDArray {
     const size = arr.data.length;
     const result = new Float64Array(size);
 
@@ -11764,7 +11770,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, newShape);
   }
 
-  swapaxes(arr: IFaceNDArray, axis1: number, axis2: number): IFaceNDArray {
+  override swapaxes(arr: IFaceNDArray, axis1: number, axis2: number): IFaceNDArray {
     const ndim = arr.shape.length;
     axis1 = this._normalizeAxis(axis1, ndim);
     axis2 = this._normalizeAxis(axis2, ndim);
@@ -11782,7 +11788,7 @@ export class WebGPUBackend implements Backend {
     return this._transposeGeneral(arr, perm, newShape);
   }
 
-  moveaxis(
+  override moveaxis(
     arr: IFaceNDArray,
     source: number | number[],
     destination: number | number[]
@@ -11814,7 +11820,7 @@ export class WebGPUBackend implements Backend {
     return this._transposeGeneral(arr, order, newShape);
   }
 
-  squeeze(arr: IFaceNDArray, axis?: number | number[]): IFaceNDArray {
+  override squeeze(arr: IFaceNDArray, axis?: number | number[]): IFaceNDArray {
     if (axis !== undefined) {
       const axes = Array.isArray(axis) ? axis : [axis];
       const normalizedAxes = axes.map(a => this._normalizeAxis(a, arr.shape.length));
@@ -11831,7 +11837,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(arr.data.slice(), newShape.length === 0 ? [1] : newShape);
   }
 
-  expandDims(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  override expandDims(arr: IFaceNDArray, axis: number): IFaceNDArray {
     const ndim = arr.shape.length + 1;
     if (axis < 0) axis += ndim;
     if (axis < 0 || axis >= ndim) {
@@ -11843,7 +11849,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(arr.data.slice(), newShape);
   }
 
-  reshape(arr: IFaceNDArray, shape: number[]): IFaceNDArray {
+  override reshape(arr: IFaceNDArray, shape: number[]): IFaceNDArray {
     let inferIdx = -1;
     let knownSize = 1;
     for (let i = 0; i < shape.length; i++) {
@@ -11868,7 +11874,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(arr.data.slice(), newShape);
   }
 
-  resize(arr: IFaceNDArray, newShape: number[]): IFaceNDArray {
+  override resize(arr: IFaceNDArray, newShape: number[]): IFaceNDArray {
     const newSize = newShape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(newSize);
     const srcLen = arr.data.length;
@@ -11881,11 +11887,11 @@ export class WebGPUBackend implements Backend {
     return this.createArray(data, [...newShape]);
   }
 
-  flatten(arr: IFaceNDArray): IFaceNDArray {
+  override flatten(arr: IFaceNDArray): IFaceNDArray {
     return this.createArray(arr.data.slice(), [arr.data.length]);
   }
 
-  concatenate(arrays: IFaceNDArray[], axis: number | null = 0): IFaceNDArray {
+  override concatenate(arrays: IFaceNDArray[], axis: number | null = 0): IFaceNDArray {
     if (arrays.length === 0) throw new Error('need at least one array to concatenate');
 
     // axis=null: flatten all arrays then concatenate as 1D
@@ -11963,7 +11969,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, outShape);
   }
 
-  stack(arrays: IFaceNDArray[], axis: number = 0): IFaceNDArray {
+  override stack(arrays: IFaceNDArray[], axis: number = 0): IFaceNDArray {
     if (arrays.length === 0) throw new Error('need at least one array to stack');
 
     const shape = arrays[0].shape;
@@ -11982,7 +11988,7 @@ export class WebGPUBackend implements Backend {
     return this.concatenate(expanded, axis);
   }
 
-  split(arr: IFaceNDArray, indices: number | number[], axis: number = 0): IFaceNDArray[] {
+  override split(arr: IFaceNDArray, indices: number | number[], axis: number = 0): IFaceNDArray[] {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
     const axisSize = arr.shape[axis];
@@ -12045,7 +12051,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Conditional ============
 
-  where(
+  override where(
     condition: IFaceNDArray,
     x?: IFaceNDArray,
     y?: IFaceNDArray
@@ -12066,7 +12072,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Advanced Indexing ============
 
-  take(arr: IFaceNDArray, indices: IFaceNDArray | number[], axis?: number): IFaceNDArray {
+  override take(arr: IFaceNDArray, indices: IFaceNDArray | number[], axis?: number): IFaceNDArray {
     const indexArray = Array.isArray(indices) ? indices : Array.from(indices.data);
 
     if (axis === undefined) {
@@ -12114,7 +12120,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, outShape);
   }
 
-  put(arr: IFaceNDArray, ind: number[] | IFaceNDArray, v: number | number[]): void {
+  override put(arr: IFaceNDArray, ind: number[] | IFaceNDArray, v: number | number[]): void {
     const indices = Array.isArray(ind) ? ind : Array.from(ind.data);
     const vals = typeof v === 'number' ? [v] : v;
     for (let i = 0; i < indices.length; i++) {
@@ -12124,7 +12130,7 @@ export class WebGPUBackend implements Backend {
     }
   }
 
-  ix_(...args: IFaceNDArray[]): IFaceNDArray[] {
+  override ix_(...args: IFaceNDArray[]): IFaceNDArray[] {
     const ndim = args.length;
     const result: IFaceNDArray[] = [];
     for (let i = 0; i < ndim; i++) {
@@ -12135,7 +12141,7 @@ export class WebGPUBackend implements Backend {
     return result;
   }
 
-  partition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
+  override partition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = axis < 0 ? axis + ndim : axis;
     if (axis < 0 || axis >= ndim) {
@@ -12221,7 +12227,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, arr.shape);
   }
 
-  argpartition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
+  override argpartition(arr: IFaceNDArray, kth: number, axis: number = -1): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = axis < 0 ? axis + ndim : axis;
     if (axis < 0 || axis >= ndim) {
@@ -12315,7 +12321,7 @@ export class WebGPUBackend implements Backend {
   // lexsort - multi-key sort returning indices
   // Native implementation using comparator chain (last key is primary)
   // For GPU version, use lexsortAsync() which uses iterative GPU argsort
-  lexsort(keys: IFaceNDArray[]): IFaceNDArray {
+  override lexsort(keys: IFaceNDArray[]): IFaceNDArray {
     if (keys.length === 0) {
       return this.createArray(new Float64Array(0), [0]);
     }
@@ -12343,7 +12349,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(new Float64Array(indices), [n]);
   }
 
-  compress(condition: IFaceNDArray, arr: IFaceNDArray, axis?: number): IFaceNDArray {
+  override compress(condition: IFaceNDArray, arr: IFaceNDArray, axis?: number): IFaceNDArray {
     const condFlat = this.flatten(condition).data;
 
     if (axis === undefined) {
@@ -12404,7 +12410,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(result, outShape);
   }
 
-  extract(condition: IFaceNDArray, arr: IFaceNDArray): IFaceNDArray {
+  override extract(condition: IFaceNDArray, arr: IFaceNDArray): IFaceNDArray {
     const condFlat = this.flatten(condition).data;
     const arrFlat = this.flatten(arr).data;
     const result: number[] = [];
@@ -12419,7 +12425,7 @@ export class WebGPUBackend implements Backend {
     return this.createArray(new Float64Array(result), [result.length]);
   }
 
-  place(arr: IFaceNDArray, mask: IFaceNDArray, vals: IFaceNDArray): void {
+  override place(arr: IFaceNDArray, mask: IFaceNDArray, vals: IFaceNDArray): void {
     const maskFlat = this.flatten(mask).data;
     const valsFlat = this.flatten(vals).data;
 
@@ -12432,7 +12438,7 @@ export class WebGPUBackend implements Backend {
     }
   }
 
-  select(
+  override select(
     condlist: IFaceNDArray[],
     choicelist: IFaceNDArray[],
     defaultVal: number = 0
@@ -12469,7 +12475,7 @@ export class WebGPUBackend implements Backend {
 
   // ============ Batched Operations ============
 
-  batchedMatmul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override batchedMatmul(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     if (a.shape.length < 2 || b.shape.length < 2) {
       throw new Error('batchedMatmul requires at least 2D arrays');
     }
@@ -12550,7 +12556,7 @@ export class WebGPUBackend implements Backend {
    * GPU-accelerated einsum that routes common patterns to existing GPU ops
    * and uses a GPU shader for general contractions.
    */
-  async einsum(subscripts: string, ...operands: IFaceNDArray[]): Promise<IFaceNDArray> {
+  override async einsum(subscripts: string, ...operands: IFaceNDArray[]): Promise<IFaceNDArray> {
     const [inputStr, outputStr] = subscripts.split('->').map(s => s.trim());
     const inputSubscripts = inputStr.split(',').map(s => s.trim());
 
@@ -13015,7 +13021,7 @@ ${productCode}
 
   // ============ Differences ============
 
-  diff(
+  override diff(
     arr: IFaceNDArray,
     n: number = 1,
     axis: number = -1,
@@ -13064,7 +13070,7 @@ ${productCode}
     return result;
   }
 
-  private _diffOnce(arr: IFaceNDArray, axis: number): IFaceNDArray {
+  protected override _diffOnce(arr: IFaceNDArray, axis: number): IFaceNDArray {
     const shape = arr.shape;
     if (shape[axis] < 2) {
       throw new Error('diff requires at least 2 elements along axis');
@@ -13104,7 +13110,7 @@ ${productCode}
     return this.createArray(result, newShape);
   }
 
-  gradient(arr: IFaceNDArray, axis: number = -1, edgeOrder: 1 | 2 = 1): IFaceNDArray {
+  override gradient(arr: IFaceNDArray, axis: number = -1, edgeOrder: 1 | 2 = 1): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
     const shape = arr.shape;
@@ -13179,14 +13185,14 @@ ${productCode}
     return this.createArray(result, shape);
   }
 
-  ediff1d(arr: IFaceNDArray): IFaceNDArray {
+  override ediff1d(arr: IFaceNDArray): IFaceNDArray {
     const flat = this.flatten(arr);
     return this.diff(flat, 1, 0);
   }
 
   // ============ Cross Product ============
 
-  cross(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override cross(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const aFlat = this.flatten(a);
     const bFlat = this.flatten(b);
 
@@ -13205,7 +13211,7 @@ ${productCode}
 
   // ============ Statistics ============
 
-  cov(
+  override cov(
     x: IFaceNDArray,
     y?: IFaceNDArray,
     rowvar: boolean = true,
@@ -13284,7 +13290,7 @@ ${productCode}
     }
   }
 
-  corrcoef(x: IFaceNDArray, y?: IFaceNDArray, rowvar: boolean = true): IFaceNDArray {
+  override corrcoef(x: IFaceNDArray, y?: IFaceNDArray, rowvar: boolean = true): IFaceNDArray {
     const covMatrix = this.cov(x, y, rowvar);
     const n = covMatrix.shape[0];
     const result = new Float64Array(n * n);
@@ -13303,7 +13309,7 @@ ${productCode}
 
   // ============ Convolution (GPU) ============
 
-  async convolve(
+  override async convolve(
     a: IFaceNDArray,
     v: IFaceNDArray,
     mode: 'full' | 'same' | 'valid' = 'full'
@@ -13407,7 +13413,7 @@ ${productCode}
     return this.createArray(result, [outLen]);
   }
 
-  async correlate(
+  override async correlate(
     a: IFaceNDArray,
     v: IFaceNDArray,
     mode: 'full' | 'same' | 'valid' = 'valid'
@@ -13428,11 +13434,11 @@ ${productCode}
 
   // ============ Matrix Creation ============
 
-  identity(n: number, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override identity(n: number, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     return this.eye(n, dtype);
   }
 
-  tril(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
+  override tril(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
     if (arr.shape.length !== 2) {
       throw new Error('tril requires 2D array');
     }
@@ -13450,7 +13456,7 @@ ${productCode}
     return this.createArray(result, [rows, cols]);
   }
 
-  triu(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
+  override triu(arr: IFaceNDArray, k: number = 0): IFaceNDArray {
     if (arr.shape.length !== 2) {
       throw new Error('triu requires 2D array');
     }
@@ -13470,7 +13476,7 @@ ${productCode}
 
   // ============ Grid Creation ============
 
-  meshgrid(...args: (IFaceNDArray | 'xy' | 'ij')[]): IFaceNDArray[] {
+  override meshgrid(...args: (IFaceNDArray | 'xy' | 'ij')[]): IFaceNDArray[] {
     // Separate arrays from indexing option
     let indexing: 'xy' | 'ij' = 'xy';
     const arrays: IFaceNDArray[] = [];
@@ -13529,7 +13535,7 @@ ${productCode}
     return result;
   }
 
-  logspace(
+  override logspace(
     start: number,
     stop: number,
     num: number,
@@ -13546,7 +13552,7 @@ ${productCode}
     return dtype ? this.astype(result, dtype) : result;
   }
 
-  geomspace(
+  override geomspace(
     start: number,
     stop: number,
     num: number,
@@ -13578,7 +13584,7 @@ ${productCode}
 
   // ============ Stacking Shortcuts ============
 
-  vstack(arrays: IFaceNDArray[]): IFaceNDArray {
+  override vstack(arrays: IFaceNDArray[]): IFaceNDArray {
     const processed = arrays.map(arr => {
       if (arr.shape.length === 1) {
         return this.reshape(arr, [1, arr.shape[0]]);
@@ -13588,18 +13594,18 @@ ${productCode}
     return this.concatenate(processed, 0);
   }
 
-  rowStack(arrays: IFaceNDArray[]): IFaceNDArray {
+  override rowStack(arrays: IFaceNDArray[]): IFaceNDArray {
     return this.vstack(arrays);
   }
 
-  hstack(arrays: IFaceNDArray[]): IFaceNDArray {
+  override hstack(arrays: IFaceNDArray[]): IFaceNDArray {
     if (arrays[0].shape.length === 1) {
       return this.concatenate(arrays, 0);
     }
     return this.concatenate(arrays, 1);
   }
 
-  dstack(arrays: IFaceNDArray[]): IFaceNDArray {
+  override dstack(arrays: IFaceNDArray[]): IFaceNDArray {
     const processed = arrays.map(arr => {
       if (arr.shape.length === 1) {
         return this.reshape(arr, [1, arr.shape[0], 1]);
@@ -13613,21 +13619,21 @@ ${productCode}
 
   // ============ Split Shortcuts ============
 
-  vsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
+  override vsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
     if (arr.shape.length < 2) {
       throw new Error('vsplit requires array with at least 2 dimensions');
     }
     return this.split(arr, indices, 0);
   }
 
-  hsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
+  override hsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
     if (arr.shape.length === 1) {
       return this.split(arr, indices, 0);
     }
     return this.split(arr, indices, 1);
   }
 
-  dsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
+  override dsplit(arr: IFaceNDArray, indices: number | number[]): IFaceNDArray[] {
     if (arr.shape.length < 3) {
       throw new Error('dsplit requires array with at least 3 dimensions');
     }
@@ -13636,7 +13642,7 @@ ${productCode}
 
   // ============ Array Replication ============
 
-  tile(arr: IFaceNDArray, reps: number | number[]): IFaceNDArray {
+  override tile(arr: IFaceNDArray, reps: number | number[]): IFaceNDArray {
     const repsArray = Array.isArray(reps) ? reps : [reps];
 
     const ndim = Math.max(arr.shape.length, repsArray.length);
@@ -13669,7 +13675,7 @@ ${productCode}
     return this.createArray(result, outShape);
   }
 
-  repeat(arr: IFaceNDArray, repeats: number, axis?: number): IFaceNDArray {
+  override repeat(arr: IFaceNDArray, repeats: number, axis?: number): IFaceNDArray {
     if (axis === undefined) {
       const flat = this.flatten(arr);
       const result = new Float64Array(flat.data.length * repeats);
@@ -13715,7 +13721,7 @@ ${productCode}
 
   // ============ Index Finding ============
 
-  nonzero(arr: IFaceNDArray): IFaceNDArray[] {
+  override nonzero(arr: IFaceNDArray): IFaceNDArray[] {
     const indices: number[][] = Array.from({ length: arr.shape.length }, () => []);
     const strides = this._computeStrides(arr.shape);
 
@@ -13733,7 +13739,7 @@ ${productCode}
     return indices.map(idx => this.createArray(new Float64Array(idx), [idx.length]));
   }
 
-  argwhere(arr: IFaceNDArray): IFaceNDArray {
+  override argwhere(arr: IFaceNDArray): IFaceNDArray {
     const indices = this.nonzero(arr);
     if (indices.length === 0 || indices[0].data.length === 0) {
       return this.createArray(new Float64Array(0), [0, arr.shape.length]);
@@ -13752,7 +13758,7 @@ ${productCode}
     return this.createArray(result, [nNonzero, ndim]);
   }
 
-  flatnonzero(arr: IFaceNDArray): IFaceNDArray {
+  override flatnonzero(arr: IFaceNDArray): IFaceNDArray {
     const indices: number[] = [];
     for (let i = 0; i < arr.data.length; i++) {
       if (arr.data[i] !== 0) {
@@ -13764,7 +13770,12 @@ ${productCode}
 
   // ============ Value Handling ============
 
-  nanToNum(arr: IFaceNDArray, nan: number = 0, posInf?: number, negInf?: number): IFaceNDArray {
+  override nanToNum(
+    arr: IFaceNDArray,
+    nan: number = 0,
+    posInf?: number,
+    negInf?: number
+  ): IFaceNDArray {
     const maxFloat = Number.MAX_VALUE;
     const pInf = posInf ?? maxFloat;
     const nInf = negInf ?? -maxFloat;
@@ -13790,7 +13801,7 @@ ${productCode}
   // For 1D arrays: uses GPU bitonic sort (O(n log^2 n) parallel)
   // For multi-dim with axis: extracts slices, sorts on GPU, writes back
 
-  sort(arr: IFaceNDArray, axis: number = -1, _kind?: SortKind): IFaceNDArray {
+  override sort(arr: IFaceNDArray, axis: number = -1, _kind?: SortKind): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
     const shape = arr.shape;
@@ -13881,7 +13892,7 @@ ${productCode}
 
   // argsort - returns indices that would sort the array
   // Uses native TypeScript argsort implementation
-  argsort(arr: IFaceNDArray, axis: number = -1, _kind?: SortKind): IFaceNDArray {
+  override argsort(arr: IFaceNDArray, axis: number = -1, _kind?: SortKind): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
     const shape = arr.shape;
@@ -13968,7 +13979,7 @@ ${productCode}
 
   // searchsorted - binary search for insertion points
   // Native implementation using parallel binary search pattern
-  searchsorted(
+  override searchsorted(
     arr: IFaceNDArray,
     v: number | IFaceNDArray,
     side: 'left' | 'right' = 'left',
@@ -14017,7 +14028,7 @@ ${productCode}
 
   // unique - returns sorted unique values, with optional return flags for NumPy parity
   // Native implementation using Set + sort
-  unique(
+  override unique(
     arr: IFaceNDArray,
     returnIndex?: boolean,
     returnInverse?: boolean,
@@ -15157,7 +15168,7 @@ ${productCode}
    * Generic axis reduction helper: for each slice along the given axis,
    * gathers values into a flat array and calls the scalar reducer.
    */
-  private _reduceAlongAxis(
+  protected override _reduceAlongAxis(
     arr: IFaceNDArray,
     axis: number,
     reducer: (vals: Float64Array) => number
@@ -15210,7 +15221,7 @@ ${productCode}
     return this.createArray(result, resultShape);
   }
 
-  nansum(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nansum(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         let sum = 0;
@@ -15231,7 +15242,7 @@ ${productCode}
     return sum;
   }
 
-  nanmean(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nanmean(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         let sum = 0,
@@ -15261,7 +15272,7 @@ ${productCode}
     return count > 0 ? sum / count : NaN;
   }
 
-  nanvar(
+  override nanvar(
     arr: IFaceNDArray,
     axis?: number | null,
     ddof: number = 0,
@@ -15307,7 +15318,7 @@ ${productCode}
     return count > ddof ? sumSq / (count - ddof) : NaN;
   }
 
-  nanstd(
+  override nanstd(
     arr: IFaceNDArray,
     axis?: number | null,
     ddof: number = 0,
@@ -15326,7 +15337,7 @@ ${productCode}
     return Math.sqrt(this.nanvar(arr, null, ddof) as number);
   }
 
-  nanmin(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nanmin(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         let min = Infinity;
@@ -15348,7 +15359,7 @@ ${productCode}
     return min === Infinity ? NaN : min;
   }
 
-  nanmax(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nanmax(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         let max = -Infinity;
@@ -15370,7 +15381,7 @@ ${productCode}
     return max === -Infinity ? NaN : max;
   }
 
-  nanargmin(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
+  override nanargmin(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
     if (axis !== undefined) {
       return this._reduceAlongAxis(arr, axis, vals => {
         let minIdx = -1,
@@ -15394,7 +15405,7 @@ ${productCode}
     return minIdx;
   }
 
-  nanargmax(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
+  override nanargmax(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
     if (axis !== undefined) {
       return this._reduceAlongAxis(arr, axis, vals => {
         let maxIdx = -1,
@@ -15418,7 +15429,7 @@ ${productCode}
     return maxIdx;
   }
 
-  nanprod(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nanprod(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         let prod = 1;
@@ -15441,13 +15452,13 @@ ${productCode}
 
   // ============ Order Statistics ============
 
-  private static _medianOfSorted(sorted: number[]): number {
+  protected static override _medianOfSorted(sorted: number[]): number {
     if (sorted.length === 0) return NaN;
     const mid = Math.floor(sorted.length / 2);
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
   }
 
-  private static _quantileOfSorted(
+  protected static override _quantileOfSorted(
     sorted: number[],
     q: number,
     method: 'linear' | 'lower' | 'higher' | 'midpoint' | 'nearest' = 'linear'
@@ -15474,7 +15485,7 @@ ${productCode}
     }
   }
 
-  median(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override median(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         const sorted = Array.from(vals).sort((a, b) => a - b);
@@ -15491,7 +15502,7 @@ ${productCode}
     return WebGPUBackend._medianOfSorted(sorted);
   }
 
-  percentile(
+  override percentile(
     arr: IFaceNDArray,
     q: number,
     axis?: number,
@@ -15502,7 +15513,7 @@ ${productCode}
     return this.quantile(arr, q / 100, axis, keepdims, method);
   }
 
-  quantile(
+  override quantile(
     arr: IFaceNDArray,
     q: number,
     axis?: number,
@@ -15526,7 +15537,7 @@ ${productCode}
     return WebGPUBackend._quantileOfSorted(sorted, q, method);
   }
 
-  nanmedian(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override nanmedian(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis !== undefined) {
       const result = this._reduceAlongAxis(arr, axis, vals => {
         const sorted = Array.from(vals)
@@ -15547,7 +15558,7 @@ ${productCode}
     return WebGPUBackend._medianOfSorted(sorted);
   }
 
-  nanpercentile(
+  override nanpercentile(
     arr: IFaceNDArray,
     q: number,
     axis?: number,
@@ -15577,7 +15588,7 @@ ${productCode}
 
   // ============ Histogram ============
 
-  private _computeOptimalBins(data: AnyTypedArray, strategy: string): number {
+  protected override _computeOptimalBins(data: AnyTypedArray, strategy: string): number {
     const valid: number[] = [];
     for (let i = 0; i < data.length; i++) {
       if (!Number.isNaN(data[i])) valid.push(data[i]);
@@ -15638,7 +15649,7 @@ ${productCode}
     }
   }
 
-  histogram(
+  override histogram(
     arr: IFaceNDArray,
     bins: BinsParam = 10,
     range?: [number, number] | null,
@@ -15753,15 +15764,15 @@ ${productCode}
     };
   }
 
-  histogramBinEdges(arr: IFaceNDArray, bins: BinsParam = 10): IFaceNDArray {
+  override histogramBinEdges(arr: IFaceNDArray, bins: BinsParam = 10): IFaceNDArray {
     const { binEdges } = this.histogram(arr, bins);
     return binEdges;
   }
 
   // ============ Random ============
-  private _rngState: number = Date.now();
+  protected override _rngState: number = Date.now();
 
-  private _xorshift(): number {
+  protected override _xorshift(): number {
     let x = this._rngState;
     x ^= x << 13;
     x ^= x >>> 17;
@@ -15770,12 +15781,12 @@ ${productCode}
     return (this._rngState >>> 0) / 0xffffffff;
   }
 
-  seed(s: number): void {
+  override seed(s: number): void {
     this._rngState = s >>> 0;
     if (this._rngState === 0) this._rngState = 1;
   }
 
-  rand(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override rand(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -15784,7 +15795,7 @@ ${productCode}
     return this.createArray(data, shape, dtype);
   }
 
-  randn(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override randn(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     // Box-Muller transform
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
@@ -15799,7 +15810,12 @@ ${productCode}
     return this.createArray(data, shape, dtype);
   }
 
-  randint(low: number, high: number, shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override randint(
+    low: number,
+    high: number,
+    shape: number[],
+    dtype: DType = DEFAULT_DTYPE
+  ): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     const range = high - low;
@@ -15809,7 +15825,12 @@ ${productCode}
     return this.createArray(data, shape, dtype);
   }
 
-  uniform(low: number, high: number, shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override uniform(
+    low: number,
+    high: number,
+    shape: number[],
+    dtype: DType = DEFAULT_DTYPE
+  ): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     const range = high - low;
@@ -15819,7 +15840,12 @@ ${productCode}
     return this.createArray(data, shape, dtype);
   }
 
-  normal(loc: number, scale: number, shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override normal(
+    loc: number,
+    scale: number,
+    shape: number[],
+    dtype: DType = DEFAULT_DTYPE
+  ): IFaceNDArray {
     const arr = this.randn(shape);
     const data = arr.data;
     const result = new Float64Array(data.length);
@@ -15829,7 +15855,7 @@ ${productCode}
     return this.createArray(result, shape, dtype);
   }
 
-  shuffle(arr: IFaceNDArray): void {
+  override shuffle(arr: IFaceNDArray): void {
     // Fisher-Yates shuffle on first axis, in-place
     const data = arr.data;
     const shape = arr.shape;
@@ -15853,7 +15879,7 @@ ${productCode}
     }
   }
 
-  choice(
+  override choice(
     arr: IFaceNDArray,
     size: number,
     replace: boolean = true,
@@ -15929,7 +15955,7 @@ ${productCode}
     return this.createArray(data, [size]);
   }
 
-  permutation(n: number | IFaceNDArray): IFaceNDArray {
+  override permutation(n: number | IFaceNDArray): IFaceNDArray {
     let arr: IFaceNDArray;
     if (typeof n === 'number') {
       arr = this.arange(0, n, 1);
@@ -15942,33 +15968,33 @@ ${productCode}
 
   // ============ Logic ============
 
-  logicalAnd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override logicalAnd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x !== 0 && y !== 0 ? 1 : 0));
   }
 
-  logicalOr(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override logicalOr(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x !== 0 || y !== 0 ? 1 : 0));
   }
 
-  logicalNot(arr: IFaceNDArray): IFaceNDArray {
+  override logicalNot(arr: IFaceNDArray): IFaceNDArray {
     const len = arr.data.length;
     const data = new Float64Array(len);
     for (let i = 0; i < len; i++) data[i] = arr.data[i] === 0 ? 1 : 0;
     return this.createArray(data, arr.shape);
   }
 
-  logicalXor(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override logicalXor(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => ((x !== 0) !== (y !== 0) ? 1 : 0));
   }
 
-  private _iscloseScalar(x: number, y: number, rtol: number, atol: number): boolean {
+  protected override _iscloseScalar(x: number, y: number, rtol: number, atol: number): boolean {
     if (x === y) return true;
     if (Number.isNaN(x) || Number.isNaN(y)) return false;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
     return Math.abs(x - y) <= atol + rtol * Math.abs(y);
   }
 
-  isclose(
+  override isclose(
     a: IFaceNDArray,
     b: IFaceNDArray,
     rtol: number = 1e-5,
@@ -15982,14 +16008,19 @@ ${productCode}
     return this.createArray(data, a.shape);
   }
 
-  allclose(a: IFaceNDArray, b: IFaceNDArray, rtol: number = 1e-5, atol: number = 1e-8): boolean {
+  override allclose(
+    a: IFaceNDArray,
+    b: IFaceNDArray,
+    rtol: number = 1e-5,
+    atol: number = 1e-8
+  ): boolean {
     for (let i = 0; i < a.data.length; i++) {
       if (!this._iscloseScalar(a.data[i], b.data[i], rtol, atol)) return false;
     }
     return true;
   }
 
-  arrayEqual(a: IFaceNDArray, b: IFaceNDArray, equal_nan?: boolean): boolean {
+  override arrayEqual(a: IFaceNDArray, b: IFaceNDArray, equal_nan?: boolean): boolean {
     if (a.shape.length !== b.shape.length) return false;
     for (let i = 0; i < a.shape.length; i++) {
       if (a.shape[i] !== b.shape[i]) return false;
@@ -16003,45 +16034,45 @@ ${productCode}
 
   // ============ Bitwise ============
 
-  bitwiseAnd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override bitwiseAnd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x | 0) & (y | 0));
   }
 
-  bitwiseOr(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override bitwiseOr(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => x | 0 | (y | 0));
   }
 
-  bitwiseXor(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override bitwiseXor(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x | 0) ^ (y | 0));
   }
 
-  bitwiseNot(arr: IFaceNDArray): IFaceNDArray {
+  override bitwiseNot(arr: IFaceNDArray): IFaceNDArray {
     const len = arr.data.length;
     const data = new Float64Array(len);
     for (let i = 0; i < len; i++) data[i] = ~(arr.data[i] | 0);
     return this.createArray(data, arr.shape);
   }
 
-  leftShift(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override leftShift(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x | 0) << (y | 0));
   }
 
-  rightShift(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override rightShift(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     return this._binaryOp(a, b, (x, y) => (x | 0) >> (y | 0));
   }
 
   // ============ Array Manipulation (Additional) ============
 
-  copy(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
+  override copy(arr: IFaceNDArray, dtype?: DType): IFaceNDArray {
     const dt = dtype ?? arr.dtype ?? 'float64';
     return this.createArray(createTypedArrayFrom(dt, Array.from(arr.data)), [...arr.shape], dt);
   }
 
-  empty(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override empty(shape: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     return this.createArray(new Float64Array(this._shapeSize(shape)), shape, dtype);
   }
 
-  flip(arr: IFaceNDArray, axis?: number): IFaceNDArray {
+  override flip(arr: IFaceNDArray, axis?: number): IFaceNDArray {
     if (axis === undefined) {
       // Reverse all elements
       const data = new Float64Array(arr.data.length);
@@ -16077,17 +16108,21 @@ ${productCode}
     return this.createArray(data, [...shape]);
   }
 
-  fliplr(arr: IFaceNDArray): IFaceNDArray {
+  override fliplr(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length < 2) throw new Error('fliplr requires at least 2D array');
     return this.flip(arr, 1);
   }
 
-  flipud(arr: IFaceNDArray): IFaceNDArray {
+  override flipud(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length < 1) throw new Error('flipud requires at least 1D array');
     return this.flip(arr, 0);
   }
 
-  roll(arr: IFaceNDArray, shift: number | number[], axis?: number | number[]): IFaceNDArray {
+  override roll(
+    arr: IFaceNDArray,
+    shift: number | number[],
+    axis?: number | number[]
+  ): IFaceNDArray {
     if (axis === undefined) {
       // Roll flat — if shift is array, sum the shifts
       const totalShift = Array.isArray(shift) ? shift.reduce((a, b) => a + b, 0) : shift;
@@ -16140,7 +16175,7 @@ ${productCode}
     return result;
   }
 
-  rot90(arr: IFaceNDArray, k: number = 1, axes?: [number, number]): IFaceNDArray {
+  override rot90(arr: IFaceNDArray, k: number = 1, axes?: [number, number]): IFaceNDArray {
     if (arr.shape.length < 2) throw new Error('rot90 requires at least 2D');
     const [ax0, ax1] = axes
       ? [
@@ -16167,11 +16202,11 @@ ${productCode}
     return result;
   }
 
-  ravel(arr: IFaceNDArray): IFaceNDArray {
+  override ravel(arr: IFaceNDArray): IFaceNDArray {
     return this.createArray(new Float64Array(arr.data), [arr.data.length]);
   }
 
-  private _pad1dIndex(i: number, padBefore: number, n: number, mode: string): number {
+  protected override _pad1dIndex(i: number, padBefore: number, n: number, mode: string): number {
     if (mode === 'edge') return i < padBefore ? 0 : n - 1;
     if (mode === 'reflect') {
       return i < padBefore ? padBefore - i : n - 2 - (i - padBefore - n);
@@ -16185,7 +16220,7 @@ ${productCode}
     return -1;
   }
 
-  pad(
+  override pad(
     arr: IFaceNDArray,
     padWidth: number | [number, number],
     mode:
@@ -16347,7 +16382,7 @@ ${productCode}
     throw new Error('pad only supports 1D and 2D arrays');
   }
 
-  columnStack(arrays: IFaceNDArray[]): IFaceNDArray {
+  override columnStack(arrays: IFaceNDArray[]): IFaceNDArray {
     if (arrays.length === 0) throw new Error('columnStack requires at least one array');
     // Treat 1D arrays as column vectors
     const cols: IFaceNDArray[] = arrays.map(a => {
@@ -16359,12 +16394,16 @@ ${productCode}
     return this.concatenate(cols, 1);
   }
 
-  arraySplit(arr: IFaceNDArray, indices: number | number[], axis: number = 0): IFaceNDArray[] {
+  override arraySplit(
+    arr: IFaceNDArray,
+    indices: number | number[],
+    axis: number = 0
+  ): IFaceNDArray[] {
     // Same as split
     return this.split(arr, indices, axis);
   }
 
-  putAlongAxis(
+  override putAlongAxis(
     arr: IFaceNDArray,
     indices: IFaceNDArray,
     values: IFaceNDArray,
@@ -16404,7 +16443,7 @@ ${productCode}
     return this.createArray(data, [...shape]);
   }
 
-  takeAlongAxis(arr: IFaceNDArray, indices: IFaceNDArray, axis: number): IFaceNDArray {
+  override takeAlongAxis(arr: IFaceNDArray, indices: IFaceNDArray, axis: number): IFaceNDArray {
     const shape = arr.shape;
     const ndim = shape.length;
     const ax = axis < 0 ? ndim + axis : axis;
@@ -16449,7 +16488,7 @@ ${productCode}
 
   // ============ Additional Linalg ============
 
-  eig(arr: IFaceNDArray): { values: IFaceNDArray; vectors: IFaceNDArray } {
+  override eig(arr: IFaceNDArray): { values: IFaceNDArray; vectors: IFaceNDArray } {
     // CPU fallback: QR algorithm for eigenvalue decomposition
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('eig requires square 2D matrix');
@@ -16514,17 +16553,17 @@ ${productCode}
     };
   }
 
-  eigh(arr: IFaceNDArray): { values: IFaceNDArray; vectors: IFaceNDArray } {
+  override eigh(arr: IFaceNDArray): { values: IFaceNDArray; vectors: IFaceNDArray } {
     // For symmetric matrices, eig works but is guaranteed real
     return this.eig(arr);
   }
 
-  eigvals(arr: IFaceNDArray): IFaceNDArray {
+  override eigvals(arr: IFaceNDArray): IFaceNDArray {
     const { values } = this.eig(arr);
     return values;
   }
 
-  cholesky(arr: IFaceNDArray): IFaceNDArray {
+  override cholesky(arr: IFaceNDArray): IFaceNDArray {
     if (arr.shape.length !== 2 || arr.shape[0] !== arr.shape[1]) {
       throw new Error('cholesky requires square 2D matrix');
     }
@@ -16586,7 +16625,7 @@ ${productCode}
     return result;
   }
 
-  lstsq(
+  override lstsq(
     a: IFaceNDArray,
     b: IFaceNDArray,
     rcond?: number | null
@@ -16689,7 +16728,7 @@ ${productCode}
     };
   }
 
-  pinv(arr: IFaceNDArray): IFaceNDArray {
+  override pinv(arr: IFaceNDArray): IFaceNDArray {
     // Moore-Penrose pseudoinverse via SVD: A+ = V * S+ * U^T
     const { u, s, vt } = this.svd(arr, false);
     const [m, n] = arr.shape;
@@ -16718,7 +16757,7 @@ ${productCode}
     return this.matmul(vScaledArr, ut);
   }
 
-  matrixRank(arr: IFaceNDArray, tol?: number): number {
+  override matrixRank(arr: IFaceNDArray, tol?: number): number {
     const { s } = this.svd(arr);
     const maxSV = s.data.length > 0 ? s.data[0] : 0;
     const threshold = tol !== undefined ? tol : 1e-10 * Math.max(...arr.shape) * maxSV;
@@ -16729,7 +16768,11 @@ ${productCode}
     return rank;
   }
 
-  tensordot(a: IFaceNDArray, b: IFaceNDArray, axes?: number | [number[], number[]]): IFaceNDArray {
+  override tensordot(
+    a: IFaceNDArray,
+    b: IFaceNDArray,
+    axes?: number | [number[], number[]]
+  ): IFaceNDArray {
     if (axes === undefined) axes = 2;
 
     let aAxes: number[];
@@ -16821,7 +16864,7 @@ ${productCode}
     return this.createArray(data, outShape);
   }
 
-  vdot(a: IFaceNDArray, b: IFaceNDArray): number {
+  override vdot(a: IFaceNDArray, b: IFaceNDArray): number {
     let sum = 0;
     const n = Math.min(a.data.length, b.data.length);
     for (let i = 0; i < n; i++) sum += a.data[i] * b.data[i];
@@ -16885,7 +16928,7 @@ ${productCode}
     return p;
   }
 
-  fft(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override fft(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
     const n = this._nextPow2(arr.data.length);
     const re = new Float64Array(n);
     const im = new Float64Array(n);
@@ -16897,7 +16940,10 @@ ${productCode}
     };
   }
 
-  ifft(real: IFaceNDArray, imag: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override ifft(
+    real: IFaceNDArray,
+    imag: IFaceNDArray
+  ): { real: IFaceNDArray; imag: IFaceNDArray } {
     const n = real.data.length;
     const re = new Float64Array(real.data);
     const im = new Float64Array(imag.data);
@@ -16908,7 +16954,7 @@ ${productCode}
     };
   }
 
-  fft2(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override fft2(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
     if (arr.shape.length !== 2) throw new Error('fft2 requires 2D array');
     const [rows, cols] = arr.shape;
     const nCols = this._nextPow2(cols);
@@ -16949,7 +16995,10 @@ ${productCode}
     };
   }
 
-  ifft2(real: IFaceNDArray, imag: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override ifft2(
+    real: IFaceNDArray,
+    imag: IFaceNDArray
+  ): { real: IFaceNDArray; imag: IFaceNDArray } {
     if (real.shape.length !== 2) throw new Error('ifft2 requires 2D arrays');
     const [rows, cols] = real.shape;
 
@@ -16992,7 +17041,7 @@ ${productCode}
     };
   }
 
-  rfft(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override rfft(arr: IFaceNDArray): { real: IFaceNDArray; imag: IFaceNDArray } {
     const { real, imag } = this.fft(arr);
     // rfft returns only the positive frequencies (n/2 + 1)
     const outLen = Math.floor(real.data.length / 2) + 1;
@@ -17002,7 +17051,7 @@ ${productCode}
     };
   }
 
-  irfft(real: IFaceNDArray, imag: IFaceNDArray, n?: number): IFaceNDArray {
+  override irfft(real: IFaceNDArray, imag: IFaceNDArray, n?: number): IFaceNDArray {
     const outLen = n || (real.data.length - 1) * 2;
     const nFull = this._nextPow2(outLen);
 
@@ -17023,7 +17072,7 @@ ${productCode}
     return this.createArray(new Float64Array(re.buffer, 0, outLen), [outLen]);
   }
 
-  fftfreq(n: number, d: number = 1.0): IFaceNDArray {
+  override fftfreq(n: number, d: number = 1.0): IFaceNDArray {
     const data = new Float64Array(n);
     const val = 1.0 / (n * d);
     for (let i = 0; i < Math.floor((n + 1) / 2); i++) data[i] = i * val;
@@ -17031,7 +17080,7 @@ ${productCode}
     return this.createArray(data, [n]);
   }
 
-  rfftfreq(n: number, d: number = 1.0): IFaceNDArray {
+  override rfftfreq(n: number, d: number = 1.0): IFaceNDArray {
     const outLen = Math.floor(n / 2) + 1;
     const data = new Float64Array(outLen);
     const val = 1.0 / (n * d);
@@ -17039,7 +17088,7 @@ ${productCode}
     return this.createArray(data, [outLen]);
   }
 
-  fftshift(arr: IFaceNDArray): IFaceNDArray {
+  override fftshift(arr: IFaceNDArray): IFaceNDArray {
     const n = arr.data.length;
     const shift = Math.floor(n / 2);
     const data = new Float64Array(n);
@@ -17047,7 +17096,7 @@ ${productCode}
     return this.createArray(data, [...arr.shape]);
   }
 
-  ifftshift(arr: IFaceNDArray): IFaceNDArray {
+  override ifftshift(arr: IFaceNDArray): IFaceNDArray {
     const n = arr.data.length;
     const shift = Math.ceil(n / 2);
     const data = new Float64Array(n);
@@ -17086,7 +17135,7 @@ ${productCode}
     }
   }
 
-  exponential(scale: number, shape: number[]): IFaceNDArray {
+  override exponential(scale: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17095,7 +17144,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  poisson(lam: number, shape: number[]): IFaceNDArray {
+  override poisson(lam: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     // Knuth's algorithm
@@ -17112,7 +17161,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  binomial(n: number, p: number, shape: number[]): IFaceNDArray {
+  override binomial(n: number, p: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17125,7 +17174,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  beta(a: number, b: number, shape: number[]): IFaceNDArray {
+  override beta(a: number, b: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((x, y) => x * y, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17136,7 +17185,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  gamma(shape_param: number, scale: number, sizeArr: number[]): IFaceNDArray {
+  override gamma(shape_param: number, scale: number, sizeArr: number[]): IFaceNDArray {
     const size = sizeArr.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17145,7 +17194,7 @@ ${productCode}
     return this.createArray(data, sizeArr);
   }
 
-  lognormal(mean: number, sigma: number, shape: number[]): IFaceNDArray {
+  override lognormal(mean: number, sigma: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17154,12 +17203,12 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  chisquare(df: number, shape: number[]): IFaceNDArray {
+  override chisquare(df: number, shape: number[]): IFaceNDArray {
     // Chi-squared is Gamma(df/2, 2)
     return this.gamma(df / 2, 2, shape);
   }
 
-  standardT(df: number, shape: number[]): IFaceNDArray {
+  override standardT(df: number, shape: number[]): IFaceNDArray {
     // t = Z / sqrt(V/df) where Z ~ N(0,1), V ~ chi-squared(df)
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
@@ -17171,7 +17220,11 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  multivariateNormal(mean: IFaceNDArray, cov: IFaceNDArray, size: number = 1): IFaceNDArray {
+  override multivariateNormal(
+    mean: IFaceNDArray,
+    cov: IFaceNDArray,
+    size: number = 1
+  ): IFaceNDArray {
     const n = mean.data.length;
     // Cholesky decomposition of covariance
     const L = this.cholesky(cov);
@@ -17195,7 +17248,7 @@ ${productCode}
     return this.createArray(data, size === 1 ? [n] : [size, n]);
   }
 
-  geometric(p: number, shape: number[]): IFaceNDArray {
+  override geometric(p: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17204,7 +17257,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  weibull(a: number, shape: number[]): IFaceNDArray {
+  override weibull(a: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((x, y) => x * y, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17213,11 +17266,11 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  standardNormal(shape: number[]): IFaceNDArray {
+  override standardNormal(shape: number[]): IFaceNDArray {
     return this.randn(shape);
   }
 
-  standardCauchy(shape: number[]): IFaceNDArray {
+  override standardCauchy(shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17226,7 +17279,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  multinomial(n: number, pvals: number[], size: number = 1): IFaceNDArray {
+  override multinomial(n: number, pvals: number[], size: number = 1): IFaceNDArray {
     const k = pvals.length;
     const data = new Float64Array(size * k);
     for (let s = 0; s < size; s++) {
@@ -17247,7 +17300,7 @@ ${productCode}
     return this.createArray(data, size === 1 ? [k] : [size, k]);
   }
 
-  dirichlet(alpha: number[], size: number = 1): IFaceNDArray {
+  override dirichlet(alpha: number[], size: number = 1): IFaceNDArray {
     const k = alpha.length;
     const data = new Float64Array(size * k);
     for (let s = 0; s < size; s++) {
@@ -17264,11 +17317,11 @@ ${productCode}
     return this.createArray(data, size === 1 ? [k] : [size, k]);
   }
 
-  random(shape: number[]): IFaceNDArray {
+  override random(shape: number[]): IFaceNDArray {
     return this.rand(shape);
   }
 
-  f(dfnum: number, dfden: number, shape: number[]): IFaceNDArray {
+  override f(dfnum: number, dfden: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17279,7 +17332,12 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  hypergeometric(ngood: number, nbad: number, nsample: number, shape: number[]): IFaceNDArray {
+  override hypergeometric(
+    ngood: number,
+    nbad: number,
+    nsample: number,
+    shape: number[]
+  ): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17300,7 +17358,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  negativeBinomial(n: number, p: number, shape: number[]): IFaceNDArray {
+  override negativeBinomial(n: number, p: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17317,7 +17375,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  pareto(a: number, shape: number[]): IFaceNDArray {
+  override pareto(a: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((acc, x) => acc * x, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17326,7 +17384,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  rayleigh(scale: number, shape: number[]): IFaceNDArray {
+  override rayleigh(scale: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17335,7 +17393,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  triangular(left: number, mode: number, right: number, shape: number[]): IFaceNDArray {
+  override triangular(left: number, mode: number, right: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     const fc = (mode - left) / (right - left);
@@ -17350,7 +17408,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  vonmises(mu: number, kappa: number, shape: number[]): IFaceNDArray {
+  override vonmises(mu: number, kappa: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     const tau = 1 + Math.sqrt(1 + 4 * kappa * kappa);
@@ -17372,7 +17430,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  wald(mean: number, scale: number, shape: number[]): IFaceNDArray {
+  override wald(mean: number, scale: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((a, b) => a * b, 1);
     const data = new Float64Array(size);
     for (let i = 0; i < size; i++) {
@@ -17388,7 +17446,7 @@ ${productCode}
     return this.createArray(data, shape);
   }
 
-  zipf(a: number, shape: number[]): IFaceNDArray {
+  override zipf(a: number, shape: number[]): IFaceNDArray {
     const size = shape.reduce((acc, x) => acc * x, 1);
     const data = new Float64Array(size);
     const am1 = a - 1;
@@ -17410,7 +17468,7 @@ ${productCode}
 
   // ============ Additional Stats ============
 
-  average(
+  override average(
     arr: IFaceNDArray,
     weights?: IFaceNDArray,
     axis?: number,
@@ -17443,7 +17501,7 @@ ${productCode}
     return sum / wSum;
   }
 
-  ptp(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+  override ptp(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
     if (axis === undefined) {
       return (this.max(arr) as number) - (this.min(arr) as number);
     }
@@ -17459,7 +17517,7 @@ ${productCode}
     return result;
   }
 
-  digitize(x: IFaceNDArray, bins: IFaceNDArray, right: boolean = false): IFaceNDArray {
+  override digitize(x: IFaceNDArray, bins: IFaceNDArray, right: boolean = false): IFaceNDArray {
     const data = new Float64Array(x.data.length);
     for (let i = 0; i < x.data.length; i++) {
       let idx = 0;
@@ -17473,7 +17531,7 @@ ${productCode}
     return this.createArray(data, [...x.shape]);
   }
 
-  nanquantile(
+  override nanquantile(
     arr: IFaceNDArray,
     q: number,
     axis?: number,
@@ -17500,7 +17558,7 @@ ${productCode}
     return WebGPUBackend._quantileOfSorted(sorted, q, method);
   }
 
-  nancumsum(arr: IFaceNDArray, axis?: number): IFaceNDArray {
+  override nancumsum(arr: IFaceNDArray, axis?: number): IFaceNDArray {
     if (axis !== undefined) {
       const cleaned = this.nanToNum(arr, 0, 0, 0);
       return this.cumsum(cleaned, axis);
@@ -17514,7 +17572,7 @@ ${productCode}
     return this.createArray(data, [...arr.shape]);
   }
 
-  nancumprod(arr: IFaceNDArray, axis?: number): IFaceNDArray {
+  override nancumprod(arr: IFaceNDArray, axis?: number): IFaceNDArray {
     if (axis !== undefined) {
       const cleaned = this.nanToNum(arr, 1, 1, 1);
       return this.cumprod(cleaned, axis);
@@ -17528,7 +17586,7 @@ ${productCode}
     return this.createArray(data, [...arr.shape]);
   }
 
-  uniqueCounts(arr: IFaceNDArray): { values: IFaceNDArray; counts: IFaceNDArray } {
+  override uniqueCounts(arr: IFaceNDArray): { values: IFaceNDArray; counts: IFaceNDArray } {
     const map = new Map<number, number>();
     for (let i = 0; i < arr.data.length; i++) {
       map.set(arr.data[i], (map.get(arr.data[i]) || 0) + 1);
@@ -17542,7 +17600,7 @@ ${productCode}
     };
   }
 
-  uniqueInverse(arr: IFaceNDArray): { values: IFaceNDArray; inverse: IFaceNDArray } {
+  override uniqueInverse(arr: IFaceNDArray): { values: IFaceNDArray; inverse: IFaceNDArray } {
     const sorted = Array.from(new Set(arr.data)).sort((a, b) => a - b);
     const indexMap = new Map<number, number>();
     sorted.forEach((v, i) => indexMap.set(v, i));
@@ -17556,7 +17614,7 @@ ${productCode}
     };
   }
 
-  histogram2d(
+  override histogram2d(
     x: IFaceNDArray,
     y: IFaceNDArray,
     bins: number = 10,
@@ -17630,13 +17688,13 @@ ${productCode}
 
   // ============ Additional Comparison ============
 
-  rint(arr: IFaceNDArray): IFaceNDArray {
+  override rint(arr: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(arr.data.length);
     for (let i = 0; i < arr.data.length; i++) data[i] = bankersRound(arr.data[i]);
     return this.createArray(data, [...arr.shape]);
   }
 
-  around(arr: IFaceNDArray, decimals: number = 0): IFaceNDArray {
+  override around(arr: IFaceNDArray, decimals: number = 0): IFaceNDArray {
     const factor = Math.pow(10, decimals);
     const data = new Float64Array(arr.data.length);
     for (let i = 0; i < arr.data.length; i++) {
@@ -17647,7 +17705,7 @@ ${productCode}
 
   // ============ Additional Polynomial ============
 
-  polyder(p: IFaceNDArray, m: number = 1): IFaceNDArray {
+  override polyder(p: IFaceNDArray, m: number = 1): IFaceNDArray {
     let coeffs = Array.from(p.data);
     for (let iter = 0; iter < m; iter++) {
       const n = coeffs.length;
@@ -17661,7 +17719,7 @@ ${productCode}
     return this.createArray(new Float64Array(coeffs), [coeffs.length]);
   }
 
-  polyint(p: IFaceNDArray, m: number = 1, k: number = 0): IFaceNDArray {
+  override polyint(p: IFaceNDArray, m: number = 1, k: number = 0): IFaceNDArray {
     let coeffs = Array.from(p.data);
     for (let iter = 0; iter < m; iter++) {
       const n = coeffs.length;
@@ -17675,7 +17733,7 @@ ${productCode}
     return this.createArray(new Float64Array(coeffs), [coeffs.length]);
   }
 
-  polydiv(u: IFaceNDArray, v: IFaceNDArray): { q: IFaceNDArray; r: IFaceNDArray } {
+  override polydiv(u: IFaceNDArray, v: IFaceNDArray): { q: IFaceNDArray; r: IFaceNDArray } {
     const num = Array.from(u.data);
     const den = Array.from(v.data);
     const lenDiff = num.length - den.length;
@@ -17706,7 +17764,7 @@ ${productCode}
     };
   }
 
-  polysub(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
+  override polysub(a: IFaceNDArray, b: IFaceNDArray): IFaceNDArray {
     const maxLen = Math.max(a.data.length, b.data.length);
     const result = new Float64Array(maxLen);
     const aOffset = maxLen - a.data.length;
@@ -17718,7 +17776,7 @@ ${productCode}
 
   // ============ Integration ============
 
-  trapezoid(y: IFaceNDArray, x?: IFaceNDArray, dx: number = 1): number {
+  override trapezoid(y: IFaceNDArray, x?: IFaceNDArray, dx: number = 1): number {
     const n = y.data.length;
     if (n < 2) return 0;
     let sum = 0;
@@ -17734,13 +17792,13 @@ ${productCode}
     return sum;
   }
 
-  trapz(y: IFaceNDArray, x?: IFaceNDArray, dx?: number): number {
+  override trapz(y: IFaceNDArray, x?: IFaceNDArray, dx?: number): number {
     return this.trapezoid(y, x, dx);
   }
 
   // ============ Index Utilities ============
 
-  unravelIndex(indices: IFaceNDArray | number, shape: number[]): IFaceNDArray[] {
+  override unravelIndex(indices: IFaceNDArray | number, shape: number[]): IFaceNDArray[] {
     const flatIndices = typeof indices === 'number' ? [indices] : Array.from(indices.data);
     const ndim = shape.length;
     const result: number[][] = Array.from({ length: ndim }, () => []);
@@ -17754,7 +17812,7 @@ ${productCode}
     return result.map(coords => this.createArray(new Float64Array(coords), [coords.length]));
   }
 
-  ravelMultiIndex(multiIndex: IFaceNDArray[], shape: number[]): IFaceNDArray {
+  override ravelMultiIndex(multiIndex: IFaceNDArray[], shape: number[]): IFaceNDArray {
     const n = multiIndex[0].data.length;
     const result = new Float64Array(n);
     for (let i = 0; i < n; i++) {
@@ -17771,7 +17829,7 @@ ${productCode}
 
   // ============ Integer Math ============
 
-  gcd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override gcd(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const gcdFn = (x: number, y: number): number => {
       x = Math.abs(Math.round(x));
       y = Math.abs(Math.round(y));
@@ -17785,7 +17843,7 @@ ${productCode}
     return this._binaryOp(a, b, gcdFn);
   }
 
-  lcm(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
+  override lcm(a: ArrayOrScalar, b: ArrayOrScalar): IFaceNDArray {
     const gcdFn = (x: number, y: number): number => {
       x = Math.abs(Math.round(x));
       y = Math.abs(Math.round(y));
@@ -17806,7 +17864,7 @@ ${productCode}
 
   // ============ Matrix Utilities ============
 
-  tri(n: number, m?: number, k: number = 0, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
+  override tri(n: number, m?: number, k: number = 0, dtype: DType = DEFAULT_DTYPE): IFaceNDArray {
     const cols = m ?? n;
     const data = new Float64Array(n * cols);
     for (let i = 0; i < n; i++) {
@@ -17817,12 +17875,12 @@ ${productCode}
     return this.createArray(data, [n, cols], dtype);
   }
 
-  diagflat(v: IFaceNDArray, k: number = 0): IFaceNDArray {
+  override diagflat(v: IFaceNDArray, k: number = 0): IFaceNDArray {
     const flat = this.flatten(v);
     return this.diag(flat, k);
   }
 
-  block(arrays: (IFaceNDArray | IFaceNDArray[])[]): IFaceNDArray {
+  override block(arrays: (IFaceNDArray | IFaceNDArray[])[]): IFaceNDArray {
     // Each element is a row of blocks; assemble by hstacking each row, then vstacking rows
     const rows: IFaceNDArray[] = [];
     for (const row of arrays) {
@@ -17839,7 +17897,7 @@ ${productCode}
     return this.vstack(rows);
   }
 
-  fillDiagonal(arr: IFaceNDArray, val: number, wrap: boolean = false): IFaceNDArray {
+  override fillDiagonal(arr: IFaceNDArray, val: number, wrap: boolean = false): IFaceNDArray {
     if (arr.shape.length < 2) {
       throw new Error('fillDiagonal requires at least a 2-d array');
     }
@@ -17866,7 +17924,7 @@ ${productCode}
 
   // ============ Index Arrays ============
 
-  indices(dimensions: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray[] {
+  override indices(dimensions: number[], dtype: DType = DEFAULT_DTYPE): IFaceNDArray[] {
     const totalSize = dimensions.reduce((a, b) => a * b, 1);
     const result: IFaceNDArray[] = [];
     for (let dim = 0; dim < dimensions.length; dim++) {
@@ -17897,7 +17955,7 @@ ${productCode}
     return result;
   }
 
-  diagIndices(n: number, ndim: number = 2): IFaceNDArray[] {
+  override diagIndices(n: number, ndim: number = 2): IFaceNDArray[] {
     const idx = new Float64Array(n);
     for (let i = 0; i < n; i++) idx[i] = i;
     const result: IFaceNDArray[] = [];
@@ -17907,7 +17965,7 @@ ${productCode}
     return result;
   }
 
-  trilIndices(n: number, k: number = 0, m?: number): [IFaceNDArray, IFaceNDArray] {
+  override trilIndices(n: number, k: number = 0, m?: number): [IFaceNDArray, IFaceNDArray] {
     const cols = m ?? n;
     const rowIdx: number[] = [];
     const colIdx: number[] = [];
@@ -17925,7 +17983,7 @@ ${productCode}
     ];
   }
 
-  triuIndices(n: number, k: number = 0, m?: number): [IFaceNDArray, IFaceNDArray] {
+  override triuIndices(n: number, k: number = 0, m?: number): [IFaceNDArray, IFaceNDArray] {
     const cols = m ?? n;
     const rowIdx: number[] = [];
     const colIdx: number[] = [];
@@ -17945,7 +18003,7 @@ ${productCode}
 
   // ============ Window Functions ============
 
-  bartlett(M: number): IFaceNDArray {
+  override bartlett(M: number): IFaceNDArray {
     if (M <= 1) return this.createArray(new Float64Array(M === 1 ? [1] : []), [M]);
     const data = new Float64Array(M);
     for (let i = 0; i < M; i++) {
@@ -17954,7 +18012,7 @@ ${productCode}
     return this.createArray(data, [M]);
   }
 
-  blackman(M: number): IFaceNDArray {
+  override blackman(M: number): IFaceNDArray {
     if (M <= 1) return this.createArray(new Float64Array(M === 1 ? [1] : []), [M]);
     const data = new Float64Array(M);
     for (let i = 0; i < M; i++) {
@@ -17966,7 +18024,7 @@ ${productCode}
     return this.createArray(data, [M]);
   }
 
-  hamming(M: number): IFaceNDArray {
+  override hamming(M: number): IFaceNDArray {
     if (M <= 1) return this.createArray(new Float64Array(M === 1 ? [1] : []), [M]);
     const data = new Float64Array(M);
     for (let i = 0; i < M; i++) {
@@ -17975,7 +18033,7 @@ ${productCode}
     return this.createArray(data, [M]);
   }
 
-  hanning(M: number): IFaceNDArray {
+  override hanning(M: number): IFaceNDArray {
     if (M <= 1) return this.createArray(new Float64Array(M === 1 ? [1] : []), [M]);
     const data = new Float64Array(M);
     for (let i = 0; i < M; i++) {
@@ -17984,7 +18042,7 @@ ${productCode}
     return this.createArray(data, [M]);
   }
 
-  kaiser(M: number, beta: number): IFaceNDArray {
+  override kaiser(M: number, beta: number): IFaceNDArray {
     if (M <= 1) return this.createArray(new Float64Array(M === 1 ? [1] : []), [M]);
     // Approximate I0 (modified Bessel function of first kind, order 0)
     const bessel_i0 = (x: number): number => {
@@ -18009,7 +18067,11 @@ ${productCode}
 
   // ============ Bit Manipulation ============
 
-  packbits(arr: IFaceNDArray, axis?: number, bitorder: 'big' | 'little' = 'big'): IFaceNDArray {
+  override packbits(
+    arr: IFaceNDArray,
+    axis?: number,
+    bitorder: 'big' | 'little' = 'big'
+  ): IFaceNDArray {
     // Flatten and pack along last axis by default
     const flat = axis === undefined ? Array.from(this.flatten(arr).data) : Array.from(arr.data);
     const nBytes = Math.ceil(flat.length / 8);
@@ -18031,7 +18093,7 @@ ${productCode}
     return this.createArray(result, [nBytes]);
   }
 
-  unpackbits(
+  override unpackbits(
     arr: IFaceNDArray,
     axis?: number,
     count?: number,
@@ -18057,14 +18119,14 @@ ${productCode}
 
   // ============ Additional Linalg ============
 
-  eigvalsh(arr: IFaceNDArray): IFaceNDArray {
+  override eigvalsh(arr: IFaceNDArray): IFaceNDArray {
     const { values } = this.eigh(arr);
     return values;
   }
 
   // ============ N-dimensional FFT ============
 
-  fftn(arr: IFaceNDArray, shape?: number[]): { real: IFaceNDArray; imag: IFaceNDArray } {
+  override fftn(arr: IFaceNDArray, shape?: number[]): { real: IFaceNDArray; imag: IFaceNDArray } {
     const ndim = arr.shape.length;
     if (ndim === 1) return this.fft(arr);
     if (ndim === 2) return this.fft2(arr);
@@ -18113,7 +18175,7 @@ ${productCode}
     };
   }
 
-  ifftn(
+  override ifftn(
     real: IFaceNDArray,
     imag: IFaceNDArray,
     shape?: number[]
@@ -18164,7 +18226,7 @@ ${productCode}
 
   // ============ Convenience Aliases ============
 
-  product(
+  override product(
     arr: IFaceNDArray,
     axis?: number,
     keepdims?: boolean,
@@ -18173,31 +18235,31 @@ ${productCode}
     return this.prod(arr, axis, keepdims, dtype);
   }
 
-  sometrue(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+  override sometrue(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
     return this.any(arr, axis, keepdims);
   }
 
-  alltrue(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+  override alltrue(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
     return this.all(arr, axis, keepdims);
   }
 
-  cumproduct(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
+  override cumproduct(arr: IFaceNDArray, axis?: number, dtype?: DType): IFaceNDArray {
     return this.cumprod(arr, axis, dtype);
   }
 
-  ndim(arr: IFaceNDArray): number {
+  override ndim(arr: IFaceNDArray): number {
     return arr.shape.length;
   }
 
-  shape(arr: IFaceNDArray): number[] {
+  override shape(arr: IFaceNDArray): number[] {
     return arr.shape;
   }
 
-  size(arr: IFaceNDArray): number {
+  override size(arr: IFaceNDArray): number {
     return arr.data.length;
   }
 
-  result_type(...args: (IFaceNDArray | DType)[]): DType {
+  override result_type(...args: (IFaceNDArray | DType)[]): DType {
     if (args.length === 0) return 'float64';
     let result: DType =
       typeof args[0] === 'string' ? (args[0] as DType) : (args[0] as IFaceNDArray).dtype;
@@ -18211,7 +18273,7 @@ ${productCode}
 
   // ============ Comparison Helpers ============
 
-  array_equiv(a: IFaceNDArray, b: IFaceNDArray): boolean {
+  override array_equiv(a: IFaceNDArray, b: IFaceNDArray): boolean {
     const shapesA = a.shape;
     const shapesB = b.shape;
     const maxDims = Math.max(shapesA.length, shapesB.length);
@@ -18227,7 +18289,7 @@ ${productCode}
     return true;
   }
 
-  isneginf(x: IFaceNDArray): IFaceNDArray {
+  override isneginf(x: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(x.data.length);
     for (let i = 0; i < x.data.length; i++) {
       data[i] = x.data[i] === -Infinity ? 1 : 0;
@@ -18235,7 +18297,7 @@ ${productCode}
     return this.createArray(data, x.shape);
   }
 
-  isposinf(x: IFaceNDArray): IFaceNDArray {
+  override isposinf(x: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(x.data.length);
     for (let i = 0; i < x.data.length; i++) {
       data[i] = x.data[i] === Infinity ? 1 : 0;
@@ -18243,19 +18305,19 @@ ${productCode}
     return this.createArray(data, x.shape);
   }
 
-  isreal(x: IFaceNDArray): IFaceNDArray {
+  override isreal(x: IFaceNDArray): IFaceNDArray {
     const data = new Float64Array(x.data.length);
     data.fill(1);
     return this.createArray(data, x.shape);
   }
 
-  isscalar(num: any): boolean {
+  override isscalar(num: any): boolean {
     return typeof num === 'number';
   }
 
   // ============ Array Construction/Manipulation ============
 
-  vander(x: IFaceNDArray, N?: number, increasing: boolean = false): IFaceNDArray {
+  override vander(x: IFaceNDArray, N?: number, increasing: boolean = false): IFaceNDArray {
     const n = x.data.length;
     const cols = N !== undefined ? N : n;
     const result = new Float64Array(n * cols);
@@ -18269,7 +18331,7 @@ ${productCode}
     return this.createArray(result, [n, cols]);
   }
 
-  apply_along_axis(
+  override apply_along_axis(
     func: (arr: IFaceNDArray) => IFaceNDArray | number,
     axis: number,
     arr: IFaceNDArray
@@ -18340,7 +18402,7 @@ ${productCode}
     return this.createArray(allResults, outShape.length > 0 ? outShape : [outerSize]);
   }
 
-  choose(
+  override choose(
     indices: IFaceNDArray,
     choices: IFaceNDArray[],
     mode: 'raise' | 'wrap' | 'clip' = 'raise'
@@ -18364,11 +18426,11 @@ ${productCode}
     return this.createArray(result, [...indices.shape]);
   }
 
-  msort(arr: IFaceNDArray): IFaceNDArray {
+  override msort(arr: IFaceNDArray): IFaceNDArray {
     return this.sort(arr, 0);
   }
 
-  piecewise(
+  override piecewise(
     x: IFaceNDArray,
     condlist: IFaceNDArray[],
     funclist: ((x: number) => number)[],
@@ -18395,7 +18457,9 @@ ${productCode}
     return this.createArray(result, [...x.shape]);
   }
 
-  vectorize(func: (...args: number[]) => number): (...args: IFaceNDArray[]) => IFaceNDArray {
+  override vectorize(
+    func: (...args: number[]) => number
+  ): (...args: IFaceNDArray[]) => IFaceNDArray {
     return (...args: IFaceNDArray[]): IFaceNDArray => {
       if (args.length === 0) throw new Error('vectorize requires at least one argument');
       const broadcasted = this.broadcastArrays(...args);
@@ -18410,7 +18474,7 @@ ${productCode}
     };
   }
 
-  nextafter(x: IFaceNDArray, y: IFaceNDArray): IFaceNDArray {
+  override nextafter(x: IFaceNDArray, y: IFaceNDArray): IFaceNDArray {
     const [bx, by] = this.broadcastArrays(x, y);
     const size = bx.data.length;
     const result = new Float64Array(size);
@@ -18466,7 +18530,10 @@ ${productCode}
     return this.createArray(result, [...bx.shape]);
   }
 
-  array2string(arr: IFaceNDArray, options?: { separator?: string; precision?: number }): string {
+  override array2string(
+    arr: IFaceNDArray,
+    options?: { separator?: string; precision?: number }
+  ): string {
     const sep = options?.separator ?? ', ';
     const prec = options?.precision;
 
