@@ -1692,30 +1692,62 @@ export class JsBackend implements Backend {
 
   // ============ Stats ============
 
-  sum(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.sumAxis(arr, axis);
+  sum(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.sumAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     const d = arr.data;
     let s = 0;
     for (let i = 0; i < d.length; i++) s += d[i];
     return s;
   }
 
-  prod(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.prodAxis(arr, axis);
+  prod(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.prodAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     const d = arr.data;
     let p = 1;
     for (let i = 0; i < d.length; i++) p *= d[i];
     return p;
   }
 
-  mean(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.meanAxis(arr, axis);
+  mean(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.meanAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) return NaN;
     return (this.sum(arr) as number) / arr.data.length;
   }
 
-  var(arr: NDArray, axis?: number | null, ddof: number = 0): number | NDArray {
-    if (axis !== undefined && axis !== null) return this.varAxis(arr, axis, ddof);
+  var(arr: NDArray, axis?: number | null, ddof: number = 0, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined && axis !== null) {
+      const result = this.varAxis(arr, axis, ddof);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) return NaN;
     const m = this.mean(arr) as number;
     const d = arr.data;
@@ -1724,25 +1756,57 @@ export class JsBackend implements Backend {
     return sumSq / (d.length - ddof);
   }
 
-  std(arr: NDArray, axis?: number | null, ddof: number = 0): number | NDArray {
-    if (axis !== undefined && axis !== null) return this.stdAxis(arr, axis, ddof);
+  std(arr: NDArray, axis?: number | null, ddof: number = 0, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined && axis !== null) {
+      const result = this.stdAxis(arr, axis, ddof);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     return Math.sqrt(this.var(arr, null, ddof) as number);
   }
 
-  min(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.minAxis(arr, axis);
+  min(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.minAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     return Math.min(...arr.data);
   }
 
-  max(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.maxAxis(arr, axis);
+  max(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.maxAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     return Math.max(...arr.data);
   }
 
-  argmin(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.argminAxis(arr, axis);
+  argmin(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.argminAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let minIdx = 0;
     for (let i = 1; i < arr.data.length; i++) {
@@ -1751,8 +1815,16 @@ export class JsBackend implements Backend {
     return minIdx;
   }
 
-  argmax(arr: NDArray, axis?: number): number | NDArray {
-    if (axis !== undefined) return this.argmaxAxis(arr, axis);
+  argmax(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const result = this.argmaxAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let maxIdx = 0;
     for (let i = 1; i < arr.data.length; i++) {
@@ -1783,13 +1855,29 @@ export class JsBackend implements Backend {
     return new JsNDArray(data, arr.shape);
   }
 
-  all(arr: NDArray, axis?: number): boolean | NDArray {
-    if (axis !== undefined) return this.allAxis(arr, axis);
+  all(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray {
+    if (axis !== undefined) {
+      const result = this.allAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     return arr.data.every(x => x !== 0);
   }
 
-  any(arr: NDArray, axis?: number): boolean | NDArray {
-    if (axis !== undefined) return this.anyAxis(arr, axis);
+  any(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray {
+    if (axis !== undefined) {
+      const result = this.anyAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     return arr.data.some(x => x !== 0);
   }
 
@@ -2371,11 +2459,71 @@ export class JsBackend implements Backend {
     return Math.sqrt(s);
   }
 
-  qr(arr: NDArray): { q: NDArray; r: NDArray } {
+  qr(arr: NDArray, mode: 'reduced' | 'complete' = 'reduced'): { q: NDArray; r: NDArray } {
     if (arr.shape.length !== 2) throw new Error('qr requires 2D');
     const [m, n] = arr.shape;
+    const k = Math.min(m, n);
 
-    // Modified Gram-Schmidt
+    if (mode === 'complete') {
+      // Complete QR via Householder reflections: Q is m×m, R is m×n
+      const qFull = new Float64Array(m * m);
+      const rFull = new Float64Array(m * n);
+
+      // Initialize R as a copy of A
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < n; j++) {
+          rFull[i * n + j] = arr.data[i * n + j];
+        }
+      }
+
+      // Initialize Q as identity
+      for (let i = 0; i < m; i++) qFull[i * m + i] = 1;
+
+      for (let j = 0; j < k; j++) {
+        // Extract column j of R from row j downward
+        const v = new Float64Array(m - j);
+        for (let i = j; i < m; i++) v[i - j] = rFull[i * n + j];
+
+        const vNorm = Math.sqrt(v.reduce((acc, x) => acc + x * x, 0));
+        if (vNorm < 1e-15) continue;
+
+        // Householder vector with sign choice to avoid cancellation
+        const sign = v[0] >= 0 ? 1 : -1;
+        v[0] += sign * vNorm;
+        const v2Norm = Math.sqrt(v.reduce((acc, x) => acc + x * x, 0));
+        if (v2Norm < 1e-15) continue;
+        for (let i = 0; i < v.length; i++) v[i] /= v2Norm;
+
+        // Apply Householder to R: R[j:, :] -= 2 * v * (v^T * R[j:, :])
+        for (let col = 0; col < n; col++) {
+          let dot = 0;
+          for (let i = 0; i < v.length; i++) {
+            dot += v[i] * rFull[(j + i) * n + col];
+          }
+          for (let i = 0; i < v.length; i++) {
+            rFull[(j + i) * n + col] -= 2 * v[i] * dot;
+          }
+        }
+
+        // Apply Householder to Q: Q[:, j:] -= 2 * (Q[:, j:] * v) * v^T
+        for (let row = 0; row < m; row++) {
+          let dot = 0;
+          for (let i = 0; i < v.length; i++) {
+            dot += qFull[row * m + (j + i)] * v[i];
+          }
+          for (let i = 0; i < v.length; i++) {
+            qFull[row * m + (j + i)] -= 2 * dot * v[i];
+          }
+        }
+      }
+
+      return {
+        q: new JsNDArray(qFull, [m, m]),
+        r: new JsNDArray(rFull, [m, n]),
+      };
+    }
+
+    // Reduced QR (default) via Modified Gram-Schmidt: Q is m×n, R is n×n
     const q = new Float64Array(m * n);
     const r = new Float64Array(n * n);
 
@@ -2397,14 +2545,14 @@ export class JsBackend implements Backend {
       }
 
       // Orthogonalize remaining columns
-      for (let k = j + 1; k < n; k++) {
+      for (let kk = j + 1; kk < n; kk++) {
         let dot = 0;
         for (let i = 0; i < m; i++) {
-          dot += q[i * n + j] * q[i * n + k];
+          dot += q[i * n + j] * q[i * n + kk];
         }
-        r[j * n + k] = dot;
+        r[j * n + kk] = dot;
         for (let i = 0; i < m; i++) {
-          q[i * n + k] -= dot * q[i * n + j];
+          q[i * n + kk] -= dot * q[i * n + j];
         }
       }
     }
@@ -2415,8 +2563,8 @@ export class JsBackend implements Backend {
     };
   }
 
-  svd(arr: NDArray): { u: NDArray; s: NDArray; vt: NDArray } {
-    // Full SVD using power iteration with deflation
+  svd(arr: NDArray, fullMatrices: boolean = true): { u: NDArray; s: NDArray; vt: NDArray } {
+    // SVD using power iteration with deflation
     // Computes A = U * Σ * V^T
     if (arr.shape.length !== 2) throw new Error('svd requires 2D');
     const [m, n] = arr.shape;
@@ -2553,10 +2701,108 @@ export class JsBackend implements Backend {
       }
     }
 
+    if (!fullMatrices || (m === k && n === k)) {
+      // Reduced SVD or square matrix (full == reduced)
+      return {
+        u: new JsNDArray(uData, [m, k]),
+        s: new JsNDArray(sortedS, [k]),
+        vt: new JsNDArray(vtData, [k, n]),
+      };
+    }
+
+    // Full SVD: extend U to m×m and Vt to n×n by completing orthonormal bases
+    // Extend U (m×k -> m×m) using QR of current U columns
+    let fullU: Float64Array;
+    if (m > k) {
+      // Build m×m orthogonal matrix whose first k columns are uData
+      fullU = new Float64Array(m * m);
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < k; j++) {
+          fullU[i * m + j] = uData[i * k + j];
+        }
+      }
+      // Fill remaining columns with random vectors, then orthogonalize via Gram-Schmidt
+      for (let j = k; j < m; j++) {
+        // Start with a standard basis vector e_j (good for linear independence)
+        for (let i = 0; i < m; i++) fullU[i * m + j] = i === j ? 1 : 0;
+        // Orthogonalize against all previous columns
+        for (let prev = 0; prev < j; prev++) {
+          let dot = 0;
+          for (let i = 0; i < m; i++) dot += fullU[i * m + j] * fullU[i * m + prev];
+          for (let i = 0; i < m; i++) fullU[i * m + j] -= dot * fullU[i * m + prev];
+        }
+        // Normalize
+        let norm = 0;
+        for (let i = 0; i < m; i++) norm += fullU[i * m + j] ** 2;
+        norm = Math.sqrt(norm);
+        if (norm < 1e-12) {
+          // Try another basis vector if this one was linearly dependent
+          for (let i = 0; i < m; i++) fullU[i * m + j] = i === (j + 1) % m ? 1 : 0;
+          for (let prev = 0; prev < j; prev++) {
+            let dot = 0;
+            for (let i = 0; i < m; i++) dot += fullU[i * m + j] * fullU[i * m + prev];
+            for (let i = 0; i < m; i++) fullU[i * m + j] -= dot * fullU[i * m + prev];
+          }
+          norm = 0;
+          for (let i = 0; i < m; i++) norm += fullU[i * m + j] ** 2;
+          norm = Math.sqrt(norm);
+        }
+        if (norm > 1e-12) {
+          for (let i = 0; i < m; i++) fullU[i * m + j] /= norm;
+        }
+      }
+    } else {
+      fullU = uData;
+    }
+
+    // Extend Vt (k×n -> n×n)
+    let fullVt: Float64Array;
+    if (n > k) {
+      // sortedV is n×k (columns of V), vtData is k×n (rows of Vt)
+      // Build n×n: first k rows are vtData, remaining rows complete the basis
+      fullVt = new Float64Array(n * n);
+      for (let i = 0; i < k; i++) {
+        for (let j = 0; j < n; j++) {
+          fullVt[i * n + j] = vtData[i * n + j];
+        }
+      }
+      // Work in V-space (columns): V is n×k, extend to n×n then transpose back
+      // Easier: work with rows of Vt. Each row is a basis vector of length n.
+      for (let row = k; row < n; row++) {
+        // Start with standard basis vector
+        for (let j = 0; j < n; j++) fullVt[row * n + j] = j === row ? 1 : 0;
+        // Orthogonalize against all previous rows
+        for (let prev = 0; prev < row; prev++) {
+          let dot = 0;
+          for (let j = 0; j < n; j++) dot += fullVt[row * n + j] * fullVt[prev * n + j];
+          for (let j = 0; j < n; j++) fullVt[row * n + j] -= dot * fullVt[prev * n + j];
+        }
+        let norm = 0;
+        for (let j = 0; j < n; j++) norm += fullVt[row * n + j] ** 2;
+        norm = Math.sqrt(norm);
+        if (norm < 1e-12) {
+          for (let j = 0; j < n; j++) fullVt[row * n + j] = j === (row + 1) % n ? 1 : 0;
+          for (let prev = 0; prev < row; prev++) {
+            let dot = 0;
+            for (let j = 0; j < n; j++) dot += fullVt[row * n + j] * fullVt[prev * n + j];
+            for (let j = 0; j < n; j++) fullVt[row * n + j] -= dot * fullVt[prev * n + j];
+          }
+          norm = 0;
+          for (let j = 0; j < n; j++) norm += fullVt[row * n + j] ** 2;
+          norm = Math.sqrt(norm);
+        }
+        if (norm > 1e-12) {
+          for (let j = 0; j < n; j++) fullVt[row * n + j] /= norm;
+        }
+      }
+    } else {
+      fullVt = vtData;
+    }
+
     return {
-      u: new JsNDArray(uData, [m, k]),
+      u: new JsNDArray(fullU, [m, m > k ? m : k]),
       s: new JsNDArray(sortedS, [k]),
-      vt: new JsNDArray(vtData, [k, n]),
+      vt: new JsNDArray(fullVt, [n > k ? n : k, n]),
     };
   }
 
@@ -3057,7 +3303,10 @@ export class JsBackend implements Backend {
 
   // ============ Conditional ============
 
-  where(condition: NDArray, x: NDArray, y: NDArray): NDArray {
+  where(condition: NDArray, x?: NDArray, y?: NDArray): NDArray | NDArray[] {
+    if (x === undefined || y === undefined) {
+      return this.nonzero(condition);
+    }
     // Broadcast all arrays to the same shape
     const [condBcast, xBcast, yBcast] = this.broadcastArrays(condition, x, y);
     const size = condBcast.data.length;
@@ -3341,11 +3590,50 @@ export class JsBackend implements Backend {
 
   // ============ Differences ============
 
-  diff(arr: NDArray, n: number = 1, axis: number = -1): NDArray {
+  diff(
+    arr: NDArray,
+    n: number = 1,
+    axis: number = -1,
+    prepend?: NDArray | number,
+    append?: NDArray | number
+  ): NDArray {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
 
-    let result = arr;
+    // Handle prepend and append by concatenating before computing diff
+    let input: NDArray = arr;
+    if (prepend !== undefined || append !== undefined) {
+      const parts: NDArray[] = [];
+      if (prepend !== undefined) {
+        if (typeof prepend === 'number') {
+          // Create array with matching shape except axis dimension = 1
+          const pShape = [...arr.shape];
+          pShape[axis] = 1;
+          const pSize = pShape.reduce((a, b) => a * b, 1);
+          const pData = new Float64Array(pSize);
+          pData.fill(prepend);
+          parts.push(new JsNDArray(pData, pShape));
+        } else {
+          parts.push(prepend);
+        }
+      }
+      parts.push(arr);
+      if (append !== undefined) {
+        if (typeof append === 'number') {
+          const aShape = [...arr.shape];
+          aShape[axis] = 1;
+          const aSize = aShape.reduce((a, b) => a * b, 1);
+          const aData = new Float64Array(aSize);
+          aData.fill(append);
+          parts.push(new JsNDArray(aData, aShape));
+        } else {
+          parts.push(append);
+        }
+      }
+      input = this.concatenate(parts, axis);
+    }
+
+    let result: NDArray = input;
     for (let i = 0; i < n; i++) {
       result = this._diffOnce(result, axis);
     }
@@ -4664,10 +4952,61 @@ export class JsBackend implements Backend {
     }
   }
 
-  choice(arr: NDArray, size: number, replace: boolean = true): NDArray {
+  choice(arr: NDArray, size: number, replace: boolean = true, p?: NDArray | number[]): NDArray {
     const n = arr.data.length;
     const data = new Float64Array(size);
-    if (replace) {
+
+    if (p !== undefined) {
+      // Weighted sampling
+      const weights = Array.isArray(p) ? p : Array.from(p.data);
+      if (weights.length !== n) throw new Error('p must have same length as arr');
+
+      // Build cumulative distribution function
+      const cdf = new Float64Array(n);
+      cdf[0] = weights[0];
+      for (let i = 1; i < n; i++) {
+        cdf[i] = cdf[i - 1] + weights[i];
+      }
+
+      if (replace) {
+        for (let i = 0; i < size; i++) {
+          const r = this._xorshift();
+          // Binary search in CDF
+          let lo = 0,
+            hi = n - 1;
+          while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (cdf[mid] <= r) lo = mid + 1;
+            else hi = mid;
+          }
+          data[i] = arr.data[lo];
+        }
+      } else {
+        if (size > n) throw new Error('Cannot sample more than array size without replacement');
+        // Weighted sampling without replacement: remove selected items
+        const remaining = Array.from({ length: n }, (_, i) => i);
+        const remainingWeights = [...weights];
+        for (let i = 0; i < size; i++) {
+          // Rebuild CDF for remaining items
+          let totalWeight = 0;
+          for (let j = 0; j < remaining.length; j++) totalWeight += remainingWeights[j];
+
+          const r = this._xorshift() * totalWeight;
+          let cumulative = 0;
+          let chosen = 0;
+          for (let j = 0; j < remaining.length; j++) {
+            cumulative += remainingWeights[j];
+            if (cumulative > r) {
+              chosen = j;
+              break;
+            }
+          }
+          data[i] = arr.data[remaining[chosen]];
+          remaining.splice(chosen, 1);
+          remainingWeights.splice(chosen, 1);
+        }
+      }
+    } else if (replace) {
       for (let i = 0; i < size; i++) {
         const idx = Math.floor(this._xorshift() * n);
         data[i] = arr.data[idx];
@@ -5171,7 +5510,8 @@ export class JsBackend implements Backend {
 
   lstsq(
     a: NDArray,
-    b: NDArray
+    b: NDArray,
+    rcond?: number | null
   ): { x: NDArray; residuals: NDArray; rank: number; singularValues: NDArray } {
     // Solve least squares via normal equations: x = (A^T A)^{-1} A^T b
     // Handle 1D b by reshaping to column vector
@@ -5196,12 +5536,30 @@ export class JsBackend implements Backend {
     const residuals = new JsNDArray(new Float64Array([residSum]), [1]);
 
     // SVD for rank and singular values
-    const svdResult = this.svd(a);
+    const svdResult = this.svd(a, false);
     const singularValues = svdResult.s;
+
+    // Determine rcond cutoff for rank calculation
+    // rcond=null or rcond=-1 means use machine epsilon * max(M, N)
+    const [M, N] = a.shape;
+    const eps = 2.220446049250313e-16; // float64 machine epsilon
+    let cutoff: number;
+    if (rcond === null || rcond === -1) {
+      cutoff = eps * Math.max(M, N);
+    } else if (rcond !== undefined) {
+      cutoff = rcond;
+    } else {
+      // Default (no rcond provided): use small tolerance * max singular value
+      cutoff = 1e-10 * Math.max(...Array.from(singularValues.data));
+    }
+
+    // If rcond is relative (null/-1/undefined with max sv), apply to max singular value
+    const maxSV = singularValues.data.length > 0 ? Math.max(...Array.from(singularValues.data)) : 0;
+    const threshold = rcond === null || rcond === -1 ? cutoff * maxSV : cutoff;
+
     let rank = 0;
-    const tol = 1e-10 * Math.max(...Array.from(singularValues.data));
     for (let i = 0; i < singularValues.data.length; i++) {
-      if (singularValues.data[i] > tol) rank++;
+      if (singularValues.data[i] > threshold) rank++;
     }
 
     return { x, residuals, rank, singularValues };
@@ -5209,7 +5567,7 @@ export class JsBackend implements Backend {
 
   pinv(arr: NDArray): NDArray {
     // Moore-Penrose pseudoinverse via SVD: A+ = V * S+ * U^T
-    const { u, s, vt } = this.svd(arr);
+    const { u, s, vt } = this.svd(arr, false);
     const [m, n] = arr.shape;
     const k = s.data.length;
     const tol = 1e-10 * Math.max(...Array.from(s.data));

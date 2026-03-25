@@ -1000,4 +1000,83 @@ export function parityTests(getBackend: () => Backend) {
       expect(inv).toEqual([2, 0, 1, 0, 2]);
     });
   });
+
+  // ============ P1: keepdims, where single-arg, svd/qr params ============
+
+  describe('keepdims', () => {
+    // >>> np.sum(np.array([[1,2],[3,4]]), axis=0, keepdims=True)
+    // array([[4, 6]])  shape=(1, 2)
+    it('sum keepdims=true', async () => {
+      const B = getBackend();
+      const a = B.array([1, 2, 3, 4], [2, 2]);
+      const r = B.sum(a, 0, true) as NDArray;
+      expect(r.shape).toEqual([1, 2]);
+      const d = await getData(r, B);
+      expect(d).toEqual([4, 6]);
+    });
+
+    // >>> np.mean(np.array([[1,2],[3,4]]), axis=1, keepdims=True)
+    // array([[1.5], [3.5]])  shape=(2, 1)
+    it('mean keepdims=true', async () => {
+      const B = getBackend();
+      const a = B.array([1, 2, 3, 4], [2, 2]);
+      const r = B.mean(a, 1, true) as NDArray;
+      expect(r.shape).toEqual([2, 1]);
+      const d = await getData(r, B);
+      const tol = getTol(B);
+      expect(approxEq(d[0], 1.5, tol)).toBe(true);
+      expect(approxEq(d[1], 3.5, tol)).toBe(true);
+    });
+  });
+
+  describe('where single-arg', () => {
+    // >>> np.where(np.array([True, False, True]))
+    // (array([0, 2]),)
+    it('where(condition) returns nonzero indices', async () => {
+      const B = getBackend();
+      const cond = B.array([1, 0, 1, 0, 1]);
+      const result = B.where(cond) as NDArray[];
+      expect(Array.isArray(result)).toBe(true);
+      const d = await getData(result[0], B);
+      expect(d).toEqual([0, 2, 4]);
+    });
+  });
+
+  describe('choice with p', () => {
+    it('weighted random choice', async () => {
+      const B = getBackend();
+      B.seed(42);
+      const a = B.array([10, 20, 30]);
+      // Heavy weight on last element
+      const r = B.choice(a, 100, true, [0.01, 0.01, 0.98]);
+      const d = await getData(r, B);
+      // Most samples should be 30
+      const count30 = d.filter(v => v === 30).length;
+      expect(count30).toBeGreaterThan(80);
+    });
+  });
+
+  describe('svd fullMatrices', () => {
+    it('reduced SVD with fullMatrices=false', async () => {
+      const B = getBackend();
+      const a = B.array([1, 2, 3, 4, 5, 6], [2, 3]);
+      const { u, s, vt } = B.svd(a, false);
+      // Reduced: U is 2x2, S is 2, Vt is 2x3
+      expect(u.shape).toEqual([2, 2]);
+      expect(s.shape).toEqual([2]);
+      expect(vt.shape).toEqual([2, 3]);
+    });
+  });
+
+  describe('diff with prepend', () => {
+    // >>> np.diff(np.array([1, 3, 6, 10]), prepend=0)
+    // array([1, 2, 3, 4])
+    it('diff with prepend=0', async () => {
+      const B = getBackend();
+      const a = B.array([1, 3, 6, 10]);
+      const r = B.diff(a, 1, undefined, 0);
+      const d = await getData(r, B);
+      expect(d).toEqual([1, 2, 3, 4]);
+    });
+  });
 }

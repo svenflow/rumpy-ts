@@ -4,13 +4,7 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import { Backend, DEFAULT_TOL, RELAXED_TOL, SVD_TOL, approxEq } from './test-utils';
-
-// Helper to get data from arrays (handles GPU materialization)
-async function getData(arr: { toArray(): number[] }, B: Backend): Promise<number[]> {
-  if (B.materializeAll) await B.materializeAll();
-  return arr.toArray();
-}
+import { Backend, DEFAULT_TOL, RELAXED_TOL, SVD_TOL, approxEq, getData } from './test-utils';
 
 export function linalgTests(getBackend: () => Backend) {
   describe('linalg', () => {
@@ -19,8 +13,7 @@ export function linalgTests(getBackend: () => Backend) {
       B = getBackend();
     });
 
-    const mat = (data: number[], rows: number, cols: number) =>
-      B.array(data, [rows, cols]);
+    const mat = (data: number[], rows: number, cols: number) => B.array(data, [rows, cols]);
     const vec1d = (data: number[]) => B.array(data, [data.length]);
 
     // ============ matmul ============
@@ -99,7 +92,7 @@ export function linalgTests(getBackend: () => Backend) {
     describe('inv', () => {
       it('computes inverse of 2x2 matrix', async () => {
         const a = mat([4.0, 7.0, 2.0, 6.0], 2, 2);
-        const aInv = B.inv(a);
+        const aInv = await B.inv(a);
 
         // A @ A^-1 should be identity
         const identity = B.matmul(a, aInv);
@@ -112,7 +105,7 @@ export function linalgTests(getBackend: () => Backend) {
 
       it('computes inverse of 3x3 matrix', async () => {
         const a = mat([1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0], 3, 3);
-        const aInv = B.inv(a);
+        const aInv = await B.inv(a);
 
         // A @ A^-1 should be identity
         const identity = B.matmul(a, aInv);
@@ -124,7 +117,7 @@ export function linalgTests(getBackend: () => Backend) {
 
       it('throws for non-square matrix', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
-        expect(() => B.inv(a)).toThrow();
+        await expect(async () => B.inv(a)).rejects.toThrow();
       });
     });
 
@@ -133,21 +126,21 @@ export function linalgTests(getBackend: () => Backend) {
     describe('det', () => {
       it('computes determinant of 2x2 matrix', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0], 2, 2);
-        const det = B.det(a);
+        const det = await B.det(a);
         // det([[1,2],[3,4]]) = 1*4 - 2*3 = -2
         expect(approxEq(det, -2.0, RELAXED_TOL)).toBe(true);
       });
 
       it('computes determinant of 3x3 singular matrix', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], 3, 3);
-        const det = B.det(a);
+        const det = await B.det(a);
         // This matrix is singular, det = 0
         expect(approxEq(det, 0.0, RELAXED_TOL)).toBe(true);
       });
 
       it('computes determinant of identity matrix', async () => {
         const a = B.eye(3);
-        const det = B.det(a);
+        const det = await B.det(a);
         expect(approxEq(det, 1.0, RELAXED_TOL)).toBe(true);
       });
     });
@@ -198,7 +191,7 @@ export function linalgTests(getBackend: () => Backend) {
         // Solution: x = [[2],[3]]
         const a = mat([3.0, 1.0, 1.0, 2.0], 2, 2);
         const b = mat([9.0, 8.0], 2, 1);
-        const x = B.solve(a, b);
+        const x = await B.solve(a, b);
 
         const xData = await getData(x, B);
         expect(approxEq(xData[0], 2.0, RELAXED_TOL)).toBe(true);
@@ -208,7 +201,7 @@ export function linalgTests(getBackend: () => Backend) {
       it('verifies A @ x = b', async () => {
         const a = mat([3.0, 1.0, 1.0, 2.0], 2, 2);
         const b = mat([9.0, 8.0], 2, 1);
-        const x = B.solve(a, b);
+        const x = await B.solve(a, b);
 
         // Reshape x for matmul (solve may return 1D)
         const xData = await getData(x, B);
@@ -269,12 +262,18 @@ export function linalgTests(getBackend: () => Backend) {
     describe('svd', () => {
       it('computes SVD with correct shapes', async () => {
         const a = mat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
-        const { u, s, vt } = B.svd(a);
 
-        // Verify shapes: A is 2x3, so U is 2x2, S is 2, Vt is 2x3
+        // Default (fullMatrices=true, NumPy compat): U is 2x2, S is 2, Vt is 3x3
+        const { u, s, vt } = B.svd(a);
         expect(u.shape).toEqual([2, 2]);
         expect(s.shape).toEqual([2]);
-        expect(vt.shape).toEqual([2, 3]);
+        expect(vt.shape).toEqual([3, 3]);
+
+        // Reduced (fullMatrices=false): U is 2x2, S is 2, Vt is 2x3
+        const { u: uR, s: sR, vt: vtR } = B.svd(a, false);
+        expect(uR.shape).toEqual([2, 2]);
+        expect(sR.shape).toEqual([2]);
+        expect(vtR.shape).toEqual([2, 3]);
 
         // Singular values should be non-negative and sorted descending
         const sData = await getData(s, B);

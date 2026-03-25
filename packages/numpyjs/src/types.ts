@@ -262,21 +262,21 @@ export interface Backend {
   clip(arr: NDArray, min: number | null, max: number | null): NDArray;
 
   // ============ Stats (NumPy-style with optional axis) ============
-  sum(arr: NDArray, axis?: number): number | NDArray;
-  prod(arr: NDArray, axis?: number): number | NDArray;
-  mean(arr: NDArray, axis?: number): number | NDArray;
-  /** np.var — variance. var(arr, axis?, ddof?) matches NumPy param order */
-  var(arr: NDArray, axis?: number | null, ddof?: number): number | NDArray;
-  /** np.std — standard deviation. std(arr, axis?, ddof?) matches NumPy param order */
-  std(arr: NDArray, axis?: number | null, ddof?: number): number | NDArray;
-  min(arr: NDArray, axis?: number): number | NDArray;
-  max(arr: NDArray, axis?: number): number | NDArray;
-  argmin(arr: NDArray, axis?: number): number | NDArray;
-  argmax(arr: NDArray, axis?: number): number | NDArray;
+  sum(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  prod(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  mean(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  /** np.var — variance. var(arr, axis?, ddof?, keepdims?) matches NumPy param order */
+  var(arr: NDArray, axis?: number | null, ddof?: number, keepdims?: boolean): number | NDArray;
+  /** np.std — standard deviation. std(arr, axis?, ddof?, keepdims?) matches NumPy param order */
+  std(arr: NDArray, axis?: number | null, ddof?: number, keepdims?: boolean): number | NDArray;
+  min(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  max(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  argmin(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
+  argmax(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray;
   cumsum(arr: NDArray, axis?: number): NDArray;
   cumprod(arr: NDArray, axis?: number): NDArray;
-  all(arr: NDArray, axis?: number): boolean | NDArray;
-  any(arr: NDArray, axis?: number): boolean | NDArray;
+  all(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray;
+  any(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray;
   /** @deprecated Use sum(arr, axis) instead */
   sumAxis(arr: NDArray, axis: number): NDArray;
   /** @deprecated Use mean(arr, axis) instead */
@@ -337,8 +337,8 @@ export interface Backend {
   inv(arr: NDArray): NDArray | Promise<NDArray>;
   solve(a: NDArray, b: NDArray): NDArray | Promise<NDArray>;
   norm(arr: NDArray, ord?: number, axis?: number): number | NDArray;
-  qr(arr: NDArray): { q: NDArray; r: NDArray };
-  svd(arr: NDArray): { u: NDArray; s: NDArray; vt: NDArray };
+  qr(arr: NDArray, mode?: 'reduced' | 'complete'): { q: NDArray; r: NDArray };
+  svd(arr: NDArray, fullMatrices?: boolean): { u: NDArray; s: NDArray; vt: NDArray };
 
   // ============ Creation - Like Functions ============
   zerosLike(arr: NDArray): NDArray;
@@ -362,7 +362,7 @@ export interface Backend {
   split(arr: NDArray, indices: number | number[], axis?: number): NDArray[];
 
   // ============ Conditional ============
-  where(condition: NDArray, x: NDArray, y: NDArray): NDArray;
+  where(condition: NDArray, x?: NDArray, y?: NDArray): NDArray | NDArray[];
 
   // ============ Advanced Indexing ============
   take(arr: NDArray, indices: NDArray | number[], axis?: number): NDArray;
@@ -374,7 +374,13 @@ export interface Backend {
   einsum(subscripts: string, ...operands: NDArray[]): NDArray | Promise<NDArray>;
 
   // ============ Differences ============
-  diff(arr: NDArray, n?: number, axis?: number): NDArray;
+  diff(
+    arr: NDArray,
+    n?: number,
+    axis?: number,
+    prepend?: NDArray | number,
+    append?: NDArray | number
+  ): NDArray;
   gradient(arr: NDArray, axis?: number): NDArray;
   ediff1d(arr: NDArray): NDArray;
 
@@ -440,7 +446,7 @@ export interface Backend {
   uniform(low: number, high: number, shape: number[], dtype?: DType): NDArray;
   normal(loc: number, scale: number, shape: number[], dtype?: DType): NDArray;
   shuffle(arr: NDArray): void;
-  choice(arr: NDArray, size: number, replace?: boolean): NDArray;
+  choice(arr: NDArray, size: number, replace?: boolean, p?: NDArray | number[]): NDArray;
   permutation(n: number | NDArray): NDArray;
 
   // ============ Logic ============
@@ -487,7 +493,8 @@ export interface Backend {
   cholesky(arr: NDArray): NDArray;
   lstsq(
     a: NDArray,
-    b: NDArray
+    b: NDArray,
+    rcond?: number | null
   ): { x: NDArray; residuals: NDArray; rank: number; singularValues: NDArray };
   pinv(arr: NDArray): NDArray;
   matrixRank(arr: NDArray, tol?: number): number;

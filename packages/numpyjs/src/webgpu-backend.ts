@@ -8248,29 +8248,66 @@ export class WebGPUBackend implements Backend {
 
   // ============ Stats Operations ============
 
-  sum(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.sumAxis(arr, axis);
+  sum(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.sumAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     let sum = 0;
     for (let i = 0; i < arr.data.length; i++) sum += arr.data[i];
     return sum;
   }
 
-  prod(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.prodAxis(arr, axis);
+  prod(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.prodAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) return 1;
     let prod = 1;
     for (let i = 0; i < arr.data.length; i++) prod *= arr.data[i];
     return prod;
   }
 
-  mean(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.meanAxis(arr, axis);
+  mean(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.meanAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) return NaN;
     return (this.sum(arr) as number) / arr.data.length;
   }
 
-  var(arr: IFaceNDArray, axis?: number | null, ddof: number = 0): number | IFaceNDArray {
-    if (axis !== undefined && axis !== null) return this.varAxis(arr, axis, ddof);
+  var(
+    arr: IFaceNDArray,
+    axis?: number | null,
+    ddof: number = 0,
+    keepdims?: boolean
+  ): number | IFaceNDArray {
+    if (axis !== undefined && axis !== null) {
+      const result = this.varAxis(arr, axis, ddof);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     const n = arr.data.length;
     if (n === 0) return NaN;
     const mean = this.mean(arr) as number;
@@ -8282,13 +8319,34 @@ export class WebGPUBackend implements Backend {
     return sumSq / (n - ddof);
   }
 
-  std(arr: IFaceNDArray, axis?: number | null, ddof: number = 0): number | IFaceNDArray {
-    if (axis !== undefined && axis !== null) return this.stdAxis(arr, axis, ddof);
+  std(
+    arr: IFaceNDArray,
+    axis?: number | null,
+    ddof: number = 0,
+    keepdims?: boolean
+  ): number | IFaceNDArray {
+    if (axis !== undefined && axis !== null) {
+      const result = this.stdAxis(arr, axis, ddof);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     return Math.sqrt(this.var(arr, undefined, ddof) as number);
   }
 
-  min(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.minAxis(arr, axis);
+  min(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.minAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let min = arr.data[0];
     for (let i = 1; i < arr.data.length; i++) {
@@ -8297,8 +8355,16 @@ export class WebGPUBackend implements Backend {
     return min;
   }
 
-  max(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.maxAxis(arr, axis);
+  max(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.maxAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let max = arr.data[0];
     for (let i = 1; i < arr.data.length; i++) {
@@ -8307,8 +8373,16 @@ export class WebGPUBackend implements Backend {
     return max;
   }
 
-  argmin(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.argminAxis(arr, axis);
+  argmin(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.argminAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let minIdx = 0;
     for (let i = 1; i < arr.data.length; i++) {
@@ -8317,8 +8391,16 @@ export class WebGPUBackend implements Backend {
     return minIdx;
   }
 
-  argmax(arr: IFaceNDArray, axis?: number): number | IFaceNDArray {
-    if (axis !== undefined) return this.argmaxAxis(arr, axis);
+  argmax(arr: IFaceNDArray, axis?: number, keepdims?: boolean): number | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.argmaxAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     if (arr.data.length === 0) throw new Error('zero-size array');
     let maxIdx = 0;
     for (let i = 1; i < arr.data.length; i++) {
@@ -8339,16 +8421,32 @@ export class WebGPUBackend implements Backend {
     return this.fromTensor(this.runCumulativeOnTensor(tensor, 'cumprod'));
   }
 
-  all(arr: IFaceNDArray, axis?: number): boolean | IFaceNDArray {
-    if (axis !== undefined) return this.allAxis(arr, axis);
+  all(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.allAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     for (let i = 0; i < arr.data.length; i++) {
       if (arr.data[i] === 0) return false;
     }
     return true;
   }
 
-  any(arr: IFaceNDArray, axis?: number): boolean | IFaceNDArray {
-    if (axis !== undefined) return this.anyAxis(arr, axis);
+  any(arr: IFaceNDArray, axis?: number, keepdims?: boolean): boolean | IFaceNDArray {
+    if (axis !== undefined) {
+      const result = this.anyAxis(arr, axis);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[axis] = 1;
+        return this.reshape(result, newShape);
+      }
+      return result;
+    }
     for (let i = 0; i < arr.data.length; i++) {
       if (arr.data[i] !== 0) return true;
     }
@@ -10189,18 +10287,75 @@ export class WebGPUBackend implements Backend {
   /**
    * Sync QR wrapper - calls async version
    */
-  qr(arr: IFaceNDArray): { q: IFaceNDArray; r: IFaceNDArray } {
-    // For sync interface, use CPU fallback (Modified Gram-Schmidt)
+  qr(
+    arr: IFaceNDArray,
+    mode: 'reduced' | 'complete' = 'reduced'
+  ): { q: IFaceNDArray; r: IFaceNDArray } {
+    // For sync interface, use CPU fallback
     if (arr.shape.length !== 2) throw new Error('qr requires 2D array');
     const [m, n] = arr.shape;
+    const k = Math.min(m, n);
     const arrData = arr.data;
 
+    if (mode === 'complete') {
+      // Complete QR via Householder reflections: Q is m×m, R is m×n
+      const qFull = new Float64Array(m * m);
+      const rFull = new Float64Array(m * n);
+
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < n; j++) {
+          rFull[i * n + j] = arrData[i * n + j];
+        }
+      }
+
+      for (let i = 0; i < m; i++) qFull[i * m + i] = 1;
+
+      for (let j = 0; j < k; j++) {
+        const v = new Float64Array(m - j);
+        for (let i = j; i < m; i++) v[i - j] = rFull[i * n + j];
+
+        const vNorm = Math.sqrt(v.reduce((acc, x) => acc + x * x, 0));
+        if (vNorm < 1e-15) continue;
+
+        const sign = v[0] >= 0 ? 1 : -1;
+        v[0] += sign * vNorm;
+        const v2Norm = Math.sqrt(v.reduce((acc, x) => acc + x * x, 0));
+        if (v2Norm < 1e-15) continue;
+        for (let i = 0; i < v.length; i++) v[i] /= v2Norm;
+
+        for (let col = 0; col < n; col++) {
+          let dot = 0;
+          for (let i = 0; i < v.length; i++) {
+            dot += v[i] * rFull[(j + i) * n + col];
+          }
+          for (let i = 0; i < v.length; i++) {
+            rFull[(j + i) * n + col] -= 2 * v[i] * dot;
+          }
+        }
+
+        for (let row = 0; row < m; row++) {
+          let dot = 0;
+          for (let i = 0; i < v.length; i++) {
+            dot += qFull[row * m + (j + i)] * v[i];
+          }
+          for (let i = 0; i < v.length; i++) {
+            qFull[row * m + (j + i)] -= 2 * dot * v[i];
+          }
+        }
+      }
+
+      return {
+        q: this.createArray(qFull, [m, m]),
+        r: this.createArray(rFull, [m, n]),
+      };
+    }
+
+    // Reduced QR (default) via Modified Gram-Schmidt
     const q = new Float64Array(m * n);
     const r = new Float64Array(n * n);
     for (let i = 0; i < m * n; i++) q[i] = arrData[i];
 
     for (let col = 0; col < n; col++) {
-      // Compute norm
       let normSquared = 0;
       for (let i = 0; i < m; i++) {
         normSquared += q[i * n + col] ** 2;
@@ -10208,22 +10363,20 @@ export class WebGPUBackend implements Backend {
       const colNorm = Math.sqrt(normSquared);
       r[col * n + col] = colNorm;
 
-      // Normalize
       if (colNorm > 1e-10) {
         for (let i = 0; i < m; i++) {
           q[i * n + col] /= colNorm;
         }
       }
 
-      // Orthogonalize remaining columns
-      for (let k = col + 1; k < n; k++) {
+      for (let kk = col + 1; kk < n; kk++) {
         let dot = 0;
         for (let i = 0; i < m; i++) {
-          dot += q[i * n + col] * q[i * n + k];
+          dot += q[i * n + col] * q[i * n + kk];
         }
-        r[col * n + k] = dot;
+        r[col * n + kk] = dot;
         for (let i = 0; i < m; i++) {
-          q[i * n + k] -= dot * q[i * n + col];
+          q[i * n + kk] -= dot * q[i * n + col];
         }
       }
     }
@@ -10486,7 +10639,10 @@ export class WebGPUBackend implements Backend {
    * Sync SVD - full implementation with U and V matrices
    * Uses power iteration with convergence check and orthogonalization
    */
-  svd(arr: IFaceNDArray): { u: IFaceNDArray; s: IFaceNDArray; vt: IFaceNDArray } {
+  svd(
+    arr: IFaceNDArray,
+    fullMatrices: boolean = true
+  ): { u: IFaceNDArray; s: IFaceNDArray; vt: IFaceNDArray } {
     if (arr.shape.length !== 2) throw new Error('svd requires 2D array');
     const [m, n] = arr.shape;
     const k = Math.min(m, n);
@@ -10623,10 +10779,94 @@ export class WebGPUBackend implements Backend {
       }
     }
 
+    if (!fullMatrices || (m === k && n === k)) {
+      // Reduced SVD or square matrix
+      return {
+        u: this.createArray(uData, [m, k]),
+        s: this.createArray(sortedS, [k]),
+        vt: this.createArray(vtData, [k, n]),
+      };
+    }
+
+    // Full SVD: extend U to m×m and Vt to n×n
+    let fullU: Float64Array;
+    if (m > k) {
+      fullU = new Float64Array(m * m);
+      for (let i = 0; i < m; i++) {
+        for (let j = 0; j < k; j++) {
+          fullU[i * m + j] = uData[i * k + j];
+        }
+      }
+      for (let j = k; j < m; j++) {
+        for (let i = 0; i < m; i++) fullU[i * m + j] = i === j ? 1 : 0;
+        for (let prev = 0; prev < j; prev++) {
+          let dot = 0;
+          for (let i = 0; i < m; i++) dot += fullU[i * m + j] * fullU[i * m + prev];
+          for (let i = 0; i < m; i++) fullU[i * m + j] -= dot * fullU[i * m + prev];
+        }
+        let norm = 0;
+        for (let i = 0; i < m; i++) norm += fullU[i * m + j] ** 2;
+        norm = Math.sqrt(norm);
+        if (norm < 1e-12) {
+          for (let i = 0; i < m; i++) fullU[i * m + j] = i === (j + 1) % m ? 1 : 0;
+          for (let prev = 0; prev < j; prev++) {
+            let dot = 0;
+            for (let i = 0; i < m; i++) dot += fullU[i * m + j] * fullU[i * m + prev];
+            for (let i = 0; i < m; i++) fullU[i * m + j] -= dot * fullU[i * m + prev];
+          }
+          norm = 0;
+          for (let i = 0; i < m; i++) norm += fullU[i * m + j] ** 2;
+          norm = Math.sqrt(norm);
+        }
+        if (norm > 1e-12) {
+          for (let i = 0; i < m; i++) fullU[i * m + j] /= norm;
+        }
+      }
+    } else {
+      fullU = uData;
+    }
+
+    let fullVt: Float64Array;
+    if (n > k) {
+      fullVt = new Float64Array(n * n);
+      for (let i = 0; i < k; i++) {
+        for (let j = 0; j < n; j++) {
+          fullVt[i * n + j] = vtData[i * n + j];
+        }
+      }
+      for (let row = k; row < n; row++) {
+        for (let j = 0; j < n; j++) fullVt[row * n + j] = j === row ? 1 : 0;
+        for (let prev = 0; prev < row; prev++) {
+          let dot = 0;
+          for (let j = 0; j < n; j++) dot += fullVt[row * n + j] * fullVt[prev * n + j];
+          for (let j = 0; j < n; j++) fullVt[row * n + j] -= dot * fullVt[prev * n + j];
+        }
+        let norm = 0;
+        for (let j = 0; j < n; j++) norm += fullVt[row * n + j] ** 2;
+        norm = Math.sqrt(norm);
+        if (norm < 1e-12) {
+          for (let j = 0; j < n; j++) fullVt[row * n + j] = j === (row + 1) % n ? 1 : 0;
+          for (let prev = 0; prev < row; prev++) {
+            let dot = 0;
+            for (let j = 0; j < n; j++) dot += fullVt[row * n + j] * fullVt[prev * n + j];
+            for (let j = 0; j < n; j++) fullVt[row * n + j] -= dot * fullVt[prev * n + j];
+          }
+          norm = 0;
+          for (let j = 0; j < n; j++) norm += fullVt[row * n + j] ** 2;
+          norm = Math.sqrt(norm);
+        }
+        if (norm > 1e-12) {
+          for (let j = 0; j < n; j++) fullVt[row * n + j] /= norm;
+        }
+      }
+    } else {
+      fullVt = vtData;
+    }
+
     return {
-      u: this.createArray(uData, [m, k]),
+      u: this.createArray(fullU, [m, m > k ? m : k]),
       s: this.createArray(sortedS, [k]),
-      vt: this.createArray(vtData, [k, n]),
+      vt: this.createArray(fullVt, [n > k ? n : k, n]),
     };
   }
 
@@ -11479,7 +11719,14 @@ export class WebGPUBackend implements Backend {
 
   // ============ Conditional ============
 
-  where(condition: IFaceNDArray, x: IFaceNDArray, y: IFaceNDArray): IFaceNDArray {
+  where(
+    condition: IFaceNDArray,
+    x?: IFaceNDArray,
+    y?: IFaceNDArray
+  ): IFaceNDArray | IFaceNDArray[] {
+    if (x === undefined || y === undefined) {
+      return this.nonzero(condition) as IFaceNDArray[];
+    }
     const [condBcast, xBcast, yBcast] = this.broadcastArrays(condition, x, y);
     const size = condBcast.data.length;
     const result = new Float64Array(size);
@@ -12421,11 +12668,49 @@ ${productCode}
 
   // ============ Differences ============
 
-  diff(arr: IFaceNDArray, n: number = 1, axis: number = -1): IFaceNDArray {
+  diff(
+    arr: IFaceNDArray,
+    n: number = 1,
+    axis: number = -1,
+    prepend?: IFaceNDArray | number,
+    append?: IFaceNDArray | number
+  ): IFaceNDArray {
     const ndim = arr.shape.length;
     axis = this._normalizeAxis(axis, ndim);
 
-    let result: IFaceNDArray = arr;
+    // Handle prepend and append by concatenating before computing diff
+    let input: IFaceNDArray = arr;
+    if (prepend !== undefined || append !== undefined) {
+      const parts: IFaceNDArray[] = [];
+      if (prepend !== undefined) {
+        if (typeof prepend === 'number') {
+          const pShape = [...arr.shape];
+          pShape[axis] = 1;
+          const pSize = pShape.reduce((a, b) => a * b, 1);
+          const pData = new Float64Array(pSize);
+          pData.fill(prepend);
+          parts.push(this.createArray(pData, pShape));
+        } else {
+          parts.push(prepend);
+        }
+      }
+      parts.push(arr);
+      if (append !== undefined) {
+        if (typeof append === 'number') {
+          const aShape = [...arr.shape];
+          aShape[axis] = 1;
+          const aSize = aShape.reduce((a, b) => a * b, 1);
+          const aData = new Float64Array(aSize);
+          aData.fill(append);
+          parts.push(this.createArray(aData, aShape));
+        } else {
+          parts.push(append);
+        }
+      }
+      input = this.concatenate(parts, axis);
+    }
+
+    let result: IFaceNDArray = input;
     for (let i = 0; i < n; i++) {
       result = this._diffOnce(result, axis);
     }
@@ -14894,10 +15179,66 @@ ${productCode}
     }
   }
 
-  choice(arr: IFaceNDArray, size: number, replace: boolean = true): IFaceNDArray {
+  choice(
+    arr: IFaceNDArray,
+    size: number,
+    replace: boolean = true,
+    p?: IFaceNDArray | number[]
+  ): IFaceNDArray {
     const n = arr.data.length;
     const data = new Float64Array(size);
-    if (replace) {
+
+    if (p !== undefined) {
+      // Weighted sampling
+      const weights = Array.isArray(p) ? p : Array.from(p.data);
+      if (weights.length !== n) throw new Error('p must have same length as arr');
+
+      // Build cumulative distribution function
+      const cdf = new Float64Array(n);
+      cdf[0] = weights[0];
+      for (let i = 1; i < n; i++) {
+        cdf[i] = cdf[i - 1] + weights[i];
+      }
+
+      if (replace) {
+        for (let i = 0; i < size; i++) {
+          const r = this._xorshift();
+          // Binary search in CDF
+          let lo = 0,
+            hi = n - 1;
+          while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (cdf[mid] <= r) lo = mid + 1;
+            else hi = mid;
+          }
+          data[i] = arr.data[lo];
+        }
+      } else {
+        if (size > n) throw new Error('Cannot sample more than array size without replacement');
+        // Weighted sampling without replacement: remove selected items
+        const remaining = Array.from({ length: n }, (_, i) => i);
+        const remainingWeights = [...weights];
+        for (let i = 0; i < size; i++) {
+          // Rebuild CDF for remaining items
+          let totalWeight = 0;
+          for (let j = 0; j < remaining.length; j++) totalWeight += remainingWeights[j];
+
+          const r = this._xorshift() * totalWeight;
+          let cumulative = 0;
+          let chosen = 0;
+          for (let j = 0; j < remaining.length; j++) {
+            cumulative += remainingWeights[j];
+            if (cumulative > r) {
+              chosen = j;
+              break;
+            }
+          }
+          data[i] = arr.data[remaining[chosen]];
+          remaining.splice(chosen, 1);
+          remainingWeights.splice(chosen, 1);
+        }
+      }
+    } else if (replace) {
       for (let i = 0; i < size; i++) {
         const idx = Math.floor(this._xorshift() * n);
         data[i] = arr.data[idx];
@@ -15407,7 +15748,8 @@ ${productCode}
 
   lstsq(
     a: IFaceNDArray,
-    b: IFaceNDArray
+    b: IFaceNDArray,
+    rcond?: number | null
   ): { x: IFaceNDArray; residuals: IFaceNDArray; rank: number; singularValues: IFaceNDArray } {
     // Full CPU-side implementation to avoid GPU materialization issues
     const [m, nCols] = a.shape;
@@ -15428,8 +15770,8 @@ ${productCode}
     for (let i = 0; i < nCols; i++) {
       for (let j = 0; j < nCols; j++) {
         let sum = 0;
-        for (let k = 0; k < m; k++) {
-          sum += atData[i * m + k] * atData[j * m + k];
+        for (let kk = 0; kk < m; kk++) {
+          sum += atData[i * m + kk] * atData[j * m + kk];
         }
         ataData[i * nCols + j] = sum;
       }
@@ -15441,8 +15783,8 @@ ${productCode}
     for (let i = 0; i < nCols; i++) {
       for (let c = 0; c < bCols; c++) {
         let sum = 0;
-        for (let k = 0; k < m; k++) {
-          sum += atData[i * m + k] * bData[was1D ? k : k * bCols + c];
+        for (let kk = 0; kk < m; kk++) {
+          sum += atData[i * m + kk] * bData[was1D ? kk : kk * bCols + c];
         }
         atbData[i * bCols + c] = sum;
       }
@@ -15454,8 +15796,8 @@ ${productCode}
     for (let i = 0; i < nCols; i++) {
       for (let c = 0; c < bCols; c++) {
         let sum = 0;
-        for (let k = 0; k < nCols; k++) {
-          sum += ataInvData[i * nCols + k] * atbData[k * bCols + c];
+        for (let kk = 0; kk < nCols; kk++) {
+          sum += ataInvData[i * nCols + kk] * atbData[kk * bCols + c];
         }
         xData[i * bCols + c] = sum;
       }
@@ -15475,11 +15817,26 @@ ${productCode}
     }
 
     // SVD for singular values and rank
-    const { s } = this.svd(a);
+    const { s } = this.svd(a, false);
+
+    // Determine rcond cutoff for rank calculation
+    const eps = 2.220446049250313e-16; // float64 machine epsilon
+    let cutoff: number;
+    if (rcond === null || rcond === -1) {
+      cutoff = eps * Math.max(m, nCols);
+    } else if (rcond !== undefined) {
+      cutoff = rcond;
+    } else {
+      // Default: use small tolerance * max(M,N) * max singular value
+      cutoff = 1e-10 * Math.max(...a.shape) * (s.data.length > 0 ? s.data[0] : 1);
+    }
+
+    const maxSV = s.data.length > 0 ? Math.max(...Array.from(s.data)) : 0;
+    const threshold = rcond === null || rcond === -1 ? cutoff * maxSV : cutoff;
+
     let rank = 0;
-    const tol = 1e-10 * Math.max(...a.shape) * (s.data.length > 0 ? s.data[0] : 1);
     for (let i = 0; i < s.data.length; i++) {
-      if (s.data[i] > tol) rank++;
+      if (s.data[i] > threshold) rank++;
     }
 
     const x = was1D ? this.createArray(xData, [nCols]) : this.createArray(xData, [nCols, bCols]);
@@ -15494,7 +15851,7 @@ ${productCode}
 
   pinv(arr: IFaceNDArray): IFaceNDArray {
     // Moore-Penrose pseudoinverse via SVD: A+ = V * S+ * U^T
-    const { u, s, vt } = this.svd(arr);
+    const { u, s, vt } = this.svd(arr, false);
     const [m, n] = arr.shape;
     const k = s.data.length;
     const tol = 1e-10 * Math.max(m, n) * (k > 0 ? s.data[0] : 1);
