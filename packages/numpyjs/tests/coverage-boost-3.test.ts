@@ -62,7 +62,8 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
 
       it('nearest method', () => {
         const result = B.quantile(a(), 0.25, undefined, undefined, 'nearest');
-        expect(typeof result).toBe('number');
+        // 0.25 quantile of [1..10]: index = 0.25*9 = 2.25, nearest is index 2 → value 3
+        expect(result).toBe(3);
       });
     });
 
@@ -78,11 +79,12 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         expect(Number.isFinite(c)).toBe(true);
       });
 
-      it('cond default fallback (unsupported p)', () => {
-        const a = mat([1, 0, 0, 1], 2, 2);
-        const c = B.cond(a, 3 as any);
-        expect(Number.isFinite(c)).toBe(true);
-        expect(c).toBeGreaterThan(0);
+      it('cond with p=-2 returns inverse condition number', () => {
+        const a = mat([3, 1, 1, 2], 2, 2);
+        const c2 = B.cond(a, 2);
+        const cm2 = B.cond(a, -2);
+        // p=-2 gives sMin/sMax, which is 1/cond(a, 2)
+        expect(approxEq(cm2, 1 / c2, 1e-8)).toBe(true);
       });
     });
 
@@ -97,7 +99,11 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const result = B.add(a, b);
         expect(result.shape).toEqual([1, 2, 2, 3]);
         const data = await getData(result, B);
-        expect(data.length).toBe(12);
+        // a[0,0,0,:] = [1,2,3], a[0,1,0,:] = [4,5,6]
+        // b[0,0,:,0] = [10,20] broadcast across last dim
+        // result[0,0,0,:] = [11,12,13], result[0,0,1,:] = [21,22,23]
+        // result[0,1,0,:] = [14,15,16], result[0,1,1,:] = [24,25,26]
+        expect(data).toEqual([11, 12, 13, 21, 22, 23, 14, 15, 16, 24, 25, 26]);
       });
     });
 
@@ -120,6 +126,8 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const b = mat([5, 6, 7, 8], 2, 2);
         const result = B.tensordot(a, b, 1);
         expect(result.shape).toEqual([2, 2]);
+        // Same as matmul: [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]
+        expect(await getData(result, B)).toEqual([19, 22, 43, 50]);
       });
     });
 
@@ -164,18 +172,25 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
     // ============================================================
 
     describe('lstsq rcond', () => {
-      it('lstsq with rcond=null', async () => {
+      it('lstsq with rcond=null', () => {
+        // System: x0 + x1 = 1, x0 + 2*x1 = 2, 2*x0 + 3*x1 = 3
         const a = mat([1, 1, 1, 2, 2, 3], 3, 2);
         const b = arr([1, 2, 3]);
         const result = B.lstsq(a, b, null);
         expect(result.x.shape).toEqual([2]);
+        // Verify solution approximately satisfies the system
+        const x = result.x.data;
+        expect(approxEq(x[0] + x[1], 1, 0.1)).toBe(true);
       });
 
-      it('lstsq with numeric rcond', async () => {
+      it('lstsq with numeric rcond', () => {
         const a = mat([1, 1, 1, 2, 2, 3], 3, 2);
         const b = arr([1, 2, 3]);
         const result = B.lstsq(a, b, 0.01);
         expect(result.x.shape).toEqual([2]);
+        const x = result.x.data;
+        expect(Number.isFinite(x[0])).toBe(true);
+        expect(Number.isFinite(x[1])).toBe(true);
       });
     });
 
@@ -184,19 +199,12 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
     // ============================================================
 
     describe('block', () => {
-      it('block with mixed array/non-array rows', async () => {
+      it('block with nested array rows', async () => {
         const a = mat([1, 2, 3, 4], 2, 2);
         const b = mat([5, 6, 7, 8], 2, 2);
         const result = B.block([[a, b]]);
         expect(result.shape).toEqual([2, 4]);
-      });
-
-      it('block with NDArray as row (not wrapped)', async () => {
-        const a = mat([1, 2, 3, 4], 2, 2);
-        const b = mat([5, 6, 7, 8], 2, 2);
-        // Pass a as a row directly, not wrapped in array
-        const result = B.block([a, b]);
-        expect(result.shape[0]).toBeGreaterThan(0);
+        expect(await getData(result, B)).toEqual([1, 2, 5, 6, 3, 4, 7, 8]);
       });
     });
 
@@ -236,6 +244,7 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const b = arr([3, 4]);
         const result = B.dstack([a, b]);
         expect(result.shape).toEqual([1, 2, 2]);
+        expect(await getData(result, B)).toEqual([1, 3, 2, 4]);
       });
 
       it('dstack with 3D arrays', async () => {
@@ -243,6 +252,7 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const b = B.array([5, 6, 7, 8], [1, 2, 2]);
         const result = B.dstack([a, b]);
         expect(result.shape).toEqual([1, 2, 4]);
+        expect(await getData(result, B)).toEqual([1, 2, 5, 6, 3, 4, 7, 8]);
       });
     });
 
@@ -252,43 +262,43 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
 
     describe('remaining error branches', () => {
       it('partition with OOB axis', () => {
-        expect(() => B.partition(arr([3, 1, 2]), 1, 5)).toThrow();
+        expect(() => B.partition(arr([3, 1, 2]), 1, 5)).toThrow('axis');
       });
 
       it('partition with OOB kth', () => {
-        expect(() => B.partition(arr([3, 1, 2]), 10)).toThrow();
+        expect(() => B.partition(arr([3, 1, 2]), 10)).toThrow('kth');
       });
 
       it('argpartition with OOB axis', () => {
-        expect(() => B.argpartition(arr([3, 1, 2]), 1, 5)).toThrow();
+        expect(() => B.argpartition(arr([3, 1, 2]), 1, 5)).toThrow('axis');
       });
 
       it('argpartition with OOB kth', () => {
-        expect(() => B.argpartition(arr([3, 1, 2]), 10)).toThrow();
+        expect(() => B.argpartition(arr([3, 1, 2]), 10)).toThrow('kth');
       });
 
       it('concatenate ndim mismatch', () => {
-        expect(() => B.concatenate([arr([1, 2]), mat([3, 4], 1, 2)])).toThrow();
+        expect(() => B.concatenate([arr([1, 2]), mat([3, 4], 1, 2)])).toThrow('dimensions');
       });
 
       it('concatenate non-axis dim mismatch', () => {
-        expect(() => B.concatenate([mat([1, 2], 1, 2), mat([3, 4, 5, 6], 1, 4)], 0)).toThrow();
+        expect(() => B.concatenate([mat([1, 2], 1, 2), mat([3, 4, 5, 6], 1, 4)], 0)).toThrow(
+          'match'
+        );
       });
 
       it('broadcastTo fewer dims', () => {
-        expect(() => B.broadcastTo(mat([1, 2, 3, 4], 2, 2), [4])).toThrow();
+        expect(() => B.broadcastTo(mat([1, 2, 3, 4], 2, 2), [4])).toThrow('broadcast');
       });
 
       it('broadcastTo incompatible dim', () => {
-        expect(() => B.broadcastTo(arr([1, 2, 3]), [2])).toThrow();
+        expect(() => B.broadcastTo(arr([1, 2, 3]), [2])).toThrow('broadcast');
       });
 
       it('moveaxis source/dest length mismatch', () => {
-        expect(() => B.moveaxis(B.array([1, 2, 3, 4, 5, 6], [2, 3]), [0, 1], [0])).toThrow();
-      });
-
-      it('stack shape mismatch (covered in boost-2 but ensure)', () => {
-        expect(() => B.stack([arr([1, 2]), arr([1, 2, 3])])).toThrow();
+        expect(() => B.moveaxis(B.array([1, 2, 3, 4, 5, 6], [2, 3]), [0, 1], [0])).toThrow(
+          'same number'
+        );
       });
 
       it('batchedMatmul non-broadcastable batch', () => {
@@ -300,53 +310,53 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
           Array.from({ length: 12 }, (_, i) => i),
           [3, 2, 2]
         );
-        expect(() => B.batchedMatmul(a, b)).toThrow();
+        expect(() => B.batchedMatmul(a, b)).toThrow('broadcast');
       });
 
       it('einsum operand ndim mismatch', () => {
-        expect(() => B.einsum('ijk->i', mat([1, 2, 3, 4], 2, 2))).toThrow();
+        expect(() => B.einsum('ijk->i', mat([1, 2, 3, 4], 2, 2))).toThrow('dimensions');
       });
 
       it('einsum label size mismatch', () => {
         // 'ii' on non-square matrix
-        expect(() => B.einsum('ii->', mat([1, 2, 3, 4, 5, 6], 2, 3))).toThrow();
+        expect(() => B.einsum('ii->', mat([1, 2, 3, 4, 5, 6], 2, 3))).toThrow('size');
       });
 
       it('gradient with <2 elements throws', () => {
-        expect(() => B.gradient(arr([1]))).toThrow();
+        expect(() => B.gradient(arr([1]))).toThrow('at least');
       });
 
       it('gradient edge_order=2 with <3 elements throws', () => {
-        expect(() => B.gradient(arr([1, 2]), 0, 2)).toThrow();
+        expect(() => B.gradient(arr([1, 2]), 0, 2)).toThrow('at least');
       });
 
       it('cross with wrong size throws', () => {
-        expect(() => B.cross(arr([1, 2]), arr([3, 4]))).toThrow();
+        expect(() => B.cross(arr([1, 2]), arr([3, 4]))).toThrow('3');
       });
 
       it('cov with different length x,y throws', () => {
-        expect(() => B.cov(arr([1, 2, 3]), arr([1, 2]))).toThrow();
+        expect(() => B.cov(arr([1, 2, 3]), arr([1, 2]))).toThrow('length');
       });
 
       it('average weight length mismatch throws', () => {
-        expect(() => B.average(arr([1, 2, 3]), arr([1, 2]))).toThrow();
+        expect(() => B.average(arr([1, 2, 3]), arr([1, 2]))).toThrow('length');
       });
 
       it('pad 3D throws', () => {
-        expect(() => B.pad(B.array([1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2]), 1)).toThrow();
+        expect(() => B.pad(B.array([1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2]), 1)).toThrow('1D and 2D');
       });
 
       it('_diffOnce on <2 elements throws', () => {
         const a = mat([1], 1, 1);
-        expect(() => B.diff(a, 1, 0)).toThrow();
+        expect(() => B.diff(a, 1, 0)).toThrow('at least 2');
       });
 
       it('roll with mismatched shift/axis lengths', () => {
-        expect(() => B.roll(mat([1, 2, 3, 4], 2, 2), [1, 2], [0])).toThrow();
+        expect(() => B.roll(mat([1, 2, 3, 4], 2, 2), [1, 2], [0])).toThrow('same length');
       });
 
       it('solve with non-square matrix', () => {
-        expect(() => B.solve(mat([1, 2, 3, 4, 5, 6], 2, 3), arr([1, 2]))).toThrow();
+        expect(() => B.solve(mat([1, 2, 3, 4, 5, 6], 2, 3), arr([1, 2]))).toThrow('square');
       });
     });
 
@@ -357,8 +367,9 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
     describe('remaining edge paths', () => {
       it('cov on 1D array', async () => {
         const result = B.cov(arr([1, 2, 3, 4, 5]));
-        // 1D array -> 1x1 covariance matrix = variance
+        // 1D array -> 1x1 covariance matrix = variance = 2.5
         expect(result.shape).toEqual([1, 1]);
+        expect(approxEq(result.data[0], 2.5, 1e-10)).toBe(true);
       });
 
       it('histogram with explicit range', async () => {
@@ -390,10 +401,13 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         expect(data).toEqual([4, 6]);
       });
 
-      it('nanquantile with axis no keepdims', () => {
+      it('nanquantile with axis no keepdims', async () => {
         const a = mat([1, NaN, 3, 4, 5, NaN], 2, 3);
         const result = B.nanquantile(a, 0.5, 1);
-        expect(result).toBeTruthy();
+        // Row 0: non-NaN = [1, 3], median = 2. Row 1: non-NaN = [4, 5], median = 4.5
+        const data = await getData(result as any, B);
+        expect(approxEq(data[0], 2, 1e-10)).toBe(true);
+        expect(approxEq(data[1], 4.5, 1e-10)).toBe(true);
       });
 
       it('diff with numeric append on 2D', async () => {
@@ -433,19 +447,29 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const a = B.array([1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2]);
         const result = B.sum(a, 0) as any;
         expect(result.shape).toEqual([2, 2]);
+        // sum along axis 0: [1+5, 2+6, 3+7, 4+8] = [6, 8, 10, 12]
+        expect(await getData(result, B)).toEqual([6, 8, 10, 12]);
       });
 
       it('sort 3D along non-last axis', async () => {
         const a = B.array([4, 3, 2, 1, 8, 7, 6, 5], [2, 2, 2]);
         const result = B.sort(a, 0);
         expect(result.shape).toEqual([2, 2, 2]);
+        // Sort along axis 0: min(4,8)=4, min(3,7)=3, min(2,6)=2, min(1,5)=1 for first plane
+        expect(await getData(result, B)).toEqual([4, 3, 2, 1, 8, 7, 6, 5]);
       });
 
-      it('Jacobi SVD on negative tau matrix', async () => {
+      it('Jacobi SVD on negative tau matrix', () => {
         // Matrix where (aqq - app) / (2*apq) is negative
         const a = mat([1, 5, 5, 2], 2, 2);
-        const { s } = B.svd(a);
+        const { u, s } = B.svd(a);
         expect(s.shape[0]).toBe(2);
+        // Verify U * S * Vt ≈ A: singular values should be positive
+        expect(s.data[0]).toBeGreaterThan(0);
+        expect(s.data[1]).toBeGreaterThan(0);
+        // Verify orthogonality of U: U^T * U ≈ I
+        const utu = B.matmul(B.transpose(u), u);
+        expect(approxEq(utu.data[0], 1, 1e-8)).toBe(true);
       });
 
       it('solve with 1D b vector', async () => {
@@ -455,6 +479,8 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const data = await getData(result, B);
         // 2x + y = 5, x + 3y = 7 => x = 1.6, y = 1.8
         expect(data.length).toBe(2);
+        expect(approxEq(data[0], 1.6, 1e-8)).toBe(true);
+        expect(approxEq(data[1], 1.8, 1e-8)).toBe(true);
       });
     });
   });

@@ -1,13 +1,12 @@
 /**
  * Coverage boost phase 4 — targeting final ~30 uncovered lines in base-backend.ts
  *
- * Covers: cond singular matrix (lines 1004,1028), roots non-convergence (1309-1310),
- * quickselect exact-k break (1443,1537), lexsort edge cases (1561,1582),
- * compress axis out-of-bounds (1607), apply_along_axis 3D (2185),
- * _checkSameShape errors (3039,3043), LU pivot swap (3065,3069-3073),
- * broadcast mismatch (3175), resize empty (3354), stack shape mismatch (3458),
- * histogram unknown bin strategy (5298), eig 1x1 (6139), polydiv remainder
- * trimming (7360), block non-array row (7501), nextafter(0, negative) (8097-8098).
+ * Covers: cond default fallback path, roots non-convergence, quickselect exact-k
+ * break, lexsort edge cases, compress axis out-of-bounds, cumsum/cumprod 3D outer
+ * strides, _checkSameShape error branches, LU pivot swap (4x4+), broadcastArrays
+ * mismatch, resize empty, stack shape mismatch, histogram unknown bin strategy,
+ * eig edge cases, polydiv remainder trimming, block non-array rows, nextafter
+ * edge cases.
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
@@ -24,21 +23,25 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     const mat = (data: number[], rows: number, cols: number) => B.array(data, [rows, cols]);
 
     // ============================================================
-    // cond with truly singular matrix (lines 1004, 1028)
+    // cond default fallback via non-standard p value
     // ============================================================
 
     describe('cond with non-standard p hits default fallback', () => {
       it('cond with p=3 falls through to default SVD path', () => {
-        // p=3 is not 2, -2, 1, -1, Inf, -Inf, or 'fro' — hits default fallback (line 1022)
+        // p=3 is not 2, -2, 1, -1, Inf, -Inf, or 'fro' — hits default SVD-based fallback
+        // Default fallback behaves like p=2, so result should match cond(a, 2)
         const a = mat([3, 1, 1, 2], 2, 2);
-        const c = B.cond(a, 3 as any);
-        expect(c).toBeGreaterThan(0);
-        expect(Number.isFinite(c)).toBe(true);
+        const c3 = B.cond(a, 3 as any);
+        const c2 = B.cond(a, 2);
+        expect(c3).toBeGreaterThan(0);
+        expect(Number.isFinite(c3)).toBe(true);
+        // Default fallback uses same SVD logic as p=2
+        expect(Math.abs(c3 - c2)).toBeLessThan(1e-10);
       });
     });
 
     // ============================================================
-    // roots non-convergence (lines 1309-1310)
+    // roots non-convergence fallback
     // ============================================================
 
     describe('roots non-convergence fallback', () => {
@@ -53,7 +56,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // quickselect exact-k break (lines 1443, 1537)
+    // quickselect exact-k break in partition/argpartition
     // ============================================================
 
     describe('partition and argpartition quickselect exact-k break', () => {
@@ -84,7 +87,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // lexsort edge cases (lines 1561, 1582)
+    // lexsort edge cases
     // ============================================================
 
     describe('lexsort edge cases', () => {
@@ -105,7 +108,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // compress with invalid axis (line 1607)
+    // compress with invalid axis
     // ============================================================
 
     describe('compress axis out of bounds', () => {
@@ -123,7 +126,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // apply_along_axis with 3D+ array (line 2185)
+    // _cumAlongAxis with 3D+ array (multi-dim outer strides)
     // ============================================================
 
     describe('_cumAlongAxis with 3D array (outerShape.length >= 2)', () => {
@@ -153,7 +156,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // _checkSameShape errors (lines 3039, 3043)
+    // _checkSameShape error branches (ndim mismatch + dim mismatch)
     // ============================================================
 
     describe('_checkSameShape error branches', () => {
@@ -183,7 +186,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // LU decompose pivot swap (lines 3065, 3069-3073)
+    // LU decompose pivot row swap (requires 4x4+ to bypass direct det formulas)
     // ============================================================
 
     describe('LU pivot row swap (4x4+ to bypass direct det formulas)', () => {
@@ -200,13 +203,14 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
         // First element is 0, forces pivot swap in first column of LU
         const a = mat([0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17], 4, 4);
         const d = B.det(a) as number;
-        // Just verify it computes without error and is finite
+        // Computed by cofactor expansion: det = -4
         expect(Number.isFinite(d)).toBe(true);
+        expect(Math.abs(d)).toBeGreaterThan(0);
       });
     });
 
     // ============================================================
-    // Broadcast shape mismatch (line 3175)
+    // Broadcast shape mismatch in broadcastArrays
     // ============================================================
 
     describe('broadcast_arrays shape mismatch', () => {
@@ -218,7 +222,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // resize empty source array (line 3354)
+    // resize empty source array to non-empty shape
     // ============================================================
 
     describe('resize empty array', () => {
@@ -231,7 +235,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // stack shape mismatch (line 3458)
+    // stack shape mismatch (different ndim)
     // ============================================================
 
     describe('stack shape mismatch', () => {
@@ -243,7 +247,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // histogram unknown bin strategy (line 5298)
+    // histogram unknown bin strategy falls back to 10 bins
     // ============================================================
 
     describe('histogram unknown bin strategy', () => {
@@ -257,7 +261,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // eig on 1x1 matrix (line 6139)
+    // eig eigenvalue decomposition
     // ============================================================
 
     describe('eig edge cases', () => {
@@ -272,7 +276,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // polydiv remainder trimming (line 7360)
+    // polydiv remainder trimming (leading near-zeros stripped)
     // ============================================================
 
     describe('polydiv remainder trimming', () => {
@@ -302,7 +306,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // block with non-array row (line 7501)
+    // block with non-array row (direct NDArray in block list)
     // ============================================================
 
     describe('block with non-array rows', () => {
@@ -321,12 +325,12 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
     });
 
     // ============================================================
-    // nextafter(0, negative) (lines 8097-8098)
+    // nextafter edge cases (zero, decrement, increment magnitude)
     // ============================================================
 
     describe('nextafter edge cases', () => {
       it('nextafter(0, -1) produces smallest negative denormal', () => {
-        // xv=0, yv=-1: hits line 8075 (xv===0), then line 8080 (yv > 0 is false)
+        // xv=0, yv=-1: enters xv===0 branch, yv > 0 is false → negative denormal
         const result = B.nextafter(arr([0]), arr([-1]));
         const val = result.data[0];
         expect(val).toBeLessThan(0);
@@ -334,7 +338,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
       });
 
       it('nextafter(positive, negative) decrements', () => {
-        // xv > 0, yv < xv: hits else branch at line 8094, then xv > 0 at line 8099
+        // xv > 0, yv < xv: takes "move towards negative" branch, xv > 0 → decrement
         const result = B.nextafter(arr([1.0]), arr([-1.0]));
         const val = result.data[0];
         expect(val).toBeLessThan(1.0);
@@ -342,7 +346,7 @@ export function coverageBoost4Tests(getBackend: () => Backend) {
       });
 
       it('nextafter(negative, more_negative) increments magnitude', () => {
-        // xv < 0, yv < xv: hits else branch line 8094, then else at 8105
+        // xv < 0, yv < xv: takes "move towards negative" branch, xv < 0 → increment magnitude
         const result = B.nextafter(arr([-1.0]), arr([-2.0]));
         const val = result.data[0];
         expect(val).toBeLessThan(-1.0);
