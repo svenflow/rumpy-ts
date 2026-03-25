@@ -72,11 +72,13 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
     // ============================================================
 
     describe('cond edge cases', () => {
-      it('cond with p=2 produces finite positive number', () => {
-        const a = mat([3, 1, 1, 2], 2, 2);
-        const c = B.cond(a, 2);
-        expect(c).toBeGreaterThan(0);
-        expect(Number.isFinite(c)).toBe(true);
+      it('cond with p=2 computes correct condition number', () => {
+        // Identity matrix has cond = 1 for any p
+        const eye = mat([1, 0, 0, 1], 2, 2);
+        expect(approxEq(B.cond(eye, 2), 1, 1e-6)).toBe(true);
+        // [[2,0],[0,1]] has singular values 2 and 1, cond = 2
+        const diag = mat([2, 0, 0, 1], 2, 2);
+        expect(approxEq(B.cond(diag, 2), 2, 1e-6)).toBe(true);
       });
 
       it('cond with p=-2 returns inverse condition number', () => {
@@ -188,9 +190,10 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const b = arr([1, 2, 3]);
         const result = B.lstsq(a, b, 0.01);
         expect(result.x.shape).toEqual([2]);
-        const x = result.x.data;
-        expect(Number.isFinite(x[0])).toBe(true);
-        expect(Number.isFinite(x[1])).toBe(true);
+        // Both rcond=null and rcond=0.01 should give similar solutions
+        const resultNull = B.lstsq(a, b, null);
+        expect(approxEq(result.x.data[0], resultNull.x.data[0], 0.5)).toBe(true);
+        expect(approxEq(result.x.data[1], resultNull.x.data[1], 0.5)).toBe(true);
       });
     });
 
@@ -331,7 +334,7 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
       });
 
       it('cross with wrong size throws', () => {
-        expect(() => B.cross(arr([1, 2]), arr([3, 4]))).toThrow('3');
+        expect(() => B.cross(arr([1, 2]), arr([3, 4]))).toThrow('3D vectors');
       });
 
       it('cov with different length x,y throws', () => {
@@ -365,17 +368,20 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
     // ============================================================
 
     describe('remaining edge paths', () => {
-      it('cov on 1D array', async () => {
+      it('cov on 1D array', () => {
         const result = B.cov(arr([1, 2, 3, 4, 5]));
         // 1D array -> 1x1 covariance matrix = variance = 2.5
         expect(result.shape).toEqual([1, 1]);
         expect(approxEq(result.data[0], 2.5, 1e-10)).toBe(true);
       });
 
-      it('histogram with explicit range', async () => {
+      it('histogram with explicit range', () => {
         const a = arr([1, 2, 3, 4, 5]);
         const result = B.histogram(a, 5, [0, 10]);
         expect(result.binEdges.shape[0]).toBe(6);
+        // 5 bins with edges [0,2,4,6,8,10]. All 5 values should be distributed across bins.
+        const totalCount = Array.from(result.hist.data).reduce((s, v) => s + v, 0);
+        expect(totalCount).toBe(5);
       });
 
       it('histogram with NDArray bins and density', async () => {
@@ -383,8 +389,14 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
         const edges = arr([0, 2.5, 5]);
         const result = B.histogram(a, edges, undefined, true);
         const data = await getData(result.hist, B);
-        // With density, should integrate to 1
-        expect(data.every(v => v >= 0)).toBe(true);
+        // With density: bin widths are 2.5 each, counts are [2, 3]
+        // density = count / (total * binWidth) = [2/(5*2.5), 3/(5*2.5)] = [0.16, 0.24]
+        // integral = sum(density * width) = 0.16*2.5 + 0.24*2.5 = 1.0
+        const integral = data.reduce((sum, d, i) => {
+          const width = edges.data[i + 1] - edges.data[i];
+          return sum + d * width;
+        }, 0);
+        expect(approxEq(integral, 1.0, 1e-10)).toBe(true);
       });
 
       it('flip 2D without axis', async () => {
@@ -413,8 +425,9 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
       it('diff with numeric append on 2D', async () => {
         const a = mat([1, 2, 3, 4, 5, 6], 2, 3);
         const result = B.diff(a, 1, 1, undefined, 10);
-        // Appending 10 along axis 1 then diff
-        expect(result.shape[1]).toBe(3);
+        // Row 0: [1,2,3,10] → diff = [1,1,7]. Row 1: [4,5,6,10] → diff = [1,1,4]
+        expect(result.shape).toEqual([2, 3]);
+        expect(await getData(result, B)).toEqual([1, 1, 7, 1, 1, 4]);
       });
 
       it('nanprod with axis no keepdims', async () => {
@@ -452,10 +465,12 @@ export function coverageBoost3Tests(getBackend: () => Backend) {
       });
 
       it('sort 3D along non-last axis', async () => {
-        const a = B.array([4, 3, 2, 1, 8, 7, 6, 5], [2, 2, 2]);
+        // Shape [2,2,2]: plane0=[[8,7],[6,5]], plane1=[[4,3],[2,1]]
+        const a = B.array([8, 7, 6, 5, 4, 3, 2, 1], [2, 2, 2]);
         const result = B.sort(a, 0);
         expect(result.shape).toEqual([2, 2, 2]);
-        // Sort along axis 0: min(4,8)=4, min(3,7)=3, min(2,6)=2, min(1,5)=1 for first plane
+        // Sort along axis 0: compare elements at same [row,col] across planes
+        // [0,0,:]: min(8,4)=4 first, max=8 second; [0,1,:]: min(7,3)=3, max=7; etc.
         expect(await getData(result, B)).toEqual([4, 3, 2, 1, 8, 7, 6, 5]);
       });
 
