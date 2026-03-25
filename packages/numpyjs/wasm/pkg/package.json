@@ -1,0 +1,15 @@
+{
+  "name": "numpyjs-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "numpyjs_wasm_bg.wasm",
+    "numpyjs_wasm.js",
+    "numpyjs_wasm.d.ts"
+  ],
+  "main": "numpyjs_wasm.js",
+  "types": "numpyjs_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
