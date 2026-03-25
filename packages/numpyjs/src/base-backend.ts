@@ -2900,10 +2900,16 @@ export abstract class BaseBackend implements Backend {
     const bData = arrB.data;
 
     // Fast path: same shape
-    if (
-      arrA.shape.length === arrB.shape.length &&
-      arrA.shape.every((s, i) => s === arrB.shape[i])
-    ) {
+    let sameShape = arrA.shape.length === arrB.shape.length;
+    if (sameShape) {
+      for (let i = 0; i < arrA.shape.length; i++) {
+        if (arrA.shape[i] !== arrB.shape[i]) {
+          sameShape = false;
+          break;
+        }
+      }
+    }
+    if (sameShape) {
       const data = new Float64Array(aData.length);
       for (let i = 0; i < aData.length; i++) data[i] = fn(aData[i], bData[i]);
       return this.createArray(data, [...arrA.shape]);

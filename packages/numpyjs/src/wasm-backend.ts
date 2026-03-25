@@ -107,6 +107,10 @@ interface WasmModule {
   reduce_max_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
   reduce_mean_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
 
+  // Argmin/Argmax axis reductions
+  reduce_argmin_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
+  reduce_argmax_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
+
   // Matmul
   matmul(a: Float64Array, m: number, k: number, b: Float64Array, n: number): Float64Array;
 
@@ -361,92 +365,123 @@ export class WasmBackend extends BaseBackend {
 
   // ============ Reductions (WASM) ============
 
-  override sum(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray {
+  private _wasmReduction(
+    arr: NDArray,
+    axis: number | undefined,
+    keepdims: boolean | undefined,
+    fullReducer: (data: Float64Array) => number,
+    axisReducer: (data: Float64Array, shape: Uint32Array, axis: number) => Float64Array,
+    dtype?: DType
+  ): number | NDArray {
     if (axis !== undefined) {
-      axis = this._normalizeAxis(axis, arr.shape.length);
-      const shapeU32 = toU32Shape(arr.shape);
-      const resultData = this.wasm.reduce_sum_axis(toF64(arr), shapeU32, axis);
-      const outShape = arr.shape.filter((_, i) => i !== axis);
+      const normAxis = this._normalizeAxis(axis, arr.shape.length);
+      const resultData = axisReducer(toF64(arr), toU32Shape(arr.shape), normAxis);
+      const outShape = arr.shape.filter((_, i) => i !== normAxis);
       let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
       if (dtype) result = this.astype(result, dtype);
       if (keepdims) {
         const newShape = [...arr.shape];
-        newShape[axis] = 1;
+        newShape[normAxis] = 1;
         result = this.reshape(result, newShape);
       }
       return result;
     }
-    return this.wasm.reduce_sum(toF64(arr));
+    return fullReducer(toF64(arr));
+  }
+
+  override sum(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray {
+    return this._wasmReduction(
+      arr,
+      axis,
+      keepdims,
+      d => this.wasm.reduce_sum(d),
+      (d, s, a) => this.wasm.reduce_sum_axis(d, s, a),
+      dtype
+    );
   }
 
   override prod(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray {
-    if (axis !== undefined) {
-      axis = this._normalizeAxis(axis, arr.shape.length);
-      const shapeU32 = toU32Shape(arr.shape);
-      const resultData = this.wasm.reduce_prod_axis(toF64(arr), shapeU32, axis);
-      const outShape = arr.shape.filter((_, i) => i !== axis);
-      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
-      if (dtype) result = this.astype(result, dtype);
-      if (keepdims) {
-        const newShape = [...arr.shape];
-        newShape[axis] = 1;
-        result = this.reshape(result, newShape);
-      }
-      return result;
-    }
-    return this.wasm.reduce_prod(toF64(arr));
+    return this._wasmReduction(
+      arr,
+      axis,
+      keepdims,
+      d => this.wasm.reduce_prod(d),
+      (d, s, a) => this.wasm.reduce_prod_axis(d, s, a),
+      dtype
+    );
   }
 
   override mean(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray {
-    if (axis !== undefined) {
-      axis = this._normalizeAxis(axis, arr.shape.length);
-      const shapeU32 = toU32Shape(arr.shape);
-      const resultData = this.wasm.reduce_mean_axis(toF64(arr), shapeU32, axis);
-      const outShape = arr.shape.filter((_, i) => i !== axis);
-      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
-      if (dtype) result = this.astype(result, dtype);
-      if (keepdims) {
-        const newShape = [...arr.shape];
-        newShape[axis] = 1;
-        result = this.reshape(result, newShape);
-      }
-      return result;
-    }
-    return this.wasm.reduce_mean(toF64(arr));
+    return this._wasmReduction(
+      arr,
+      axis,
+      keepdims,
+      d => this.wasm.reduce_mean(d),
+      (d, s, a) => this.wasm.reduce_mean_axis(d, s, a),
+      dtype
+    );
   }
 
   override min(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
-    if (axis !== undefined) {
-      axis = this._normalizeAxis(axis, arr.shape.length);
-      const shapeU32 = toU32Shape(arr.shape);
-      const resultData = this.wasm.reduce_min_axis(toF64(arr), shapeU32, axis);
-      const outShape = arr.shape.filter((_, i) => i !== axis);
-      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
-      if (keepdims) {
-        const newShape = [...arr.shape];
-        newShape[axis] = 1;
-        result = this.reshape(result, newShape);
-      }
-      return result;
-    }
-    return this.wasm.reduce_min(toF64(arr));
+    return this._wasmReduction(
+      arr,
+      axis,
+      keepdims,
+      d => this.wasm.reduce_min(d),
+      (d, s, a) => this.wasm.reduce_min_axis(d, s, a)
+    );
   }
 
   override max(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    return this._wasmReduction(
+      arr,
+      axis,
+      keepdims,
+      d => this.wasm.reduce_max(d),
+      (d, s, a) => this.wasm.reduce_max_axis(d, s, a)
+    );
+  }
+
+  override argmin(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
     if (axis !== undefined) {
-      axis = this._normalizeAxis(axis, arr.shape.length);
-      const shapeU32 = toU32Shape(arr.shape);
-      const resultData = this.wasm.reduce_max_axis(toF64(arr), shapeU32, axis);
-      const outShape = arr.shape.filter((_, i) => i !== axis);
+      const normAxis = this._normalizeAxis(axis, arr.shape.length);
+      const resultData = this.wasm.reduce_argmin_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
+      const outShape = arr.shape.filter((_, i) => i !== normAxis);
       let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
       if (keepdims) {
         const newShape = [...arr.shape];
-        newShape[axis] = 1;
+        newShape[normAxis] = 1;
         result = this.reshape(result, newShape);
       }
       return result;
     }
-    return this.wasm.reduce_max(toF64(arr));
+    if (arr.data.length === 0) throw new Error('zero-size array');
+    let minIdx = 0;
+    for (let i = 1; i < arr.data.length; i++) {
+      if (arr.data[i] < arr.data[minIdx]) minIdx = i;
+    }
+    return minIdx;
+  }
+
+  override argmax(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
+    if (axis !== undefined) {
+      const normAxis = this._normalizeAxis(axis, arr.shape.length);
+      const resultData = this.wasm.reduce_argmax_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
+      const outShape = arr.shape.filter((_, i) => i !== normAxis);
+      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
+      if (keepdims) {
+        const newShape = [...arr.shape];
+        newShape[normAxis] = 1;
+        result = this.reshape(result, newShape);
+      }
+      return result;
+    }
+    if (arr.data.length === 0) throw new Error('zero-size array');
+    let maxIdx = 0;
+    for (let i = 1; i < arr.data.length; i++) {
+      if (arr.data[i] > arr.data[maxIdx]) maxIdx = i;
+    }
+    return maxIdx;
   }
 
   // ============ Matmul (WASM) ============

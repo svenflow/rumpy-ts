@@ -8154,12 +8154,11 @@ export class WebGPUBackend extends BaseBackend {
 
     const result = new Float64Array(m * n);
     for (let i = 0; i < m; i++) {
-      for (let j = 0; j < n; j++) {
-        let sum = 0;
-        for (let l = 0; l < k1; l++) {
-          sum += a.data[i * k1 + l] * b.data[l * n + j];
+      for (let p = 0; p < k1; p++) {
+        const aip = a.data[i * k1 + p];
+        for (let j = 0; j < n; j++) {
+          result[i * n + j] += aip * b.data[p * n + j];
         }
-        result[i * n + j] = sum;
       }
     }
     return this.createArray(result, [m, n]);

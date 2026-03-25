@@ -566,6 +566,92 @@ pub fn reduce_mean_axis(data: &[f64], shape: &[u32], axis: u32) -> Vec<f64> {
     )
 }
 
+// ============ Argmin / Argmax Axis Reductions ============
+
+/// Generic argmin/argmax along a single axis.
+fn arg_reduce_axis_impl(
+    data: &[f64],
+    shape: &[u32],
+    axis: usize,
+    is_max: bool,
+) -> Vec<f64> {
+    let ndim = shape.len();
+    assert!(axis < ndim, "axis {} out of bounds for ndim {}", axis, ndim);
+
+    let axis_len = shape[axis] as usize;
+
+    // Compute output shape (shape with axis removed)
+    let mut out_shape: Vec<usize> = Vec::with_capacity(ndim - 1);
+    for i in 0..ndim {
+        if i != axis {
+            out_shape.push(shape[i] as usize);
+        }
+    }
+
+    let out_total: usize = if out_shape.is_empty() {
+        1
+    } else {
+        out_shape.iter().product()
+    };
+
+    // Compute input strides
+    let mut strides = vec![1usize; ndim];
+    for i in (0..ndim - 1).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1] as usize;
+    }
+
+    let axis_stride = strides[axis];
+
+    // Compute output strides
+    let mut out_strides = vec![1usize; out_shape.len()];
+    if !out_shape.is_empty() {
+        for i in (0..out_shape.len() - 1).rev() {
+            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+        }
+    }
+
+    let mut result = vec![0.0f64; out_total];
+
+    for out_idx in 0..out_total {
+        let mut tmp = out_idx;
+        let mut base_input_idx = 0usize;
+        let mut out_dim = 0;
+        for d in 0..ndim {
+            if d == axis {
+                continue;
+            }
+            let coord = tmp / out_strides[out_dim];
+            tmp %= out_strides[out_dim];
+            base_input_idx += coord * strides[d];
+            out_dim += 1;
+        }
+
+        let mut best_idx = 0usize;
+        let mut best_val = data[base_input_idx];
+        for k in 1..axis_len {
+            let val = data[base_input_idx + k * axis_stride];
+            let replace = if is_max { val > best_val } else { val < best_val };
+            if replace {
+                best_val = val;
+                best_idx = k;
+            }
+        }
+        result[out_idx] = best_idx as f64;
+    }
+
+    result
+}
+
+#[wasm_bindgen]
+pub fn reduce_argmin_axis(data: &[f64], shape: &[u32], axis: u32) -> Vec<f64> {
+    arg_reduce_axis_impl(data, shape, axis as usize, false)
+}
+
+#[wasm_bindgen]
+pub fn reduce_argmax_axis(data: &[f64], shape: &[u32], axis: u32) -> Vec<f64> {
+    arg_reduce_axis_impl(data, shape, axis as usize, true)
+}
+
 // ============ Matrix Multiplication ============
 
 #[wasm_bindgen]

@@ -27,6 +27,10 @@ export function broadcast_shape(a_shape: Uint32Array, b_shape: Uint32Array): Uin
 
 export function matmul(a: Float64Array, m: number, k: number, b: Float64Array, n: number): Float64Array;
 
+export function reduce_argmax_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
+
+export function reduce_argmin_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
+
 export function reduce_max(data: Float64Array): number;
 
 export function reduce_max_axis(data: Float64Array, shape: Uint32Array, axis: number): Float64Array;
@@ -122,6 +126,8 @@ export interface InitOutput {
     readonly binary_subtract: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
     readonly broadcast_shape: (a: number, b: number, c: number, d: number) => [number, number];
     readonly matmul: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+    readonly reduce_argmax_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly reduce_argmin_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly reduce_max: (a: number, b: number) => number;
     readonly reduce_max_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly reduce_mean: (a: number, b: number) => number;

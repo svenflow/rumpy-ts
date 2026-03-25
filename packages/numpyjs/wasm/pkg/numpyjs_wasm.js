@@ -228,6 +228,40 @@ export function matmul(a, m, k, b, n) {
 
 /**
  * @param {Float64Array} data
+ * @param {Uint32Array} shape
+ * @param {number} axis
+ * @returns {Float64Array}
+ */
+export function reduce_argmax_axis(data, shape, axis) {
+    const ptr0 = passArrayF64ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray32ToWasm0(shape, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.reduce_argmax_axis(ptr0, len0, ptr1, len1, axis);
+    var v3 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v3;
+}
+
+/**
+ * @param {Float64Array} data
+ * @param {Uint32Array} shape
+ * @param {number} axis
+ * @returns {Float64Array}
+ */
+export function reduce_argmin_axis(data, shape, axis) {
+    const ptr0 = passArrayF64ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray32ToWasm0(shape, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.reduce_argmin_axis(ptr0, len0, ptr1, len1, axis);
+    var v3 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+    return v3;
+}
+
+/**
+ * @param {Float64Array} data
  * @returns {number}
  */
 export function reduce_max(data) {

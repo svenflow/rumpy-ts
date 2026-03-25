@@ -12,6 +12,8 @@ export const binary_power: (a: number, b: number, c: number, d: number, e: numbe
 export const binary_subtract: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
 export const broadcast_shape: (a: number, b: number, c: number, d: number) => [number, number];
 export const matmul: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
+export const reduce_argmax_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const reduce_argmin_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
 export const reduce_max: (a: number, b: number) => number;
 export const reduce_max_axis: (a: number, b: number, c: number, d: number, e: number) => [number, number];
 export const reduce_mean: (a: number, b: number) => number;
