@@ -173,7 +173,17 @@ export class WasmBackend extends BaseBackend {
 
   // ============ Unary ops (WASM) ============
 
-  private _wasmUnary(arr: NDArray, fn: (d: Float64Array) => Float64Array): NDArray {
+  // Size threshold: below this, JS is faster than WASM due to copy overhead
+  private static readonly WASM_THRESHOLD = 512;
+
+  private _wasmUnary(
+    arr: NDArray,
+    fn: (d: Float64Array) => Float64Array,
+    baseFn?: (arr: NDArray) => NDArray
+  ): NDArray {
+    if (baseFn && arr.data.length < WasmBackend.WASM_THRESHOLD) {
+      return baseFn.call(this, arr);
+    }
     const result = fn(toF64(arr));
     return this.createArray(result, [...arr.shape], arr.dtype);
   }
@@ -316,10 +326,14 @@ export class WasmBackend extends BaseBackend {
       aShape: Uint32Array,
       bData: Float64Array,
       bShape: Uint32Array
-    ) => Float64Array
+    ) => Float64Array,
+    baseFn?: (a: ArrayOrScalar, b: ArrayOrScalar) => NDArray
   ): NDArray {
     const arrA = this._toNDArray(a);
     const arrB = this._toNDArray(b);
+    if (baseFn && arrA.data.length + arrB.data.length < WasmBackend.WASM_THRESHOLD) {
+      return baseFn.call(this, a, b);
+    }
     const aShape = toU32Shape(arrA.shape);
     const bShape = toU32Shape(arrB.shape);
     const result = fn(toF64(arrA), aShape, toF64(arrB), bShape);
@@ -443,45 +457,31 @@ export class WasmBackend extends BaseBackend {
   }
 
   override argmin(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
-    if (axis !== undefined) {
-      const normAxis = this._normalizeAxis(axis, arr.shape.length);
-      const resultData = this.wasm.reduce_argmin_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
-      const outShape = arr.shape.filter((_, i) => i !== normAxis);
-      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
-      if (keepdims) {
-        const newShape = [...arr.shape];
-        newShape[normAxis] = 1;
-        result = this.reshape(result, newShape);
-      }
-      return result;
+    if (axis === undefined) return super.argmin(arr);
+    const normAxis = this._normalizeAxis(axis, arr.shape.length);
+    const resultData = this.wasm.reduce_argmin_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
+    const outShape = arr.shape.filter((_, i) => i !== normAxis);
+    let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
+    if (keepdims) {
+      const newShape = [...arr.shape];
+      newShape[normAxis] = 1;
+      result = this.reshape(result, newShape);
     }
-    if (arr.data.length === 0) throw new Error('zero-size array');
-    let minIdx = 0;
-    for (let i = 1; i < arr.data.length; i++) {
-      if (arr.data[i] < arr.data[minIdx]) minIdx = i;
-    }
-    return minIdx;
+    return result;
   }
 
   override argmax(arr: NDArray, axis?: number, keepdims?: boolean): number | NDArray {
-    if (axis !== undefined) {
-      const normAxis = this._normalizeAxis(axis, arr.shape.length);
-      const resultData = this.wasm.reduce_argmax_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
-      const outShape = arr.shape.filter((_, i) => i !== normAxis);
-      let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
-      if (keepdims) {
-        const newShape = [...arr.shape];
-        newShape[normAxis] = 1;
-        result = this.reshape(result, newShape);
-      }
-      return result;
+    if (axis === undefined) return super.argmax(arr);
+    const normAxis = this._normalizeAxis(axis, arr.shape.length);
+    const resultData = this.wasm.reduce_argmax_axis(toF64(arr), toU32Shape(arr.shape), normAxis);
+    const outShape = arr.shape.filter((_, i) => i !== normAxis);
+    let result: NDArray = this.createArray(resultData, outShape.length > 0 ? outShape : [1]);
+    if (keepdims) {
+      const newShape = [...arr.shape];
+      newShape[normAxis] = 1;
+      result = this.reshape(result, newShape);
     }
-    if (arr.data.length === 0) throw new Error('zero-size array');
-    let maxIdx = 0;
-    for (let i = 1; i < arr.data.length; i++) {
-      if (arr.data[i] > arr.data[maxIdx]) maxIdx = i;
-    }
-    return maxIdx;
+    return result;
   }
 
   // ============ Matmul (WASM) ============

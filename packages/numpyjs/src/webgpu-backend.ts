@@ -261,7 +261,7 @@ class WebGPUNDArray implements IFaceNDArray {
       data[newFlat] = srcData[oldFlat];
     }
 
-    return new LegacyWebGPUNDArray(data, newShape, this.dtype);
+    return new BaseNDArray(data, newShape, this.dtype);
   }
 
   toArray(): number[] {
@@ -325,79 +325,6 @@ class WebGPUNDArray implements IFaceNDArray {
 export async function materializeAll(): Promise<void> {
   const promises = Array.from(unmaterializedArrays).map(arr => arr.materialize());
   await Promise.all(promises);
-}
-
-// Legacy class for backwards compatibility during transition
-class LegacyWebGPUNDArray implements IFaceNDArray {
-  private _data: Float64Array;
-  private _shape: number[];
-  readonly dtype: DType;
-
-  constructor(data: Float64Array | number[], shape: number[], dtype: DType = DEFAULT_DTYPE) {
-    this._data = data instanceof Float64Array ? data : new Float64Array(data);
-    this._shape = [...shape];
-    this.dtype = dtype;
-  }
-
-  get shape(): number[] {
-    return [...this._shape];
-  }
-
-  get data(): Float64Array {
-    return this._data;
-  }
-
-  get ndim(): number {
-    return this._shape.length;
-  }
-
-  get size(): number {
-    return this._shape.reduce((a, b) => a * b, 1);
-  }
-
-  get T(): IFaceNDArray {
-    const ndim = this._shape.length;
-    if (ndim <= 1) return this;
-    const perm = [...Array(ndim).keys()].reverse();
-    const newShape = perm.map(i => this._shape[i]);
-    const size = this._data.length;
-    const data = new Float64Array(size);
-
-    const oldStrides = new Array(ndim);
-    oldStrides[ndim - 1] = 1;
-    for (let i = ndim - 2; i >= 0; i--) {
-      oldStrides[i] = oldStrides[i + 1] * this._shape[i + 1];
-    }
-    const newStrides = new Array(ndim);
-    newStrides[ndim - 1] = 1;
-    for (let i = ndim - 2; i >= 0; i--) {
-      newStrides[i] = newStrides[i + 1] * newShape[i + 1];
-    }
-
-    for (let newFlat = 0; newFlat < size; newFlat++) {
-      let remaining = newFlat;
-      let oldFlat = 0;
-      for (let d = 0; d < ndim; d++) {
-        const coord = Math.floor(remaining / newStrides[d]);
-        remaining -= coord * newStrides[d];
-        oldFlat += coord * oldStrides[perm[d]];
-      }
-      data[newFlat] = this._data[oldFlat];
-    }
-
-    return new LegacyWebGPUNDArray(data, newShape, this.dtype);
-  }
-
-  toArray(): number[] {
-    return Array.from(this._data);
-  }
-
-  item(): number {
-    if (this._data.length !== 1) {
-      throw new Error('can only convert an array of size 1 to a scalar');
-    }
-    return this._data[0];
-  }
 }
 
 // ============ WGSL Shaders ============
@@ -644,12 +571,12 @@ const BINARY_SHADERS: Record<string, string> = {
   `),
   // arctan2: angle of point (bv, av) - note: atan2(y, x) so y=av, x=bv
   arctan2: makeBinaryShader('atan2(av, bv)'),
-  // logaddexp: log(exp(a) + exp(b)), numerically stable
-  // Simplified: use max to pick the larger, then add log(1 + exp(smaller - larger))
-  // Note: Can't use select() with infinity due to GPU driver bugs
-  logaddexp: makeBinaryShader(`log(exp(av) + exp(bv))`),
+  // logaddexp: log(exp(a) + exp(b)), numerically stable via max + log1p(exp(min-max))
+  // Note: Can't use select() with infinity due to GPU driver bugs, so use direct formula
+  // which naturally handles -inf (exp(-inf - finite) = 0, log(1+0) = 0)
+  logaddexp: makeBinaryShader(`max(av, bv) + log(1.0 + exp(min(av, bv) - max(av, bv)))`),
   // logaddexp2: log2(2^a + 2^b), numerically stable
-  logaddexp2: makeBinaryShader(`log2(exp2(av) + exp2(bv))`),
+  logaddexp2: makeBinaryShader(`max(av, bv) + log2(1.0 + exp2(min(av, bv) - max(av, bv)))`),
   // fmax: maximum ignoring NaN (if one is NaN, return the other)
   // Only return NaN if both are NaN
   fmax: makeBinaryShader(`

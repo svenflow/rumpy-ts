@@ -2226,12 +2226,11 @@ export abstract class BaseBackend implements Backend {
 
     const data = new Float64Array(m * n);
     for (let i = 0; i < m; i++) {
-      for (let j = 0; j < n; j++) {
-        let sum = 0;
-        for (let k = 0; k < k1; k++) {
-          sum += a.data[i * k1 + k] * b.data[k * n + j];
+      for (let p = 0; p < k1; p++) {
+        const a_ip = a.data[i * k1 + p];
+        for (let j = 0; j < n; j++) {
+          data[i * n + j] += a_ip * b.data[p * n + j];
         }
-        data[i * n + j] = sum;
       }
     }
     return this.createArray(data, [m, n]);

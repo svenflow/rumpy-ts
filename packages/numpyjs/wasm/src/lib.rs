@@ -99,8 +99,8 @@ fn bankers_round(x: f64) -> f64 {
     }
     let floor = x.floor();
     let frac = x - floor;
-    // Check if exactly halfway
-    if (frac - 0.5).abs() < f64::EPSILON * x.abs().max(1.0) {
+    // Check if exactly halfway (exact comparison avoids epsilon scaling issues for large values)
+    if (2.0 * frac - 1.0).abs() == 0.0 {
         // Round to even
         let floor_i = floor as i64;
         if floor_i % 2 == 0 {
