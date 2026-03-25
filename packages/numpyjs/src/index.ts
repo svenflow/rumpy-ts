@@ -1,7 +1,9 @@
 /**
  * numpyjs - NumPy-compatible array library for JavaScript
  *
- * Pure JS (CPU) and WebGPU (GPU-accelerated) backends.
+ * Backends:
+ * - JS (CPU): Pure JavaScript, works everywhere
+ * - WebGPU (GPU): GPU-accelerated via WebGPU compute shaders
  */
 
 // Re-export types
@@ -18,11 +20,11 @@ import type { Backend } from './types.js';
  */
 export async function createBackend(type: 'js' | 'webgpu' = 'js'): Promise<Backend> {
   if (type === 'js') {
-    const { createJsBackend } = await import('../tests/js-backend.js');
+    const { createJsBackend } = await import('./js-backend.js');
     return createJsBackend();
   }
   if (type === 'webgpu') {
-    const { initWebGPUBackend, createWebGPUBackend } = await import('../tests/webgpu-backend.js');
+    const { initWebGPUBackend, createWebGPUBackend } = await import('./webgpu-backend.js');
     await initWebGPUBackend();
     return createWebGPUBackend();
   }

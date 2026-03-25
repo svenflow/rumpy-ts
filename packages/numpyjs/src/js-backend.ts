@@ -18,6 +18,7 @@ import {
   DEFAULT_DTYPE,
   createTypedArray,
   createTypedArrayFrom,
+  promoteDTypes,
 } from './types.js';
 
 class JsNDArray implements NDArray {
@@ -5567,12 +5568,13 @@ export class JsBackend implements Backend {
     return true;
   }
 
-  arrayEqual(a: NDArray, b: NDArray): boolean {
+  arrayEqual(a: NDArray, b: NDArray, equal_nan?: boolean): boolean {
     if (a.shape.length !== b.shape.length) return false;
     for (let i = 0; i < a.shape.length; i++) {
       if (a.shape[i] !== b.shape[i]) return false;
     }
     for (let i = 0; i < a.data.length; i++) {
+      if (equal_nan && Number.isNaN(a.data[i]) && Number.isNaN(b.data[i])) continue;
       if (a.data[i] !== b.data[i]) return false;
     }
     return true;
@@ -7722,6 +7724,335 @@ export class JsBackend implements Backend {
       real: new JsNDArray(realData, [...currentShape]),
       imag: new JsNDArray(imagData, [...currentShape]),
     };
+  }
+
+  // ============ Convenience Aliases ============
+
+  product(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray {
+    return this.prod(arr, axis, keepdims, dtype);
+  }
+
+  sometrue(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray {
+    return this.any(arr, axis, keepdims);
+  }
+
+  alltrue(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray {
+    return this.all(arr, axis, keepdims);
+  }
+
+  cumproduct(arr: NDArray, axis?: number, dtype?: DType): NDArray {
+    return this.cumprod(arr, axis, dtype);
+  }
+
+  ndim(arr: NDArray): number {
+    return arr.shape.length;
+  }
+
+  shape(arr: NDArray): number[] {
+    return arr.shape;
+  }
+
+  size(arr: NDArray): number {
+    return arr.data.length;
+  }
+
+  result_type(...args: (NDArray | DType)[]): DType {
+    if (args.length === 0) return 'float64';
+    let result: DType =
+      typeof args[0] === 'string' ? (args[0] as DType) : (args[0] as NDArray).dtype;
+    for (let i = 1; i < args.length; i++) {
+      const dt: DType =
+        typeof args[i] === 'string' ? (args[i] as DType) : (args[i] as NDArray).dtype;
+      result = promoteDTypes(result, dt);
+    }
+    return result;
+  }
+
+  // ============ Comparison Helpers ============
+
+  array_equiv(a: NDArray, b: NDArray): boolean {
+    // Try to broadcast shapes
+    const shapesA = a.shape;
+    const shapesB = b.shape;
+    const maxDims = Math.max(shapesA.length, shapesB.length);
+    const padA = new Array(maxDims - shapesA.length).fill(1).concat(shapesA);
+    const padB = new Array(maxDims - shapesB.length).fill(1).concat(shapesB);
+    for (let i = 0; i < maxDims; i++) {
+      if (padA[i] !== 1 && padB[i] !== 1 && padA[i] !== padB[i]) return false;
+    }
+    const [bA, bB] = this.broadcastArrays(a, b);
+    for (let i = 0; i < bA.data.length; i++) {
+      if (bA.data[i] !== bB.data[i]) return false;
+    }
+    return true;
+  }
+
+  isneginf(x: NDArray): NDArray {
+    return new JsNDArray(
+      x.data.map(v => (v === -Infinity ? 1 : 0)),
+      x.shape
+    );
+  }
+
+  isposinf(x: NDArray): NDArray {
+    return new JsNDArray(
+      x.data.map(v => (v === Infinity ? 1 : 0)),
+      x.shape
+    );
+  }
+
+  isreal(x: NDArray): NDArray {
+    return new JsNDArray(
+      x.data.map(() => 1),
+      x.shape
+    );
+  }
+
+  isscalar(num: any): boolean {
+    return typeof num === 'number';
+  }
+
+  // ============ Array Construction/Manipulation ============
+
+  vander(x: NDArray, N?: number, increasing: boolean = false): NDArray {
+    const n = x.data.length;
+    const cols = N !== undefined ? N : n;
+    const result = new Float64Array(n * cols);
+    for (let i = 0; i < n; i++) {
+      const val = x.data[i];
+      for (let j = 0; j < cols; j++) {
+        const exp = increasing ? j : cols - 1 - j;
+        result[i * cols + j] = Math.pow(val, exp);
+      }
+    }
+    return new JsNDArray(result, [n, cols]);
+  }
+
+  apply_along_axis(func: (arr: NDArray) => NDArray | number, axis: number, arr: NDArray): NDArray {
+    const ndim = arr.shape.length;
+    axis = this._normalizeAxis(axis, ndim);
+    const shape = arr.shape;
+    const axisLen = shape[axis];
+    const strides = this._computeStrides(shape);
+
+    const outerShape = shape.filter((_, i) => i !== axis);
+    const outerStrides = outerShape.length > 0 ? this._computeStrides(outerShape) : [1];
+    const outerSize = outerShape.reduce((a, b) => a * b, 1) || 1;
+
+    // Apply func to first slice to determine output shape
+    const firstSlice = new Float64Array(axisLen);
+    for (let k = 0; k < axisLen; k++) {
+      let idx = 0;
+      for (let d = 0; d < ndim; d++) {
+        if (d === axis) idx += k * strides[d];
+        else idx += 0 * strides[d];
+      }
+      firstSlice[k] = arr.data[idx];
+    }
+    const firstResult = func(new JsNDArray(firstSlice, [axisLen]));
+    const isScalar = typeof firstResult === 'number';
+    const resultPerSlice = isScalar ? 1 : (firstResult as NDArray).data.length;
+
+    const allResults = new Float64Array(outerSize * resultPerSlice);
+    // Store first result
+    if (isScalar) {
+      allResults[0] = firstResult as number;
+    } else {
+      for (let k = 0; k < resultPerSlice; k++) allResults[k] = (firstResult as NDArray).data[k];
+    }
+
+    for (let outerIdx = 1; outerIdx < outerSize; outerIdx++) {
+      const outerCoords = new Array(outerShape.length);
+      let remaining = outerIdx;
+      for (let d = 0; d < outerShape.length; d++) {
+        outerCoords[d] = Math.floor(remaining / outerStrides[d]);
+        remaining = remaining % outerStrides[d];
+      }
+      const slice = new Float64Array(axisLen);
+      for (let k = 0; k < axisLen; k++) {
+        let idx = 0;
+        let oD = 0;
+        for (let d = 0; d < ndim; d++) {
+          if (d === axis) idx += k * strides[d];
+          else idx += outerCoords[oD++] * strides[d];
+        }
+        slice[k] = arr.data[idx];
+      }
+      const res = func(new JsNDArray(slice, [axisLen]));
+      const offset = outerIdx * resultPerSlice;
+      if (typeof res === 'number') {
+        allResults[offset] = res;
+      } else {
+        for (let k = 0; k < resultPerSlice; k++) allResults[offset + k] = (res as NDArray).data[k];
+      }
+    }
+
+    if (isScalar) {
+      return new JsNDArray(allResults, outerShape.length > 0 ? outerShape : [outerSize]);
+    }
+    // Build output shape: outerShape with resultShape inserted
+    const resultShape = (firstResult as NDArray).shape;
+    const outShape = [...outerShape, ...resultShape];
+    return new JsNDArray(allResults, outShape.length > 0 ? outShape : [outerSize]);
+  }
+
+  choose(indices: NDArray, choices: NDArray[], mode: 'raise' | 'wrap' | 'clip' = 'raise'): NDArray {
+    const size = indices.data.length;
+    const nChoices = choices.length;
+    const result = new Float64Array(size);
+    for (let i = 0; i < size; i++) {
+      let idx = indices.data[i];
+      if (mode === 'raise') {
+        if (idx < 0 || idx >= nChoices) {
+          throw new Error(`index ${idx} is out of bounds for ${nChoices} choices`);
+        }
+      } else if (mode === 'wrap') {
+        idx = ((idx % nChoices) + nChoices) % nChoices;
+      } else if (mode === 'clip') {
+        idx = Math.max(0, Math.min(nChoices - 1, idx));
+      }
+      result[i] = choices[idx].data[i];
+    }
+    return new JsNDArray(result, [...indices.shape]);
+  }
+
+  msort(arr: NDArray): NDArray {
+    return this.sort(arr, 0);
+  }
+
+  piecewise(
+    x: NDArray,
+    condlist: NDArray[],
+    funclist: ((x: number) => number)[],
+    default_: number = 0
+  ): NDArray {
+    const size = x.data.length;
+    const result = new Float64Array(size);
+    const hasExtraFunc = funclist.length === condlist.length + 1;
+    const defaultFunc = hasExtraFunc ? funclist[funclist.length - 1] : null;
+
+    for (let i = 0; i < size; i++) {
+      let found = false;
+      for (let c = 0; c < condlist.length; c++) {
+        if (condlist[c].data[i] !== 0) {
+          result[i] = funclist[c](x.data[i]);
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        result[i] = defaultFunc ? defaultFunc(x.data[i]) : default_;
+      }
+    }
+    return new JsNDArray(result, [...x.shape]);
+  }
+
+  vectorize(func: (...args: number[]) => number): (...args: NDArray[]) => NDArray {
+    return (...args: NDArray[]): NDArray => {
+      if (args.length === 0) throw new Error('vectorize requires at least one argument');
+      // Broadcast all args to common shape
+      const broadcasted = this.broadcastArrays(...args);
+      const shape = broadcasted[0].shape;
+      const size = broadcasted[0].data.length;
+      const result = new Float64Array(size);
+      for (let i = 0; i < size; i++) {
+        const vals = broadcasted.map(a => a.data[i]);
+        result[i] = func(...vals);
+      }
+      return new JsNDArray(result, shape);
+    };
+  }
+
+  nextafter(x: NDArray, y: NDArray): NDArray {
+    const [bx, by] = this.broadcastArrays(x, y).map(a => a);
+    const size = bx.data.length;
+    const result = new Float64Array(size);
+    const buf = new ArrayBuffer(8);
+    const f64View = new Float64Array(buf);
+    const i32View = new Int32Array(buf);
+
+    for (let i = 0; i < size; i++) {
+      const xv = bx.data[i];
+      const yv = by.data[i];
+      if (isNaN(xv) || isNaN(yv)) {
+        result[i] = NaN;
+      } else if (xv === yv) {
+        result[i] = yv;
+      } else {
+        f64View[0] = xv;
+        let lo = i32View[0];
+        let hi = i32View[1];
+        if ((xv > 0 && yv > xv) || (xv < 0 && yv > xv) || xv === 0) {
+          // Move towards positive / towards y
+          if (xv === 0) {
+            // Smallest positive denormal
+            i32View[0] = 1;
+            i32View[1] = yv > 0 ? 0 : -2147483648; // 0x80000000
+          } else if (xv > 0) {
+            // Increment
+            lo += 1;
+            if (lo === 0) hi += 1; // Carry
+            i32View[0] = lo;
+            i32View[1] = hi;
+          } else {
+            // xv < 0, moving toward 0 or positive: decrement magnitude
+            lo -= 1;
+            if (lo === -1) hi -= 1;
+            i32View[0] = lo;
+            i32View[1] = hi;
+          }
+        } else {
+          // Move towards negative / towards y
+          if (xv === 0) {
+            i32View[0] = 1;
+            i32View[1] = yv < 0 ? -2147483648 : 0;
+          } else if (xv > 0) {
+            // Decrement
+            lo -= 1;
+            if (lo === -1) hi -= 1;
+            i32View[0] = lo;
+            i32View[1] = hi;
+          } else {
+            // xv < 0, moving more negative: increment magnitude
+            lo += 1;
+            if (lo === 0) hi += 1;
+            i32View[0] = lo;
+            i32View[1] = hi;
+          }
+        }
+        result[i] = f64View[0];
+      }
+    }
+    return new JsNDArray(result, [...bx.shape]);
+  }
+
+  array2string(arr: NDArray, options?: { separator?: string; precision?: number }): string {
+    const sep = options?.separator ?? ', ';
+    const prec = options?.precision;
+
+    const formatVal = (v: number): string => {
+      if (prec !== undefined) return v.toFixed(prec);
+      return String(v);
+    };
+
+    const formatNd = (data: number[], shape: number[], offset: number): string => {
+      if (shape.length === 0) return formatVal(data[offset]);
+      if (shape.length === 1) {
+        const items: string[] = [];
+        for (let i = 0; i < shape[0]; i++) {
+          items.push(formatVal(data[offset + i]));
+        }
+        return '[' + items.join(sep) + ']';
+      }
+      const innerSize = shape.slice(1).reduce((a, b) => a * b, 1);
+      const items: string[] = [];
+      for (let i = 0; i < shape[0]; i++) {
+        items.push(formatNd(data, shape.slice(1), offset + i * innerSize));
+      }
+      return '[' + items.join(sep) + ']';
+    };
+
+    return formatNd(Array.from(arr.data), arr.shape, 0);
   }
 }
 

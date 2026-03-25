@@ -533,7 +533,7 @@ export interface Backend {
   logicalXor(a: ArrayOrScalar, b: ArrayOrScalar): NDArray;
   isclose(a: NDArray, b: NDArray, rtol?: number, atol?: number): NDArray;
   allclose(a: NDArray, b: NDArray, rtol?: number, atol?: number): boolean;
-  arrayEqual(a: NDArray, b: NDArray): boolean;
+  arrayEqual(a: NDArray, b: NDArray, equal_nan?: boolean): boolean;
 
   // ============ Bitwise ============
   bitwiseAnd(a: ArrayOrScalar, b: ArrayOrScalar): NDArray;
@@ -738,6 +738,59 @@ export interface Backend {
   fftn(arr: NDArray, shape?: number[]): { real: NDArray; imag: NDArray };
   /** np.fft.ifftn — n-dimensional inverse FFT */
   ifftn(real: NDArray, imag: NDArray, shape?: number[]): { real: NDArray; imag: NDArray };
+
+  // ============ Convenience Aliases ============
+  /** np.product — alias for prod */
+  product(arr: NDArray, axis?: number, keepdims?: boolean, dtype?: DType): number | NDArray;
+  /** np.sometrue — alias for any */
+  sometrue(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray;
+  /** np.alltrue — alias for all */
+  alltrue(arr: NDArray, axis?: number, keepdims?: boolean): boolean | NDArray;
+  /** np.cumproduct — alias for cumprod */
+  cumproduct(arr: NDArray, axis?: number, dtype?: DType): NDArray;
+  /** np.ndim — number of dimensions */
+  ndim(arr: NDArray): number;
+  /** np.shape — return shape of array */
+  shape(arr: NDArray): number[];
+  /** np.size — total number of elements */
+  size(arr: NDArray): number;
+  /** np.result_type — dtype promotion utility */
+  result_type(...args: (NDArray | DType)[]): DType;
+
+  // ============ Comparison Helpers ============
+  /** np.array_equiv — like array_equal but allows broadcasting */
+  array_equiv(a: NDArray, b: NDArray): boolean;
+  /** np.isneginf — element-wise test for -Infinity */
+  isneginf(x: NDArray): NDArray;
+  /** np.isposinf — element-wise test for +Infinity */
+  isposinf(x: NDArray): NDArray;
+  /** np.isreal — always true (no complex support) */
+  isreal(x: NDArray): NDArray;
+  /** np.isscalar — true if input is a number */
+  isscalar(num: any): boolean;
+
+  // ============ Array Construction/Manipulation ============
+  /** np.vander — Vandermonde matrix */
+  vander(x: NDArray, N?: number, increasing?: boolean): NDArray;
+  /** np.apply_along_axis — apply function to 1-D slices along axis */
+  apply_along_axis(func: (arr: NDArray) => NDArray | number, axis: number, arr: NDArray): NDArray;
+  /** np.choose — construct array from index array and choices */
+  choose(indices: NDArray, choices: NDArray[], mode?: 'raise' | 'wrap' | 'clip'): NDArray;
+  /** np.msort — sort along first axis */
+  msort(arr: NDArray): NDArray;
+  /** np.piecewise — evaluate piecewise-defined function */
+  piecewise(
+    x: NDArray,
+    condlist: NDArray[],
+    funclist: ((x: number) => number)[],
+    default_?: number
+  ): NDArray;
+  /** np.vectorize — vectorized function wrapper */
+  vectorize(func: (...args: number[]) => number): (...args: NDArray[]) => NDArray;
+  /** np.nextafter — next floating-point value after x towards y */
+  nextafter(x: NDArray, y: NDArray): NDArray;
+  /** np.array2string — string representation of array */
+  array2string(arr: NDArray, options?: { separator?: string; precision?: number }): string;
 
   // ============ GPU Materialization ============
   materializeAll?(): Promise<void>;
