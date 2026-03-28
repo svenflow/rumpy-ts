@@ -8,6 +8,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,600;0,9..144,700;0,9..144,800;1,9..144,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
 <style>
 /* ── Reset ─────────────────────────────────────── */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -734,6 +737,164 @@ footer {
     }
   }
 }
+
+/* ── Benchmark ────────────────────────────────── */
+.bench-container {
+  margin-top: var(--space-2xl);
+  max-width: var(--content-width);
+}
+
+.bench-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-bottom: var(--space-lg);
+}
+
+.bench-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0.75rem 1.75rem;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: none;
+  cursor: pointer;
+  transition: background 0.2s ease, transform 0.15s ease;
+}
+.bench-btn:hover:not(:disabled) {
+  background: var(--ink-secondary);
+  transform: translateY(-1px);
+}
+.bench-btn:disabled {
+  background: var(--ink-muted);
+  cursor: not-allowed;
+  transform: none;
+}
+
+.bench-status {
+  font-size: var(--text-sm);
+  color: var(--ink-tertiary);
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.bench-init {
+  font-size: var(--text-xs);
+  color: var(--ink-tertiary);
+  margin-bottom: var(--space-md);
+}
+
+.bench-init-ok { color: #16a34a; }
+.bench-init-fail { color: #dc2626; }
+
+.bench-table-wrap {
+  background: var(--code-bg);
+  padding: var(--space-lg);
+  overflow-x: auto;
+  margin-bottom: var(--space-lg);
+}
+
+.bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.bench-table th {
+  text-align: left;
+  padding: var(--space-sm) var(--space-md);
+  color: var(--code-comment);
+  font-weight: 500;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+
+.bench-table td {
+  padding: var(--space-sm) var(--space-md);
+  color: var(--code-fg);
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.bench-table td.bench-best {
+  color: var(--code-string);
+  font-weight: 500;
+}
+
+.bench-table td.bench-winner {
+  color: var(--code-string);
+  font-weight: 500;
+}
+
+.bench-table td small {
+  color: var(--code-comment);
+  font-size: 0.85em;
+}
+
+.bench-note {
+  font-size: var(--text-xs);
+  color: var(--ink-tertiary);
+  line-height: 1.6;
+  margin-top: var(--space-sm);
+}
+
+.bench-reference {
+  margin-top: var(--space-xl);
+  padding: var(--space-lg);
+  background: var(--paper-warm);
+  border: 1px solid var(--border);
+}
+
+.bench-reference h3 {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-tertiary);
+  margin-bottom: var(--space-md);
+}
+
+.bench-ref-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-lg);
+}
+
+@media (max-width: 768px) {
+  .bench-ref-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.bench-ref-item {}
+
+.bench-ref-device {
+  font-weight: 600;
+  font-size: var(--text-sm);
+  margin-bottom: var(--space-xs);
+}
+
+.bench-ref-peak {
+  font-family: 'Fraunces', Georgia, serif;
+  font-size: var(--text-xl);
+  font-weight: 700;
+  color: var(--accent);
+  line-height: 1.2;
+}
+
+.bench-ref-detail {
+  font-size: var(--text-xs);
+  color: var(--ink-tertiary);
+  margin-top: var(--space-xs);
+}
 </style>
 </head>
 <body>
@@ -745,6 +906,7 @@ footer {
     <ul class="nav-links">
       <li><a href="#packages">Packages</a></li>
       <li><a href="#backends">Backends</a></li>
+      <li><a href="#benchmarks">Benchmarks</a></li>
       <li><a href="#features">Features</a></li>
       <li><a href="#quickstart">Get Started</a></li>
       <li>
@@ -973,43 +1135,236 @@ console<span class="p">.</span><span class="fn">log</span><span class="p">(</spa
       <h2 class="section-title">Faster than tfjs on real hardware</h2>
     </div>
 
-    <div class="backends-grid">
-      <div class="backend-card">
-        <div class="backend-icon">💻</div>
-        <div class="backend-name">Apple M4 — WebGPU</div>
-        <div class="backend-desc" style="font-variant-numeric: tabular-nums;">
-          <strong>3,272 GFLOPS peak</strong> at 4096×4096 matmul.<br>
-          1.45× faster than tfjs WebGPU. Beats tfjs at every size ≥512.
+    <div class="bench-container">
+      <!-- Reference results -->
+      <div class="bench-reference">
+        <h3>Reference results</h3>
+        <div class="bench-ref-grid">
+          <div class="bench-ref-item">
+            <div class="bench-ref-device">Apple M4 — WebGPU</div>
+            <div class="bench-ref-peak">3,272 GFLOPS</div>
+            <div class="bench-ref-detail">4096×4096 matmul · 1.45× faster than tfjs</div>
+          </div>
+          <div class="bench-ref-item">
+            <div class="bench-ref-device">iPhone 17 Pro — WebGPU</div>
+            <div class="bench-ref-peak">781 GFLOPS</div>
+            <div class="bench-ref-detail">2048×2048 matmul · beats tfjs at every size</div>
+          </div>
+          <div class="bench-ref-item">
+            <div class="bench-ref-device">WASM SIMD — CPU</div>
+            <div class="bench-ref-peak">625 GFLOPS</div>
+            <div class="bench-ref-detail">4096×4096 matmul · beats tfjs XNNPACK at 1024+</div>
+          </div>
         </div>
-        <div class="backend-env">BCACHE shader · f32 · GPU-resident</div>
       </div>
 
-      <div class="backend-card">
-        <div class="backend-icon">📱</div>
-        <div class="backend-name">iPhone 17 Pro — WebGPU</div>
-        <div class="backend-desc" style="font-variant-numeric: tabular-nums;">
-          <strong>781 GFLOPS peak</strong> at 2048×2048 matmul.<br>
-          Beats tfjs at every size tested (512, 1024, 2048).
+      <!-- Live benchmark -->
+      <div style="margin-top: var(--space-xl);">
+        <div id="bench-init" class="bench-init"></div>
+        <div class="bench-controls">
+          <button class="bench-btn" id="benchRunBtn" onclick="window.runPageBenchmark()">Run on your device</button>
+          <span class="bench-status" id="benchStatus"></span>
         </div>
-        <div class="backend-env">A18 Pro GPU · Safari · LambdaTest verified</div>
-      </div>
 
-      <div class="backend-card">
-        <div class="backend-icon">⬡</div>
-        <div class="backend-name">WASM SIMD — CPU</div>
-        <div class="backend-desc" style="font-variant-numeric: tabular-nums;">
-          <strong>625 GFLOPS peak</strong> at 4096×4096 matmul.<br>
-          Beats tfjs WASM (XNNPACK) at sizes ≥1024. Futex thread pool + FMA.
+        <div id="benchResultsWrap" class="bench-table-wrap" style="display:none">
+          <table class="bench-table">
+            <thead>
+              <tr>
+                <th>Size</th>
+                <th>numpyjs WebGPU</th>
+                <th>tfjs WebGPU</th>
+                <th>Winner</th>
+              </tr>
+            </thead>
+            <tbody id="benchResults"></tbody>
+          </table>
+          <div class="bench-note">
+            WebGPU matmul, f32, GPU-resident (no CPU readback). GFLOPS = 2N³ / time. Higher is better. Results vary by device and browser state.
+          </div>
         </div>
-        <div class="backend-env">All browsers · relaxed-SIMD fast path</div>
       </div>
-    </div>
-
-    <div style="text-align: center; margin-top: 2rem;">
-      <a href="bench.html" style="display: inline-block; padding: 0.75rem 1.5rem; background: var(--accent); color: white; border-radius: 8px; text-decoration: none; font-weight: 600; font-family: var(--font-body, 'IBM Plex Sans', sans-serif);">Run benchmark on your device →</a>
     </div>
   </div>
 </section>
+
+<script type="module">
+// ── Embedded benchmark (numpyjs WebGPU vs tfjs WebGPU) ──────────────
+const MATMUL_SHADER = `
+  struct Uniforms { M: u32, K: u32, N: u32, _pad: u32, }
+  @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+  @group(0) @binding(1) var<storage, read> A: array<vec4<f32>>;
+  @group(0) @binding(2) var<storage, read> B: array<vec4<f32>>;
+  @group(0) @binding(3) var<storage, read_write> C: array<vec4<f32>>;
+  var<workgroup> mm_Asub: array<array<vec4<f32>, 8>, 32>;
+  var<workgroup> mm_Bsub: array<array<vec4<f32>, 8>, 32>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(local_invocation_id) localId: vec3<u32>, @builtin(global_invocation_id) globalId: vec3<u32>) {
+    let M = i32(uniforms.M); let K = i32(uniforms.K); let N = i32(uniforms.N);
+    let KVec4 = K / 4; let NVec4 = N / 4;
+    let localRow = i32(localId.y); let tileRow = localRow * 4; let tileCol = i32(localId.x);
+    let globalRow = i32(globalId.y) * 4; let globalCol = i32(globalId.x) * 4;
+    var acc: array<vec4<f32>, 4>;
+    acc[0] = vec4<f32>(0.0); acc[1] = vec4<f32>(0.0); acc[2] = vec4<f32>(0.0); acc[3] = vec4<f32>(0.0);
+    let numTiles = (K + 31) / 32; var kStart = 0; let tileRowB = localRow * 4;
+    for (var t = 0; t < numTiles; t++) {
+      for (var innerRow = 0; innerRow < 4; innerRow++) {
+        let inputRow = tileRow + innerRow; let aRow = globalRow + innerRow;
+        let aColVec4 = (kStart + tileCol * 4) / 4;
+        if (aRow < M && aColVec4 < KVec4) { mm_Asub[inputRow][tileCol] = A[aRow * KVec4 + aColVec4]; }
+        else { mm_Asub[inputRow][tileCol] = vec4<f32>(0.0); }
+      }
+      for (var innerRow = 0; innerRow < 4; innerRow++) {
+        let inputRow = tileRowB + innerRow; let bRow = kStart + inputRow; let bColVec4 = globalCol / 4;
+        if (bRow < K && bColVec4 < NVec4) { mm_Bsub[inputRow][tileCol] = B[bRow * NVec4 + bColVec4]; }
+        else { mm_Bsub[inputRow][tileCol] = vec4<f32>(0.0); }
+      }
+      kStart = kStart + 32; workgroupBarrier();
+      for (var k = 0; k < 8; k++) {
+        let B0 = mm_Bsub[k*4+0][tileCol]; let B1 = mm_Bsub[k*4+1][tileCol];
+        let B2 = mm_Bsub[k*4+2][tileCol]; let B3 = mm_Bsub[k*4+3][tileCol];
+        for (var i = 0; i < 4; i++) {
+          let a = mm_Asub[tileRow + i][k];
+          acc[i] = fma(B0, vec4<f32>(a[0]), acc[i]); acc[i] = fma(B1, vec4<f32>(a[1]), acc[i]);
+          acc[i] = fma(B2, vec4<f32>(a[2]), acc[i]); acc[i] = fma(B3, vec4<f32>(a[3]), acc[i]);
+        }
+      }
+      workgroupBarrier();
+    }
+    for (var innerRow = 0; innerRow < 4; innerRow++) {
+      let outRow = globalRow + innerRow; let outColVec4 = globalCol / 4;
+      if (outRow < M && outColVec4 < NVec4) { C[outRow * NVec4 + outColVec4] = acc[innerRow]; }
+    }
+  }
+`;
+
+let _device = null, _pipeline = null;
+
+function _createBuf(data, usage) {
+  const buf = _device.createBuffer({ size: data.byteLength, usage: usage | GPUBufferUsage.COPY_DST });
+  _device.queue.writeBuffer(buf, 0, data);
+  return buf;
+}
+
+async function _benchWebGPU(size, warmup = 5, runs = 10) {
+  const n = size, nPad = Math.ceil(n / 4) * 4;
+  const aData = new Float32Array(n * nPad), bData = new Float32Array(n * nPad);
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) { aData[r*nPad+c] = Math.random(); bData[r*nPad+c] = Math.random(); }
+  const aBuf = _createBuf(aData, GPUBufferUsage.STORAGE), bBuf = _createBuf(bData, GPUBufferUsage.STORAGE);
+  const cBuf = _device.createBuffer({ size: n * nPad * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const uBuf = _createBuf(new Uint32Array([n, n, n, 0]), GPUBufferUsage.UNIFORM);
+  const bg = _device.createBindGroup({ layout: _pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: uBuf } }, { binding: 1, resource: { buffer: aBuf } },
+    { binding: 2, resource: { buffer: bBuf } }, { binding: 3, resource: { buffer: cBuf } },
+  ]});
+  const wgX = Math.ceil(n/32), wgY = Math.ceil(n/32);
+  for (let i = 0; i < warmup; i++) { const e = _device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(_pipeline); p.setBindGroup(0, bg); p.dispatchWorkgroups(wgX, wgY); p.end(); _device.queue.submit([e.finish()]); }
+  await _device.queue.onSubmittedWorkDone();
+  const times = [];
+  for (let i = 0; i < runs; i++) { const s = performance.now(); const e = _device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(_pipeline); p.setBindGroup(0, bg); p.dispatchWorkgroups(wgX, wgY); p.end(); _device.queue.submit([e.finish()]); await _device.queue.onSubmittedWorkDone(); times.push(performance.now() - s); }
+  aBuf.destroy(); bBuf.destroy(); cBuf.destroy(); uBuf.destroy();
+  const avg = times.reduce((a,b) => a+b) / times.length;
+  return { avgMs: avg, gflops: (2*n*n*n) / (avg/1000) / 1e9 };
+}
+
+async function _benchTfjs(size, warmup = 5, runs = 10) {
+  const a = new Float32Array(size*size), b = new Float32Array(size*size);
+  for (let i = 0; i < size*size; i++) { a[i] = Math.random(); b[i] = Math.random(); }
+  const tfA = tf.tensor2d(a, [size,size],'float32'), tfB = tf.tensor2d(b, [size,size],'float32');
+  for (let i = 0; i < warmup; i++) { const c = tf.matMul(tfA,tfB); await c.data(); c.dispose(); }
+  const times = [];
+  for (let i = 0; i < runs; i++) { const s = performance.now(); const c = tf.matMul(tfA,tfB); await c.data(); times.push(performance.now()-s); c.dispose(); }
+  tfA.dispose(); tfB.dispose();
+  const avg = times.reduce((a,b) => a+b) / times.length;
+  return { avgMs: avg, gflops: (2*size*size*size) / (avg/1000) / 1e9 };
+}
+
+window.runPageBenchmark = async function() {
+  const btn = document.getElementById('benchRunBtn');
+  const status = document.getElementById('benchStatus');
+  const results = document.getElementById('benchResults');
+  const wrap = document.getElementById('benchResultsWrap');
+  const initEl = document.getElementById('bench-init');
+
+  btn.disabled = true;
+  results.innerHTML = '';
+  wrap.style.display = 'block';
+  initEl.innerHTML = '';
+
+  // Init WebGPU
+  if (!_device) {
+    status.textContent = 'Initializing WebGPU...';
+    try {
+      if (!navigator.gpu) throw new Error('WebGPU not supported in this browser');
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (!adapter) throw new Error('No GPU adapter');
+      const info = adapter.info || {};
+      const desc = (info.description || info.device || 'GPU').trim();
+      _device = await adapter.requestDevice({
+        requiredLimits: { maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize, maxBufferSize: adapter.limits.maxBufferSize, maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension }
+      });
+      _pipeline = _device.createComputePipeline({ layout: 'auto', compute: { module: _device.createShaderModule({ code: MATMUL_SHADER }), entryPoint: 'main' } });
+      initEl.innerHTML = `<span class="bench-init-ok">WebGPU: ${desc}</span>`;
+    } catch (e) {
+      initEl.innerHTML = `<span class="bench-init-fail">WebGPU not available: ${e.message}</span>`;
+      status.textContent = 'WebGPU required for this benchmark';
+      btn.disabled = false;
+      return;
+    }
+  }
+
+  // Init tfjs WebGPU
+  status.textContent = 'Initializing tfjs...';
+  try {
+    await tf.setBackend('webgpu'); await tf.ready();
+    initEl.innerHTML += ` · <span class="bench-init-ok">tfjs WebGPU ready</span>`;
+  } catch (e) {
+    initEl.innerHTML += ` · <span class="bench-init-fail">tfjs: ${e.message}</span>`;
+  }
+
+  const isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
+  const sizes = isMobile ? [256, 512, 1024] : [256, 512, 1024, 2048, 4096];
+  let peakGflops = 0;
+
+  for (const size of sizes) {
+    status.textContent = `Running ${size}\u00d7${size}...`;
+
+    let webgpu = null, tfjs = null;
+    try { webgpu = await _benchWebGPU(size); } catch(e) {}
+
+    try {
+      if (tf.getBackend() !== 'webgpu') { await tf.setBackend('webgpu'); await tf.ready(); }
+      tfjs = await _benchTfjs(size);
+    } catch(e) {}
+
+    const numpyWins = webgpu && tfjs && webgpu.gflops > tfjs.gflops;
+    const ratio = webgpu && tfjs ? (webgpu.gflops / tfjs.gflops) : null;
+
+    if (webgpu && webgpu.gflops > peakGflops) peakGflops = webgpu.gflops;
+
+    const fmtCell = (r, isBest) => {
+      if (!r) return '<td>\u2014</td>';
+      return `<td class="${isBest ? 'bench-best' : ''}">${r.gflops.toFixed(0)} <small>(${r.avgMs.toFixed(1)}ms)</small></td>`;
+    };
+
+    const winnerText = ratio
+      ? (numpyWins ? `numpyjs ${ratio.toFixed(2)}\u00d7` : `tfjs ${(1/ratio).toFixed(2)}\u00d7`)
+      : '\u2014';
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${size}</strong></td>
+      ${fmtCell(webgpu, numpyWins)}
+      ${fmtCell(tfjs, !numpyWins)}
+      <td class="bench-winner">${winnerText}</td>
+    `;
+    results.appendChild(tr);
+  }
+
+  status.textContent = `Done \u2014 peak: ${peakGflops.toFixed(0)} GFLOPS${peakGflops > 1000 ? ` (${(peakGflops/1000).toFixed(1)} TFLOPS)` : ''}`;
+  btn.disabled = false;
+};
+</script>
 
 <!-- Features -->
 <section class="features" id="features">
